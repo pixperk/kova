@@ -11,5 +11,7 @@
 
 mod error;
 mod id;
+mod vector;
 pub use error::KovaError;
 pub use id::VectorId;
+pub use vector::Vector;

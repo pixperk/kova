@@ -22,4 +22,13 @@ pub enum KovaError {
     /// Attempted to construct a [`crate::vector::Vector`] from an empty slice.
     #[error("vector must have at least one dimension")]
     EmptyVector,
+
+    /// A vector component was non-finite (NaN or infinity), which is not allowed.
+    #[error("vector component at index {index} is non-finite: {value}")]
+    NonFinite {
+        /// The index of the component that was non-finite.
+        index: usize,
+        /// The non-finite value that was found.
+        value: f32,
+    },
 }
