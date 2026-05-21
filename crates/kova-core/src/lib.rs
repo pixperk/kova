@@ -8,3 +8,8 @@
 //! Phase 1 of the roadmap fills in `vector`, `id`, `distance`, and `error`.
 
 #![forbid(unsafe_code)]
+
+mod error;
+mod id;
+pub use error::KovaError;
+pub use id::VectorId;
