@@ -1,0 +1,14 @@
+[package]
+name = "kova-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Foundational types for Kova: Vector, VectorId, Distance trait."
+
+[dependencies]
+thiserror.workspace = true
+
+[lints]
+workspace = true

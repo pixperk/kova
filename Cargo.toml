@@ -1,0 +1,37 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/kova-core",
+    # Crates below are added at the start of their phase. See todo.md.
+    # "crates/kova-index",
+    # "crates/kova-storage",
+    # "crates/kova-query",
+    # "crates/kova-proto",
+    # "crates/kova-cluster",
+    # "crates/kova-server",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+authors = ["Yashaswi Kumar Mishra"]
+license = "MIT"
+repository = "https://github.com/pixperk/kova"
+
+[workspace.dependencies]
+thiserror = "1"
+anyhow = "1"
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_docs = "warn"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

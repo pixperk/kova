@@ -1,0 +1,8 @@
+[alias]
+ci = "test --workspace --all-features"
+xb = "build --workspace --release"
+
+# Uncomment locally to enable SIMD codegen for your CPU (do not commit enabled —
+# it breaks portable release builds and CI).
+# [build]
+# rustflags = ["-C", "target-cpu=native"]
