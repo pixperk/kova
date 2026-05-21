@@ -10,5 +10,13 @@ description = "Foundational types for Kova: Vector, VectorId, Distance trait."
 [dependencies]
 thiserror.workspace = true
 
+[dev-dependencies]
+proptest = "1"
+criterion = "0.5"
+
+[[bench]]
+name = "distance"
+harness = false
+
 [lints]
 workspace = true
