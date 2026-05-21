@@ -9,9 +9,11 @@
 
 #![forbid(unsafe_code)]
 
+mod distance;
 mod error;
 mod id;
 mod vector;
+pub use distance::{Cosine, Distance, InnerProduct, L2};
 pub use error::KovaError;
 pub use id::VectorId;
 pub use vector::Vector;
