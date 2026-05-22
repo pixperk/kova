@@ -69,6 +69,36 @@ fn bench_search(c: &mut Criterion) {
     }
 }
 
+fn bench_search_at_100k(c: &mut Criterion) {
+    // Build once : the 100k HNSW build takes ~minutes. Smaller sample size
+    // keeps the run time reasonable while still giving stable mean estimates.
+    let vectors = build_vectors(100_000, DIM, 7);
+    let queries = build_vectors(100, DIM, 99);
+    let hnsw = build_hnsw(&vectors);
+    let flat = build_flat(&vectors);
+
+    let mut group = c.benchmark_group("at_100k");
+    group.sample_size(20);
+
+    group.bench_function("hnsw_search", |b| {
+        let mut q_iter = queries.iter().cycle();
+        b.iter(|| {
+            let q = q_iter.next().unwrap();
+            hnsw.search(black_box(q), K).unwrap()
+        });
+    });
+
+    group.bench_function("flat_search", |b| {
+        let mut q_iter = queries.iter().cycle();
+        b.iter(|| {
+            let q = q_iter.next().unwrap();
+            flat.search(black_box(q), K).unwrap()
+        });
+    });
+
+    group.finish();
+}
+
 fn bench_insert(c: &mut Criterion) {
     let vectors = build_vectors(2_000, DIM, 7);
 
@@ -90,4 +120,7 @@ fn bench_insert(c: &mut Criterion) {
 }
 
 criterion_group!(benches, bench_search, bench_insert);
-criterion_main!(benches);
+// Gate the 100k benches behind a separate group so users can opt out:
+//   cargo bench -p kova-index --bench hnsw -- 'at_100k|hnsw_search|...'
+criterion_group!(big_benches, bench_search_at_100k);
+criterion_main!(benches, big_benches);

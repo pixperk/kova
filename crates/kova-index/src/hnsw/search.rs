@@ -331,19 +331,15 @@ mod tests {
         }
     }
 
-    #[test]
+    /// Helper: insert `n` random `dim`-d vectors into both index types,
+    /// run `queries` random queries, return mean recall@`k`.
     #[allow(clippy::cast_precision_loss)]
-    fn recall_at_10_vs_flat_on_300_vectors() {
+    fn measure_recall(n: u64, dim: usize, k: usize, queries: usize, data_seed: u64) -> f32 {
         use crate::{FlatIndex, Index};
         use rand::{RngExt, SeedableRng, rngs::StdRng};
         use std::collections::HashSet;
 
-        let mut rng = StdRng::seed_from_u64(99);
-        let dim = 8;
-        let n = 300;
-        let k = 10;
-        let queries = 30;
-
+        let mut rng = StdRng::seed_from_u64(data_seed);
         let mut hnsw = HnswIndex::seeded(L2, super::super::HnswParams::default(), 13);
         let mut flat: FlatIndex<L2> = FlatIndex::new(L2);
 
@@ -354,7 +350,7 @@ mod tests {
             flat.insert(id(i), vec).unwrap();
         }
 
-        let mut total_recall = 0.0_f32;
+        let mut total = 0.0_f32;
         for _ in 0..queries {
             let qdata: Vec<f32> = (0..dim).map(|_| rng.random::<f32>()).collect();
             let q = Vector::try_new(qdata).unwrap();
@@ -372,10 +368,37 @@ mod tests {
                 .map(|(id, _)| id)
                 .collect();
 
-            let overlap = h_ids.intersection(&f_ids).count();
-            total_recall += overlap as f32 / k as f32;
+            total += h_ids.intersection(&f_ids).count() as f32 / k as f32;
         }
-        let recall = total_recall / queries as f32;
-        assert!(recall > 0.9, "recall@{k} was {recall:.3}, expected > 0.9");
+        total / queries as f32
+    }
+
+    #[test]
+    fn recall_at_10_vs_flat_on_300_vectors() {
+        let r = measure_recall(300, 8, 10, 30, 99);
+        assert!(r > 0.9, "recall@10 at n=300 was {r:.3}, expected > 0.9");
+    }
+
+    /// Bigger scale, more realistic dim. Default test so CI catches
+    /// regressions at the 10k milestone. ~5s on a modern laptop.
+    #[test]
+    fn recall_at_10_vs_flat_on_10k_dim32() {
+        let r = measure_recall(10_000, 32, 10, 20, 99);
+        assert!(
+            r > 0.9,
+            "recall@10 at n=10k dim=32 was {r:.3}, expected > 0.9"
+        );
+    }
+
+    /// 50k scale. Ignored by default (~75s); run with
+    /// `cargo test --release -- --ignored` for full validation.
+    #[test]
+    #[ignore = "slow: ~75s; run with --ignored"]
+    fn recall_at_10_vs_flat_on_50k_dim32() {
+        let r = measure_recall(50_000, 32, 10, 20, 99);
+        assert!(
+            r > 0.9,
+            "recall@10 at n=50k dim=32 was {r:.3}, expected > 0.9"
+        );
     }
 }
