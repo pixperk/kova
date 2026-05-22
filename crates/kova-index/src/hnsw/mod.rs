@@ -9,6 +9,7 @@ use crate::{Index, KovaIndexError};
 mod layer;
 mod node;
 mod params;
+mod search;
 
 use node::Node;
 pub use params::HnswParams;
