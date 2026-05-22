@@ -6,6 +6,7 @@ use kova_core::{Distance, Vector, VectorId};
 
 use crate::{Index, KovaIndexError};
 
+mod layer;
 mod node;
 mod params;
 

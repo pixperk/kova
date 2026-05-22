@@ -13,7 +13,7 @@ pub(crate) struct Node {
     pub(crate) vector: Vector,
     /// `neighbors[L]` is the list of neighbour IDs at layer L.
     /// `neighbors.len() == top_layer + 1`.
-    pub(crate) neighbors: Vec<Vec<VectorId>>,
+    pub(crate) neighbors: Vec<Vec<VectorId>>, //neighbor ids per layer, indexed by layer
 }
 
 impl Node {

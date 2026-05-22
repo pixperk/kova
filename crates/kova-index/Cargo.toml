@@ -10,6 +10,7 @@ description = "Index trait, brute-force baseline, and HNSW for Kova."
 [dependencies]
 kova-core = { path = "../kova-core" }
 thiserror.workspace = true
+rand = "0.10"
 
 [lints]
 workspace = true
