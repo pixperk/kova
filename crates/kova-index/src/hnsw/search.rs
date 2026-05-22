@@ -1,8 +1,5 @@
-//! `search_layer` : bounded best-first search at one layer of the graph.
-//!
-//! This is the workhorse called by both insert (Algorithm 1) and the
-//! user-facing search (Algorithms 2 + 5). The user-facing wrapper lands once
-//! insert is in place.
+//! HNSW search : the workhorse `search_layer` (Algorithm 2) and the
+//! user-facing `search_impl` (Algorithm 5).
 
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashSet};
@@ -10,6 +7,7 @@ use std::collections::{BinaryHeap, HashSet};
 use kova_core::{Distance, Vector, VectorId};
 
 use super::HnswIndex;
+use crate::KovaIndexError;
 use crate::scored::ScoredId;
 
 impl<D: Distance> HnswIndex<D> {
@@ -95,6 +93,52 @@ impl<D: Distance> HnswIndex<D> {
             .into_iter()
             .map(|s| (s.id, s.distance))
             .collect()
+    }
+
+    /// User-facing search : HNSW Algorithm 5.
+    ///
+    /// Greedy descent through upper layers with `ef = 1`, then one
+    /// `search_layer` at layer 0 with `ef = max(ef_search, k)`. Returns up
+    /// to `k` `(id, distance)` pairs sorted ascending by distance.
+    pub(crate) fn search_impl(
+        &self,
+        query: &Vector,
+        k: usize,
+    ) -> Result<Vec<(VectorId, f32)>, KovaIndexError> {
+        if k == 0 {
+            return Ok(Vec::new());
+        }
+
+        let Some(entry_id) = self.entry_point else {
+            return Ok(Vec::new());
+        };
+
+        if let Some(d) = self.dim
+            && query.dim() != d
+        {
+            return Err(KovaIndexError::DimensionMismatch {
+                expected: d,
+                got: query.dim(),
+            });
+        }
+
+        let top_level = self.nodes[&entry_id].top_layer();
+        // ef_search must be at least k to return k results.
+        let ef = self.params.ef_search.max(k);
+
+        // Greedy descent through upper layers (ef = 1).
+        let mut current_ep = entry_id;
+        for layer in (1..=top_level).rev() {
+            let nearest = self.search_layer(query, &[current_ep], 1, layer);
+            if let Some(&(best_id, _)) = nearest.first() {
+                current_ep = best_id;
+            }
+        }
+
+        // Layer-0 search with the full beam.
+        let mut results = self.search_layer(query, &[current_ep], ef, 0);
+        results.truncate(k);
+        Ok(results)
     }
 }
 
@@ -239,5 +283,99 @@ mod tests {
         assert_eq!(out[2].0, id(1));
         assert!(out[0].1 < out[1].1);
         assert!(out[1].1 < out[2].1);
+    }
+
+    // ---------- user-facing search_impl ----------
+
+    #[test]
+    fn search_impl_empty_index_returns_empty() {
+        let idx: HnswIndex<L2> = HnswIndex::new(L2);
+        let out = idx.search_impl(&v(vec![0.0]), 5).unwrap();
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn search_impl_k_zero_returns_empty() {
+        let mut idx = HnswIndex::new(L2);
+        crate::Index::insert(&mut idx, id(1), v(vec![1.0])).unwrap();
+        let out = idx.search_impl(&v(vec![0.0]), 0).unwrap();
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn search_impl_dim_mismatch_errors() {
+        let mut idx = HnswIndex::new(L2);
+        crate::Index::insert(&mut idx, id(1), v(vec![1.0, 2.0])).unwrap();
+        let err = idx.search_impl(&v(vec![1.0]), 1).unwrap_err();
+        assert!(matches!(
+            err,
+            crate::KovaIndexError::DimensionMismatch {
+                expected: 2,
+                got: 1,
+            }
+        ));
+    }
+
+    #[test]
+    #[allow(clippy::cast_precision_loss)]
+    fn search_impl_returns_sorted_ascending() {
+        let mut idx = HnswIndex::seeded(L2, super::super::HnswParams::default(), 5);
+        for i in 0..20 {
+            let f = i as f32;
+            crate::Index::insert(&mut idx, id(i), v(vec![f])).unwrap();
+        }
+        let out = idx.search_impl(&v(vec![0.0]), 5).unwrap();
+        assert!(out.len() <= 5);
+        for w in out.windows(2) {
+            assert!(w[0].1 <= w[1].1);
+        }
+    }
+
+    #[test]
+    #[allow(clippy::cast_precision_loss)]
+    fn recall_at_10_vs_flat_on_300_vectors() {
+        use crate::{FlatIndex, Index};
+        use rand::{RngExt, SeedableRng, rngs::StdRng};
+        use std::collections::HashSet;
+
+        let mut rng = StdRng::seed_from_u64(99);
+        let dim = 8;
+        let n = 300;
+        let k = 10;
+        let queries = 30;
+
+        let mut hnsw = HnswIndex::seeded(L2, super::super::HnswParams::default(), 13);
+        let mut flat: FlatIndex<L2> = FlatIndex::new(L2);
+
+        for i in 0..n {
+            let data: Vec<f32> = (0..dim).map(|_| rng.random::<f32>()).collect();
+            let vec = Vector::try_new(data).unwrap();
+            hnsw.insert(id(i), vec.clone()).unwrap();
+            flat.insert(id(i), vec).unwrap();
+        }
+
+        let mut total_recall = 0.0_f32;
+        for _ in 0..queries {
+            let qdata: Vec<f32> = (0..dim).map(|_| rng.random::<f32>()).collect();
+            let q = Vector::try_new(qdata).unwrap();
+
+            let h_ids: HashSet<VectorId> = hnsw
+                .search(&q, k)
+                .unwrap()
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect();
+            let f_ids: HashSet<VectorId> = flat
+                .search(&q, k)
+                .unwrap()
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect();
+
+            let overlap = h_ids.intersection(&f_ids).count();
+            total_recall += overlap as f32 / k as f32;
+        }
+        let recall = total_recall / queries as f32;
+        assert!(recall > 0.9, "recall@{k} was {recall:.3}, expected > 0.9");
     }
 }

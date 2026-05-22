@@ -102,8 +102,8 @@ impl<D: Distance> Index<D> for HnswIndex<D> {
         self.insert_impl(id, vector)
     }
 
-    fn search(&self, _query: &Vector, _k: usize) -> Result<Vec<(VectorId, f32)>, Self::Error> {
-        todo!("HNSW Algorithms 2 + 5 (search) lands next")
+    fn search(&self, query: &Vector, k: usize) -> Result<Vec<(VectorId, f32)>, Self::Error> {
+        self.search_impl(query, k)
     }
 
     fn len(&self) -> usize {
