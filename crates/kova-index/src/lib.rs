@@ -5,6 +5,10 @@
 
 #![forbid(unsafe_code)]
 mod error;
+mod flat;
 mod index;
+mod scored;
+
 pub use error::KovaIndexError;
+pub use flat::FlatIndex;
 pub use index::Index;
