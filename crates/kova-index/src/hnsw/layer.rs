@@ -14,7 +14,6 @@ use rand::{Rng, RngExt};
 /// The function uses `1 - rng.random()` to avoid `u = 0` (which would make
 /// `ln(u) = -inf`); this gives `u` in `(0, 1]` and a well-defined result.
 #[allow(
-    dead_code, // called by HnswIndex::insert once Algorithm 1 lands
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss, // -ln(u) is non-negative for u in (0, 1]; floor stays >= 0
 )]

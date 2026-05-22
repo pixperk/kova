@@ -3,9 +3,12 @@
 use std::collections::HashMap;
 
 use kova_core::{Distance, Vector, VectorId};
+use rand::SeedableRng;
+use rand::rngs::StdRng;
 
 use crate::{Index, KovaIndexError};
 
+mod insert;
 mod layer;
 mod node;
 mod params;
@@ -15,35 +18,43 @@ mod select;
 use node::Node;
 pub use params::HnswParams;
 
+/// Default RNG seed for `new` / `with_params`. Users wanting non-deterministic
+/// behaviour or a custom seed call [`HnswIndex::seeded`].
+const DEFAULT_SEED: u64 = 0xDEAD_BEEF_DEAD_BEEF;
+
 /// Hierarchical Navigable Small World index.
-///
-/// Constructors and read-only accessors are wired now; the [`Index`] trait
-/// implementation has `insert` and `search` stubbed with `todo!` until
-/// Algorithms 1 / 2 / 5 land.
 pub struct HnswIndex<D: Distance> {
     metric: D,
     params: HnswParams,
     nodes: HashMap<VectorId, Node>,
     entry_point: Option<VectorId>,
     dim: Option<usize>,
+    rng: StdRng,
 }
 
 impl<D: Distance> HnswIndex<D> {
-    /// Build a new empty index using [`HnswParams::default`].
+    /// Build an empty index using [`HnswParams::default`] and the default seed.
     #[must_use]
     pub fn new(metric: D) -> Self {
-        Self::with_params(metric, HnswParams::default())
+        Self::seeded(metric, HnswParams::default(), DEFAULT_SEED)
     }
 
-    /// Build a new empty index with caller-supplied parameters.
+    /// Build an empty index with caller-supplied parameters and the default seed.
     #[must_use]
     pub fn with_params(metric: D, params: HnswParams) -> Self {
+        Self::seeded(metric, params, DEFAULT_SEED)
+    }
+
+    /// Build an empty index with an explicit RNG seed (for reproducible tests).
+    #[must_use]
+    pub fn seeded(metric: D, params: HnswParams, seed: u64) -> Self {
         Self {
             metric,
             params,
             nodes: HashMap::new(),
             entry_point: None,
             dim: None,
+            rng: StdRng::seed_from_u64(seed),
         }
     }
 
@@ -87,12 +98,12 @@ impl<D: Distance> HnswIndex<D> {
 impl<D: Distance> Index<D> for HnswIndex<D> {
     type Error = KovaIndexError;
 
-    fn insert(&mut self, _id: VectorId, _vector: Vector) -> Result<(), Self::Error> {
-        todo!("HNSW Algorithm 1 (insert)")
+    fn insert(&mut self, id: VectorId, vector: Vector) -> Result<(), Self::Error> {
+        self.insert_impl(id, vector)
     }
 
     fn search(&self, _query: &Vector, _k: usize) -> Result<Vec<(VectorId, f32)>, Self::Error> {
-        todo!("HNSW Algorithms 2 + 5 (search)")
+        todo!("HNSW Algorithms 2 + 5 (search) lands next")
     }
 
     fn len(&self) -> usize {

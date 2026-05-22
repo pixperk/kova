@@ -18,7 +18,6 @@ impl<D: Distance> HnswIndex<D> {
     /// `candidates` must be sorted ascending by distance to the query
     /// (which is what [`Self::search_layer`] returns). Order is preserved
     /// in the output : earlier acceptances win.
-    #[allow(dead_code)] // called by insert once Algorithm 1 lands
     pub(crate) fn select_neighbors_heuristic(
         &self,
         candidates: &[(VectorId, f32)],

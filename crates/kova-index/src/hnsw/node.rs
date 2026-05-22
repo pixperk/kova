@@ -19,7 +19,6 @@ pub(crate) struct Node {
 impl Node {
     /// Creates a node that lives at every layer from `0` through `top_layer`,
     /// each with an empty neighbour list.
-    #[allow(dead_code)] // called by HnswIndex::insert once Algorithm 1 lands
     pub(crate) fn new(vector: Vector, top_layer: usize) -> Self {
         Self {
             vector,

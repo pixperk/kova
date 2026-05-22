@@ -17,7 +17,6 @@ impl<D: Distance> HnswIndex<D> {
     ///
     /// Returns up to `ef` `(id, distance)` pairs sorted ascending by distance.
     /// Allocates fresh state per call so concurrent reads do not interfere.
-    #[allow(dead_code)] // wired into insert + search in upcoming days
     pub(crate) fn search_layer(
         &self,
         query: &Vector,
