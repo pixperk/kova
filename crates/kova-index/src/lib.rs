@@ -12,5 +12,5 @@ mod scored;
 
 pub use error::KovaIndexError;
 pub use flat::FlatIndex;
-pub use hnsw::HnswParams;
+pub use hnsw::{HnswIndex, HnswParams};
 pub use index::Index;
