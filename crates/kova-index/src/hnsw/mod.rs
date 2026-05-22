@@ -10,6 +10,7 @@ mod layer;
 mod node;
 mod params;
 mod search;
+mod select;
 
 use node::Node;
 pub use params::HnswParams;
