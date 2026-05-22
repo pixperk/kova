@@ -6,9 +6,11 @@
 #![forbid(unsafe_code)]
 mod error;
 mod flat;
+mod hnsw;
 mod index;
 mod scored;
 
 pub use error::KovaIndexError;
 pub use flat::FlatIndex;
+pub use hnsw::HnswParams;
 pub use index::Index;
