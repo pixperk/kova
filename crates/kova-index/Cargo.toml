@@ -1,0 +1,15 @@
+[package]
+name = "kova-index"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Index trait, brute-force baseline, and HNSW for Kova."
+
+[dependencies]
+kova-core = { path = "../kova-core" }
+thiserror.workspace = true
+
+[lints]
+workspace = true
