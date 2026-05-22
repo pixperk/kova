@@ -4,8 +4,22 @@
 //! uses to score how close two vectors are. Three concrete implementations live
 //! here: [`Cosine`], [`L2`], and [`InnerProduct`]. All return `f32` where
 //! **smaller means closer**, matching what HNSW's min-heaps expect.
+//!
+//! Implementations are SIMD-accelerated via `wide::f32x8` (8-lane f32). Any
+//! remainder past the last full 8-lane chunk is folded in scalar. The `wide`
+//! crate provides a scalar fallback on platforms without SIMD, so this code
+//! compiles and runs everywhere.
+
+use wide::f32x8;
 
 use crate::Vector;
+
+/// Load 8 consecutive f32s from a slice into a SIMD lane.
+#[inline]
+fn load8(s: &[f32]) -> f32x8 {
+    debug_assert!(s.len() >= 8);
+    f32x8::new([s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]])
+}
 
 /// A distance metric between two [`Vector`]s.
 ///
@@ -56,9 +70,34 @@ impl Distance for Cosine {
         let xs = a.as_slice();
         let ys = b.as_slice();
 
-        let dot: f32 = xs.iter().zip(ys.iter()).map(|(x, y)| x * y).sum();
-        let norm_a: f32 = xs.iter().map(|x| x * x).sum::<f32>().sqrt();
-        let norm_b: f32 = ys.iter().map(|y| y * y).sum::<f32>().sqrt();
+        // Single-pass: dot, norm_left^2, norm_right^2 accumulated together.
+        let mut dot_acc = f32x8::ZERO;
+        let mut left_norm_acc = f32x8::ZERO;
+        let mut right_norm_acc = f32x8::ZERO;
+
+        let mut iter_a = xs.chunks_exact(8);
+        let mut iter_b = ys.chunks_exact(8);
+
+        for (a_chunk, b_chunk) in iter_a.by_ref().zip(iter_b.by_ref()) {
+            let av = load8(a_chunk);
+            let bv = load8(b_chunk);
+            dot_acc += av * bv;
+            left_norm_acc += av * av;
+            right_norm_acc += bv * bv;
+        }
+
+        let mut dot: f32 = dot_acc.reduce_add();
+        let mut left_sq: f32 = left_norm_acc.reduce_add();
+        let mut right_sq: f32 = right_norm_acc.reduce_add();
+
+        for (&x, &y) in iter_a.remainder().iter().zip(iter_b.remainder().iter()) {
+            dot += x * y;
+            left_sq += x * x;
+            right_sq += y * y;
+        }
+
+        let norm_a = left_sq.sqrt();
+        let norm_b = right_sq.sqrt();
 
         // Treat a zero vector as orthogonal to everything : avoids NaN from 0/0.
         if norm_a == 0.0 || norm_b == 0.0 {
@@ -77,15 +116,27 @@ impl Distance for L2 {
     fn distance(&self, a: &Vector, b: &Vector) -> f32 {
         debug_assert_eq!(a.dim(), b.dim(), "L2: dimension mismatch");
 
-        a.as_slice()
-            .iter()
-            .zip(b.as_slice().iter())
-            .map(|(x, y)| {
-                let d = x - y;
-                d * d
-            })
-            .sum::<f32>()
-            .sqrt()
+        let xs = a.as_slice();
+        let ys = b.as_slice();
+
+        let mut acc = f32x8::ZERO;
+        let mut iter_a = xs.chunks_exact(8);
+        let mut iter_b = ys.chunks_exact(8);
+
+        for (a_chunk, b_chunk) in iter_a.by_ref().zip(iter_b.by_ref()) {
+            let av = load8(a_chunk);
+            let bv = load8(b_chunk);
+            let d = av - bv;
+            acc += d * d;
+        }
+
+        let mut sum: f32 = acc.reduce_add();
+        for (&x, &y) in iter_a.remainder().iter().zip(iter_b.remainder().iter()) {
+            let d = x - y;
+            sum += d * d;
+        }
+
+        sum.sqrt()
     }
 
     fn name(&self) -> &'static str {
@@ -97,12 +148,23 @@ impl Distance for InnerProduct {
     fn distance(&self, a: &Vector, b: &Vector) -> f32 {
         debug_assert_eq!(a.dim(), b.dim(), "InnerProduct: dimension mismatch");
 
-        let dot: f32 = a
-            .as_slice()
-            .iter()
-            .zip(b.as_slice().iter())
-            .map(|(x, y)| x * y)
-            .sum();
+        let xs = a.as_slice();
+        let ys = b.as_slice();
+
+        let mut acc = f32x8::ZERO;
+        let mut iter_a = xs.chunks_exact(8);
+        let mut iter_b = ys.chunks_exact(8);
+
+        for (a_chunk, b_chunk) in iter_a.by_ref().zip(iter_b.by_ref()) {
+            let av = load8(a_chunk);
+            let bv = load8(b_chunk);
+            acc += av * bv;
+        }
+
+        let mut dot: f32 = acc.reduce_add();
+        for (&x, &y) in iter_a.remainder().iter().zip(iter_b.remainder().iter()) {
+            dot += x * y;
+        }
 
         -dot
     }
