@@ -410,6 +410,7 @@ dependencies = [
 name = "kova-index"
 version = "0.1.0"
 dependencies = [
+ "criterion",
  "kova-core",
  "rand 0.10.1",
  "thiserror",

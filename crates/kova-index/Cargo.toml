@@ -12,5 +12,12 @@ kova-core = { path = "../kova-core" }
 thiserror.workspace = true
 rand = "0.10"
 
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "hnsw"
+harness = false
+
 [lints]
 workspace = true
