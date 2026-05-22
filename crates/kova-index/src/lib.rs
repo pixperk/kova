@@ -4,3 +4,7 @@
 //! is benchmarked against, and (later) the HNSW implementation.
 
 #![forbid(unsafe_code)]
+mod error;
+mod index;
+pub use error::KovaIndexError;
+pub use index::Index;
