@@ -9,6 +9,19 @@ with gRPC between nodes. Every byte, every index, every network call is ours.
 > *"kova"* - the Turkish word for a bucket, a hive, a vessel that holds what
 > matters. Where bees store honey, Kova stores vectors.
 
+## Workspace
+
+| Crate          | Status      | What it provides                                                       |
+| -------------- | ----------- | ---------------------------------------------------------------------- |
+| `kova-core`    | shipped     | `Vector`, `Distance` trait + `Cosine` / `L2` / `InnerProduct` (SIMD)   |
+| `kova-index`   | shipped     | `Index` trait, `FlatIndex` baseline, `HnswIndex` (insert + search)     |
+| `kova-storage` | in progress | WAL + segmentation done; mmap, Shard, checkpoints, recovery test next  |
+| `kova-query`   | not started | KQL parser, planner, executor                                          |
+| `kova-cluster` | not started | Consistent hashing, quorum replication, coordinator                    |
+| `kova-server`  | not started | gRPC node binary                                                       |
+
+106 tests passing across the workspace; `cargo clippy --workspace -- -D warnings` clean.
+
 ## Build
 
 ```sh
@@ -82,3 +95,39 @@ for uniform random data at these sizes.
 All numbers above use SIMD distance (`wide::f32x8`). The `wide` crate falls
 back to scalar on platforms without 8-lane f32 SIMD, so this builds and
 runs everywhere.
+
+## Coming up : `kova-storage`
+
+The current focus. Phase 3 turns the in-memory index into a real database
+that survives `kill -9`. Short-term goals, in order :
+
+1. **Memory-mapped `VectorStore`.** Fixed-stride flat file ; lookup by id
+   is an offset calculation, reads are zero-copy via `mmap`.
+2. **Atomic-write utility.** `tmp + fsync + rename + dirsync` helper used
+   wherever we need crash-safe file replacement (snapshots, checkpoints).
+3. **`Shard` composition.** Ties `Index`, `VectorStore`, `MetadataStore`,
+   and `Wal` together. Implements the log-then-mutate discipline so every
+   `insert` hits a fsynced WAL record before any in-memory mutation.
+4. **Crash recovery test.** Spawn a child process that inserts vectors,
+   `SIGKILL` it at a random point, reopen, verify every acknowledged
+   write is durable. Run 100 iterations with varied kill timing.
+   This is the milestone where Kova becomes a real database.
+5. **GFS-pattern checkpoints + log truncation.** Periodic snapshots of
+   in-memory state, tagged with LSN ; recovery loads checkpoint then
+   replays only newer WAL records. After the checkpoint is durable,
+   older WAL segments are physically deleted.
+
+## Longer-term scope
+
+Beyond `kova-storage` :
+
+- **`kova-query`** : KQL, a SQL-inspired query language for hybrid
+  searches that combine vector similarity with metadata filters. Pest
+  grammar, planner that picks pre-filter vs post-filter based on
+  selectivity, executor that walks plans against the storage layer.
+- **`kova-cluster` + `kova-server`** : the distribution layer. Consistent
+  hashing with virtual nodes, quorum replication, a coordinator that
+  fans out queries and merges results across shards via gRPC. `openraft`
+  for membership and leader election only ; shard logic is hand-rolled.
+- **Client SDKs** in **Rust**, **Go**, and **TypeScript** so callers
+  outside the project can talk to a Kova cluster idiomatically.
