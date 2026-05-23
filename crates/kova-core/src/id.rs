@@ -3,10 +3,13 @@
 
 use std::fmt;
 
+use serde::{Deserialize, Serialize};
+
 /// A typed identifier for vectors in Kova.
 /// This is a newtype wrapper around `u64` that provides type safety and a clear distinction from other `u64` values.
 #[repr(transparent)]
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct VectorId(u64);
 
 impl VectorId {

@@ -425,8 +425,10 @@ dependencies = [
 name = "kova-core"
 version = "0.1.0"
 dependencies = [
+ "bincode",
  "criterion",
  "proptest",
+ "serde",
  "thiserror",
  "wide",
 ]

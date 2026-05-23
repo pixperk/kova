@@ -1,6 +1,8 @@
 //! vector is the owned, dim-validated container of f32 components
 //! it's the type every distance function, every index, every storage layer will take by reference.
 
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
 use crate::KovaError;
 
 /// The `Vector` type is the owned, dim-validated container of `f32` components.
@@ -9,6 +11,21 @@ use crate::KovaError;
 //box instead of vec to ensure heap allocation and fixed size after creation
 // also Box<[T]> is more memory efficient than Vec<T> for fixed-size arrays, as it doesn't store capacity or allow resizing
 pub struct Vector(Box<[f32]>);
+
+// Hand-rolled serde so deserialisation routes through `try_new`, preserving
+// the "non-empty + finite" invariant even for bytes coming off disk.
+impl Serialize for Vector {
+    fn serialize<S: Serializer>(&self, ser: S) -> Result<S::Ok, S::Error> {
+        self.as_slice().serialize(ser)
+    }
+}
+
+impl<'de> Deserialize<'de> for Vector {
+    fn deserialize<D: Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
+        let data = Vec::<f32>::deserialize(de)?;
+        Self::try_new(data).map_err(serde::de::Error::custom)
+    }
+}
 
 impl Vector {
     /// Creates a new `Vector` from the given data, validating that it is non-empty and contains only finite values.
@@ -70,5 +87,38 @@ mod tests {
     fn test_vector_non_finite_infinity() {
         let err = Vector::try_new(vec![1.0, f32::INFINITY, 3.0]).unwrap_err();
         assert!(matches!(err, KovaError::NonFinite { index: 1, value } if value.is_infinite()));
+    }
+
+    #[test]
+    fn vector_bincode_roundtrip() {
+        let v = Vector::try_new(vec![1.0, 2.0, 3.0]).unwrap();
+        let bytes = bincode::serialize(&v).expect("serialize");
+        let decoded: Vector = bincode::deserialize(&bytes).expect("deserialize");
+        assert_eq!(decoded, v);
+    }
+
+    #[test]
+    fn vector_deserialize_rejects_nan() {
+        // Encode as a bare `Vec<f32>` containing NaN, then try to decode as
+        // `Vector`. The hand-rolled Deserialize routes through `try_new`,
+        // which must reject.
+        let bad: Vec<f32> = vec![1.0, f32::NAN, 3.0];
+        let bytes = bincode::serialize(&bad).unwrap();
+        let result: Result<Vector, _> = bincode::deserialize(&bytes);
+        assert!(
+            result.is_err(),
+            "expected NaN to be rejected on deserialize"
+        );
+    }
+
+    #[test]
+    fn vector_deserialize_rejects_empty() {
+        let bad: Vec<f32> = Vec::new();
+        let bytes = bincode::serialize(&bad).unwrap();
+        let result: Result<Vector, _> = bincode::deserialize(&bytes);
+        assert!(
+            result.is_err(),
+            "expected empty to be rejected on deserialize"
+        );
     }
 }
