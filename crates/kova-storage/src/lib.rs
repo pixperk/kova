@@ -5,3 +5,8 @@
 //! composes those with a [`kova_index::Index`]. Crash-recovery semantics
 //! follow the standard log-then-mutate discipline : every mutation hits a
 //! fsynced WAL record before any in-memory or on-disk state changes.
+
+mod error;
+mod wal;
+pub use error::KovaStorageError;
+pub use wal::{Lsn, Record, Wal};
