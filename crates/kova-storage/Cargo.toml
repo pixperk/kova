@@ -1,0 +1,18 @@
+[package]
+name = "kova-storage"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Write-ahead log, mmap vector store, and metadata index for Kova."
+
+[dependencies]
+kova-core = { path = "../kova-core" }
+thiserror.workspace = true
+crc32fast = "1"
+serde = { version = "1", features = ["derive"] }
+bincode = "1"
+
+[lints]
+workspace = true
