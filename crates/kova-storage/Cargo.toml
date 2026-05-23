@@ -7,6 +7,9 @@ license.workspace = true
 repository.workspace = true
 description = "Write-ahead log, mmap vector store, and metadata index for Kova."
 
+[dev-dependencies]
+tempfile = "3"
+
 [dependencies]
 kova-core = { path = "../kova-core" }
 thiserror.workspace = true

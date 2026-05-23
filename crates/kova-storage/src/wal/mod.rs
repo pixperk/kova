@@ -2,8 +2,10 @@
 //!
 //! The WAL is the source of truth for all mutations to
 //! the index and vector store.
+mod file_wal;
 mod in_memory;
 mod record;
+pub use file_wal::FileWal;
 pub use in_memory::InMemoryWal;
 pub use record::Record;
 use serde::{Deserialize, Serialize};

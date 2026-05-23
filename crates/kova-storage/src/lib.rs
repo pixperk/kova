@@ -9,4 +9,4 @@
 mod error;
 mod wal;
 pub use error::KovaStorageError;
-pub use wal::{InMemoryWal, Lsn, Record, Wal};
+pub use wal::{FileWal, InMemoryWal, Lsn, Record, Wal};

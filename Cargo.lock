@@ -451,6 +451,7 @@ dependencies = [
  "crc32fast",
  "kova-core",
  "serde",
+ "tempfile",
  "thiserror",
 ]
 
