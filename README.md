@@ -205,6 +205,55 @@ truncation and bounds nothing about replay time. Segmentation costs us
 databases. Same code shape will support log shipping, archive, and
 multi-segment recovery without further refactoring.
 
+### `Shard::insert` is three-phase ; apply failures after commit panic
+
+Every insert moves through three explicit phases :
+
+```text
+1. pre-commit validation     │  duplicate id, dim mismatch
+                             │  ── on Err : no state change anywhere
+                             v
+2. commit                    │  wal.append + wal.sync
+                             │  ── after Ok : op is DURABLE
+                             v
+3. apply                     │  index.insert (writes through to VectorStore)
+                             │  metadata.put
+                             │  ── on Err : panic
+```
+
+The contract :
+
+- `Ok(())` : committed **and** applied.
+- `Err(...)` : rejected in phase 1, state unchanged.
+- Phase-3 failure : process aborts. The WAL is truth ; reopen + replay
+  reconciles. The caller never sees a misleading "Err" for an
+  already-committed op.
+
+The non-obvious part is the **panic**. The naive reflex is "return Err
+from phase 3 too, let the caller decide." That's a trap : the operation
+was already committed in phase 2. If the caller treats an Err as "didn't
+happen" and retries, they reach phase 1 again with `duplicate-check :
+empty`, append a *second* `Insert{id}` record, and now the WAL holds two
+records for the same id. On the next reopen, replay applies the first
+record fine, then hits `DuplicateId` on the second and refuses to open
+the shard. One transient apply failure poisons the log permanently.
+
+The honest answer is the Postgres model : the WAL is the commit point ;
+in-memory state diverging from the WAL is a violated invariant, not a
+recoverable error. Panic, let the process restart, let replay rebuild
+in-memory state from the durable record.
+
+To keep this rare, phase 1 is aggressive : it catches every failure mode
+we can detect statically (duplicate id, dim mismatch, including the
+first-insert case where the index hasn't pinned its own dim yet — we
+fall back to the underlying `VectorStore::dim()` if the store has one).
+What's left in phase 3 is genuinely exceptional : disk full, EIO,
+filesystem corruption. For those, panic is the only safe call.
+
+Tests `dim_mismatch_on_insert_does_not_poison_wal` and
+`dim_mismatch_on_first_insert_is_caught_via_store_dim` enforce the
+no-poison guarantee.
+
 ### Metadata is not mmapped, and on purpose
 
 Vectors live in `MmapVectorStore` because they are fixed-stride, hot, and
