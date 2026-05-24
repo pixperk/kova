@@ -19,7 +19,13 @@ use crate::{Vector, VectorId};
 /// borrowed-view variant can be added if benches show the clone dominates.
 pub trait VectorStore {
     /// Error type returned by mutating operations.
-    type Error: std::fmt::Debug;
+    ///
+    /// Bounded as `Error + Send + Sync + 'static` so callers (notably
+    /// [`crate::MetadataStore`] consumers and `kova-storage::Shard`) can
+    /// box the error into a single `Box<dyn Error + Send + Sync>` for the
+    /// generic composition layer. All current impls satisfy this trivially
+    /// (`Infallible` for in-memory ; concrete `Error` types for file/mmap).
+    type Error: std::error::Error + Send + Sync + 'static;
 
     /// Store `vector` under `id`. Overwrites any existing entry for `id`.
     fn put(&mut self, id: VectorId, vector: Vector) -> Result<(), Self::Error>;

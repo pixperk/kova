@@ -50,7 +50,13 @@ pub type Metadata = HashMap<String, Value>;
 /// returns ANN candidates to apply WHERE-style filters.
 pub trait MetadataStore {
     /// Error type returned by mutating operations.
-    type Error: std::fmt::Debug;
+    ///
+    /// Bounded as `Error + Send + Sync + 'static` so callers (notably
+    /// `kova-storage::Shard`) can box the error into a single
+    /// `Box<dyn Error + Send + Sync>` for the generic composition layer.
+    /// All current impls satisfy this trivially (`Infallible` for in-memory ;
+    /// concrete `Error` types for file-backed).
+    type Error: std::error::Error + Send + Sync + 'static;
 
     /// Store `meta` under `id`. Overwrites any existing entry for `id`.
     fn put(&mut self, id: VectorId, meta: Metadata) -> Result<(), Self::Error>;
