@@ -15,12 +15,12 @@ with gRPC between nodes. Every byte, every index, every network call is ours.
 | -------------- | ----------- | ---------------------------------------------------------------------- |
 | `kova-core`    | shipped     | `Vector`, `Distance` trait + `Cosine` / `L2` / `InnerProduct` (SIMD)   |
 | `kova-index`   | shipped     | `Index` trait, `FlatIndex` baseline, `HnswIndex` (insert + search)     |
-| `kova-storage` | in progress | Segmented WAL, `MmapVectorStore`, `FileMetadataStore`, `atomic_write`; `Shard` + recovery test next |
+| `kova-storage` | in progress | Segmented WAL, `MmapVectorStore`, `FileMetadataStore`, `atomic_write`, `Shard` (log-then-mutate, SIGKILL-survival tested); delete + checkpoints next |
 | `kova-query`   | not started | KQL parser, planner, executor                                          |
 | `kova-cluster` | not started | Consistent hashing, quorum replication, coordinator                    |
 | `kova-server`  | not started | gRPC node binary                                                       |
 
-143 tests passing across the workspace; `cargo clippy --workspace -- -D warnings` clean.
+153 tests passing across the workspace; `cargo clippy --workspace --all-targets -- -D warnings` clean.
 
 ## Build
 
@@ -95,6 +95,68 @@ for uniform random data at these sizes.
 All numbers above use SIMD distance (`wide::f32x8`). The `wide` crate falls
 back to scalar on platforms without 8-lane f32 SIMD, so this builds and
 runs everywhere.
+
+## Crash recovery
+
+`Shard` is the composition layer that ties `Wal + VectorStore +
+MetadataStore + HnswIndex` together under a strict log-then-mutate
+discipline. The premise is that it must survive unplanned process
+termination : every insert the caller saw acknowledged must be present
+after reopen, every insert never acknowledged is the caller's problem.
+
+We validate this directly with a `SIGKILL` torture test. A parent
+process spawns a child binary (`crash_writer`) that opens a shard and
+inserts vectors as fast as it can, printing `ACKED <id>\n` after every
+insert that returned Ok. The parent waits a randomised delay, sends
+`SIGKILL`, drains the child's stdout pipe, then reopens the shard on
+the same directory and asserts every ACKed id is durably present.
+
+The load-bearing invariant is the ACK ordering :
+
+```text
+   shard.insert ─── wal.sync ──>  durable on disk
+                                 │
+                                 ▼
+                          writeln + flush ──>  ACK delivered to parent
+                                 │
+                       ─── kill can land here ───
+```
+
+`shard.insert` returns Ok only after `wal.sync` succeeds, so the moment
+the parent reads `ACKED <id>` the record is fsynced. Pipe contents are
+preserved across `SIGKILL` on Linux, so the parent sees exactly what
+the child flushed. The reverse (every durable insert was ACKed) is
+*not* required and does not hold — the kill can land between
+`wal.sync` and the next `flush`, leaving a durable insert the parent
+never knew about. The test correctly tolerates extras ; the only thing
+it refuses to tolerate is a missing ACKed record.
+
+| Test                       | Iterations | Acks   | Failures | Runtime (release) |
+| -------------------------- | ---------- | ------ | -------- | ----------------- |
+| `crash_recovery_smoke`     |          5 |    ~750 |        0 | ~3s               |
+| `crash_recovery_torture`   |        100 | 15,020 |        0 | ~113s             |
+
+Run them with :
+
+```sh
+cargo test -p kova-storage --test crash_recovery
+cargo test -p kova-storage --release --test crash_recovery -- --ignored --nocapture
+```
+
+Kill delays are deterministic — `1 + (iter * 173) % 1500` ms — so a
+failure on iteration N is reproducible without a `rand` dependency. The
+sequence spans from "kill before any insert lands" to "kill near the
+end of the run."
+
+### Known limitation : SIGKILL is not power loss
+
+The Linux page cache survives `SIGKILL`. Even un-fsynced mmap writes to
+`vectors.mmap` remain visible on reopen because the kernel still has
+the dirty pages. True power-loss recovery (where the page cache itself
+disappears) needs either a VM snapshot/restore harness or explicit
+`msync` on the write path. Neither is in place today. The fix tracks
+the "checkpoints + log truncation" milestone, where we'll start
+`msync`'ing mmap pages on critical boundaries.
 
 ## Design notes
 
@@ -303,22 +365,24 @@ immediately.
 
 ## Coming up : `kova-storage`
 
-The current focus : turning the in-memory index into a real database that
-survives `kill -9`. The persistence primitives are in place : segmented
-WAL, `MmapVectorStore`, `FileMetadataStore`, and `atomic_write`. What's
-left is wiring them together and proving the wiring holds under crash.
+`Shard` composition + SIGKILL crash recovery have shipped (see the
+[Crash recovery](#crash-recovery) section). Three milestones left to
+close out the storage layer :
 
-1. **`Shard` composition.** Ties `Index`, `VectorStore`, `MetadataStore`,
-   and `Wal` together. Implements the log-then-mutate discipline so every
-   `insert` hits a fsynced WAL record before any in-memory mutation.
-2. **Crash recovery test.** Spawn a child process that inserts vectors,
-   `SIGKILL` it at a random point, reopen, verify every acknowledged
-   write is durable. Run 100 iterations with varied kill timing.
-   This is the milestone where Kova becomes a real database.
+1. **Delete.** HNSW tombstoning (skip in `search_layer`),
+   `VectorStore::remove` with a free-list of holes, `MetadataStore::delete`.
+   The hybrid pattern that FAISS / hnswlib / Qdrant ship : cheap
+   tombstone on the hot path, periodic vacuum on the cold path.
+2. **Batched inserts.** `Shard::insert_many` with group-commit (N
+   appends, 1 fsync). Plus `MmapVectorStore::reserve(n)` to skip the
+   per-insert grow-remap dance, and `FileMetadataStore::flush_deferred`
+   to skip the per-put rewrite. The headline win is amortised fsync —
+   1000 inserts share one disk barrier instead of paying 1000.
 3. **GFS-pattern checkpoints + log truncation.** Periodic snapshots of
-   in-memory state, tagged with LSN ; recovery loads checkpoint then
-   replays only newer WAL records. After the checkpoint is durable,
-   older WAL segments are physically deleted.
+   in-memory state, tagged with LSN ; recovery loads the checkpoint
+   then replays only newer WAL records. After the checkpoint is durable,
+   older WAL segments are physically deleted. Vacuum (from milestone 1)
+   ties in here.
 
 ## Longer-term scope
 
