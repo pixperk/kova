@@ -38,15 +38,15 @@ Criterion mean, single core. The scalar baseline is shown for context.
 
 | Metric          | dim   | Scalar   | SIMD    | Speedup |
 | --------------- | ----- | -------- | ------- | ------- |
-| `L2`            |   128 |  110 ns  |  27 ns  |  4.1x   |
-| `L2`            |   768 |  718 ns  | 120 ns  |  6.0x   |
-| `L2`            | 1,536 | 1,430 ns | 263 ns  |  5.4x   |
-| `Cosine`        |   128 |  267 ns  |  54 ns  |  4.9x   |
-| `Cosine`        |   768 | 1,950 ns | 186 ns  | 10.5x   |
-| `Cosine`        | 1,536 | 3,870 ns | 332 ns  | **11.7x** |
-| `InnerProduct`  |   128 |   95 ns  |  21 ns  |  4.5x   |
-| `InnerProduct`  |   768 |  668 ns  | 109 ns  |  6.1x   |
-| `InnerProduct`  | 1,536 | 1,310 ns | 224 ns  |  5.8x   |
+| `L2`            |   128 |  110 ns  |  24 ns  |  4.6x   |
+| `L2`            |   768 |  718 ns  |  90 ns  |  8.0x   |
+| `L2`            | 1,536 | 1,430 ns | 171 ns  |  8.4x   |
+| `Cosine`        |   128 |  267 ns  |  34 ns  |  7.9x   |
+| `Cosine`        |   768 | 1,950 ns | 119 ns  | 16.4x   |
+| `Cosine`        | 1,536 | 3,870 ns | 220 ns  | **17.6x** |
+| `InnerProduct`  |   128 |   95 ns  |  15 ns  |  6.4x   |
+| `InnerProduct`  |   768 |  668 ns  |  75 ns  |  8.9x   |
+| `InnerProduct`  | 1,536 | 1,310 ns | 151 ns  |  8.7x   |
 
 `L2` and `InnerProduct` get the raw 8-wide SIMD benefit (~5-6x). `Cosine`
 gets ~12x because the SIMD pass also folded `dot`, `|a|^2`, and `|b|^2` into
@@ -60,9 +60,9 @@ single core, **SIMD distance**.
 
 | N       | `FlatIndex.search` | `HnswIndex.search` | HNSW speedup |
 | ------- | ------------------ | ------------------ | ------------ |
-|   1,000 |  15 us             |  79 us             |  0.19x       |
-|  10,000 | 159 us             | 161 us             |  1.0x        |
-| 100,000 | 3.65 ms            | 421 us             | **8.7x**     |
+|   1,000 |  11 us             |  62 us             |  0.17x       |
+|  10,000 | 119 us             | 122 us             |  1.0x        |
+| 100,000 | 4.9 ms             | 312 us             | **~16x**     |
 
 SIMD raises *both* lines on this table, but flat benefits more : its inner
 loop is *just* distance computation, while HNSW spends most of its time on
@@ -72,7 +72,7 @@ At 100k HNSW is still **~9x** ahead, and the gap keeps growing with N.
 
 | Operation                               | Latency |
 | --------------------------------------- | ------- |
-| `HnswIndex.insert` into 1k-vector index | 336 us  |
+| `HnswIndex.insert` into 1k-vector index | 265 us  |
 
 Run the 100k benches yourself: `cargo bench -p kova-index --bench hnsw -- at_100k`.
 The 100k build alone takes ~2-3 minutes.
@@ -96,10 +96,77 @@ All numbers above use SIMD distance (`wide::f32x8`). The `wide` crate falls
 back to scalar on platforms without 8-lane f32 SIMD, so this builds and
 runs everywhere.
 
+## Design notes
+
+A few architectural decisions worth calling out, both for future-me reading
+this six months from now and for anyone trying to follow the code.
+
+### Distance is a trait, not a function
+
+`Distance` is `Send + Sync + 'static` so the metric type composes into
+trait objects shared across threads. Concrete impls (`L2`, `Cosine`,
+`InnerProduct`) are zero-sized unit structs. `HnswIndex` and `FlatIndex`
+are both generic over `D: Distance` so the same code serves every metric
+without dispatch overhead : the compiler monomorphises per metric.
+
+The convention is `smaller = closer`. `Cosine` returns `1 - cos_similarity`
+(range `[0, 2]`) so HNSW's min-heaps order correctly without per-metric
+special-casing. `InnerProduct` is negated for the same reason.
+
+### Vectors live in a `VectorStore`, not in HNSW nodes
+
+`HnswIndex<D, V: VectorStore>` is generic over a storage backend. Nodes
+hold *graph structure only* (neighbour lists per layer) ; the actual
+vector bytes live in the composed `V`. Distance computations during
+search/insert go through `self.vectors.get(id)`.
+
+Why : storage strategy becomes pluggable. The same `HnswIndex` runs on
+top of an `InMemoryVectorStore` (HashMap, default), the eventual
+`MmapVectorStore` (file-backed, zero-copy reads), or a future
+distributed store, without any HNSW changes. Vectors live in exactly one
+place : no risk of drift between an in-memory copy and a persisted copy.
+
+The trade-off : `VectorStore::get` returns owned `Vector` (clones from
+the underlying storage). At realistic embedding dimensions (768-1536),
+the per-clone allocation adds up. If benchmarks show it dominating, the
+fix is to switch `get` to return `&[f32]` and refactor `Distance` to
+accept slices instead of `&Vector` ; ~2 hours of mechanical work.
+Deferred until measurements justify it.
+
+`FlatIndex` is intentionally not refactored : as the brute-force
+correctness baseline, it owns its vectors directly. The asymmetry
+reflects different roles, not inconsistent design.
+
+### WAL is segmented and recoverable from day one
+
+The write-ahead log lives in a directory of `wal-{16hex}.log` segment
+files, rotated at ~64 MB. Recovery enumerates segments in LSN order,
+replays each, and truncates any torn tail on the active segment.
+Truncation after a future checkpoint becomes O(1) : delete superseded
+segment files.
+
+Why : a single-file WAL is technically simpler but rules out cheap
+truncation and bounds nothing about replay time. Segmentation costs us
+~50 LOC and unlocks the full WAL design pattern from production
+databases. Same code shape will support log shipping, archive, and
+multi-segment recovery without further refactoring.
+
+### `serde::Deserialize` on `Vector` is hand-rolled
+
+`Vector::try_new` rejects NaN, ±Inf, and empty input. A blanket
+`#[derive(Deserialize)]` would bypass those checks and let invalid
+vectors come off disk. The hand-rolled `Deserialize` routes through
+`try_new` so a CRC-valid record on disk that somehow contained NaN
+cannot quietly poison the index.
+
+The test `vector_deserialize_rejects_nan` enforces this : if anyone
+"simplifies" by switching to `#[derive(Deserialize)]`, that test fails
+immediately.
+
 ## Coming up : `kova-storage`
 
-The current focus. Phase 3 turns the in-memory index into a real database
-that survives `kill -9`. Short-term goals, in order :
+The current focus : turning the in-memory index into a real database that
+survives `kill -9`. Short-term goals, in order :
 
 1. **Memory-mapped `VectorStore`.** Fixed-stride flat file ; lookup by id
    is an offset calculation, reads are zero-copy via `mmap`.
