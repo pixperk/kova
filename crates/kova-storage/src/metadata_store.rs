@@ -38,8 +38,8 @@ use std::path::{Path, PathBuf};
 
 use kova_core::{Metadata, MetadataStore, VectorId};
 
-use crate::atomic::atomic_write;
 use crate::KovaStorageError;
+use crate::atomic::atomic_write;
 
 const MAGIC: &[u8; 8] = b"KOVAMET1";
 const FORMAT_VERSION: u32 = 1;
@@ -86,8 +86,7 @@ impl FileMetadataStore {
     }
 
     fn flush(&self) -> Result<(), KovaStorageError> {
-        let payload =
-            bincode::serialize(&self.entries).map_err(KovaStorageError::Encode)?;
+        let payload = bincode::serialize(&self.entries).map_err(KovaStorageError::Encode)?;
         let mut buf = Vec::with_capacity(HEADER_LEN + payload.len());
         buf.extend_from_slice(MAGIC);
         buf.extend_from_slice(&FORMAT_VERSION.to_le_bytes());

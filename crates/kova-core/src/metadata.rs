@@ -130,7 +130,10 @@ mod tests {
         m.insert("active".into(), Value::Bool(true));
         m.insert(
             "tags".into(),
-            Value::Array(vec![Value::String("q2".into()), Value::String("urgent".into())]),
+            Value::Array(vec![
+                Value::String("q2".into()),
+                Value::String("urgent".into()),
+            ]),
         );
         m
     }
