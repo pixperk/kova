@@ -9,10 +9,12 @@
 mod atomic;
 mod error;
 mod metadata_store;
+mod shard;
 mod vector_store;
 mod wal;
 pub use atomic::atomic_write;
 pub use error::KovaStorageError;
 pub use metadata_store::FileMetadataStore;
+pub use shard::{SearchHit, Shard, ShardError};
 pub use vector_store::MmapVectorStore;
 pub use wal::{FileWal, InMemoryWal, Lsn, Record, Wal};
