@@ -53,13 +53,14 @@ impl Wal for InMemoryWal {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kova_core::{Vector, VectorId};
+    use kova_core::{Metadata, Vector, VectorId};
 
     #[allow(clippy::cast_precision_loss)]
     fn ins(n: u64) -> Record {
         Record::Insert {
             id: VectorId::new(n),
             vector: Vector::try_new(vec![n as f32]).unwrap(),
+            metadata: Metadata::new(),
         }
     }
 

@@ -3,7 +3,7 @@
 
 use std::io::{self, Read};
 
-use kova_core::{Vector, VectorId};
+use kova_core::{Metadata, Vector, VectorId};
 use serde::{Deserialize, Serialize};
 
 use crate::KovaStorageError;
@@ -17,6 +17,8 @@ pub enum Record {
         id: VectorId,
         /// The vector being inserted.
         vector: Vector,
+        /// Metadata to associate with the vector.
+        metadata: Metadata,
     },
     /// Delete the vector with the given id.
     Delete {
@@ -154,6 +156,7 @@ mod tests {
         Record::Insert {
             id: VectorId::new(42),
             vector: Vector::try_new(vec![1.0, 2.0, 3.0]).unwrap(),
+            metadata: Metadata::new(),
         }
     }
 

@@ -352,7 +352,7 @@ fn walk_segment(file: &mut File, start_lsn: u64) -> Result<(u64, u64), KovaStora
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kova_core::{Vector, VectorId};
+    use kova_core::{Metadata, Vector, VectorId};
     use tempfile::tempdir;
 
     #[allow(clippy::cast_precision_loss)]
@@ -360,6 +360,7 @@ mod tests {
         Record::Insert {
             id: VectorId::new(n),
             vector: Vector::try_new(vec![n as f32]).unwrap(),
+            metadata: Metadata::new(),
         }
     }
 
