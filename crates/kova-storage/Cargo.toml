@@ -16,6 +16,8 @@ thiserror.workspace = true
 crc32fast = "1"
 serde = { version = "1", features = ["derive"] }
 bincode = "1"
+memmap2 = "0.9"
+bytemuck = "1"
 
 [lints]
 workspace = true

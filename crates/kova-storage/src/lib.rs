@@ -7,6 +7,8 @@
 //! fsynced WAL record before any in-memory or on-disk state changes.
 
 mod error;
+mod vector_store;
 mod wal;
 pub use error::KovaStorageError;
+pub use vector_store::MmapVectorStore;
 pub use wal::{FileWal, InMemoryWal, Lsn, Record, Wal};
