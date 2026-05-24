@@ -164,6 +164,43 @@ impl MetadataStore for FileMetadataStore {
     fn len(&self) -> usize {
         self.entries.len()
     }
+
+    /// Apply many puts as a single flush.
+    ///
+    /// The default trait impl calls [`Self::put`] N times, which for
+    /// this store means N full-file rewrites + fsyncs. This override
+    /// updates the in-memory map for every item and then flushes the
+    /// whole file once at the end : O(N) memory work + 1 fsync, instead
+    /// of O(N) of each.
+    ///
+    /// # Atomicity / rollback
+    ///
+    /// On flush failure we roll back to the snapshot taken before the
+    /// batch started, so the store stays consistent with what's on disk.
+    /// For larger batches this is a real memory cost (clone of the live
+    /// map), but it preserves the "if `put_many` returned Err, the
+    /// in-memory state matches the on-disk state" invariant the singleton
+    /// `put` already guarantees.
+    fn put_many<I>(&mut self, items: I) -> Result<(), Self::Error>
+    where
+        I: IntoIterator<Item = (VectorId, Metadata)>,
+        Self: Sized,
+    {
+        // Snapshot for rollback. Skipping this would mean a flush failure
+        // mid-batch leaves the in-memory map ahead of disk, and the
+        // store would report keys it can't actually serve from disk.
+        let snapshot = self.entries.clone();
+
+        for (id, meta) in items {
+            self.entries.insert(id, meta);
+        }
+
+        if let Err(e) = self.flush() {
+            self.entries = snapshot;
+            return Err(e);
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]

@@ -132,6 +132,18 @@ impl<D: Distance, V: VectorStore> HnswIndex<D, V> {
         self.vectors.dim()
     }
 
+    /// Hint the underlying [`VectorStore`] that `additional` more puts
+    /// are coming. Lets file-backed stores grow once instead of paying
+    /// the per-`put` doubling cost.
+    ///
+    /// # Errors
+    /// Wraps any `V::Error` as [`KovaIndexError::Storage`].
+    pub fn reserve_store(&mut self, additional: usize) -> Result<(), KovaIndexError> {
+        self.vectors
+            .reserve(additional)
+            .map_err(|e| KovaIndexError::Storage(format!("{e:?}")))
+    }
+
     /// Highest layer the node with `id` occupies, or `None` if absent.
     #[must_use]
     pub fn top_layer_of(&self, id: VectorId) -> Option<usize> {

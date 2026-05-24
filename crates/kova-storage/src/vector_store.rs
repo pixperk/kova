@@ -337,6 +337,32 @@ impl VectorStore for MmapVectorStore {
     fn dim(&self) -> Option<usize> {
         Some(self.dim)
     }
+
+    /// Pre-grow the backing file to fit `additional` more slots, in one
+    /// `set_len` + remap, instead of paying the per-`put` doubling dance
+    /// for each upcoming insert.
+    ///
+    /// Caller's hint for batched workloads ; safe to call with values
+    /// larger than the actual upcoming batch (we just allocate more
+    /// capacity than we need ; nothing breaks).
+    fn reserve(&mut self, additional: usize) -> Result<(), Self::Error> {
+        // Worst case : every upcoming put allocates a fresh slot
+        // (no overwrites of existing ids), so we need room for
+        // `next_slot + additional` slots.
+        let needed_slots = self.next_slot + additional as u64;
+        let needed_bytes = HEADER_SIZE + needed_slots * self.stride;
+
+        // Grow to at least `needed_bytes`. We grow in doubling steps so
+        // many small reserves don't fragment the growth pattern.
+        let mut new_cap = self.capacity_bytes;
+        while new_cap < needed_bytes {
+            new_cap = new_cap.saturating_mul(2);
+        }
+        if new_cap > self.capacity_bytes {
+            self.grow_to(new_cap)?;
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
