@@ -1,8 +1,14 @@
 //! HNSW index implementation.
+//!
+//! `HnswIndex<D, V>` is generic over a [`Distance`] metric `D` and a
+//! [`VectorStore`] backend `V`. Graph structure (nodes + neighbour lists)
+//! is owned by the index; vector bytes live in `V`. Different storage
+//! strategies (in-memory, mmap, distributed) plug in by implementing
+//! [`VectorStore`].
 
 use std::collections::HashMap;
 
-use kova_core::{Distance, Vector, VectorId};
+use kova_core::{Distance, InMemoryVectorStore, Vector, VectorId, VectorStore};
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 
@@ -15,7 +21,7 @@ mod params;
 mod search;
 mod select;
 
-use node::Node;
+pub(crate) use node::Node;
 pub use params::HnswParams;
 
 /// Default RNG seed for `new` / `with_params`. Users wanting non-deterministic
@@ -23,23 +29,32 @@ pub use params::HnswParams;
 const DEFAULT_SEED: u64 = 0xDEAD_BEEF_DEAD_BEEF;
 
 /// Hierarchical Navigable Small World index.
-pub struct HnswIndex<D: Distance> {
+///
+/// Generic over a [`Distance`] metric and a [`VectorStore`] backend.
+/// Defaults `V = InMemoryVectorStore` so callers who don't care about
+/// storage just write `HnswIndex::new(L2)`.
+pub struct HnswIndex<D: Distance, V: VectorStore = InMemoryVectorStore> {
     metric: D,
     params: HnswParams,
+    /// Graph structure only : `nodes[id]` holds neighbour lists per layer.
+    /// Vector bytes are in `vectors`.
     nodes: HashMap<VectorId, Node>,
+    vectors: V,
     entry_point: Option<VectorId>,
     dim: Option<usize>,
     rng: StdRng,
 }
 
-impl<D: Distance> HnswIndex<D> {
-    /// Build an empty index using [`HnswParams::default`] and the default seed.
+// --- constructors that default V to InMemoryVectorStore ---
+
+impl<D: Distance> HnswIndex<D, InMemoryVectorStore> {
+    /// Build an empty index with the default in-memory store and seed.
     #[must_use]
     pub fn new(metric: D) -> Self {
         Self::seeded(metric, HnswParams::default(), DEFAULT_SEED)
     }
 
-    /// Build an empty index with caller-supplied parameters and the default seed.
+    /// Build an empty index with custom params and the default in-memory store.
     #[must_use]
     pub fn with_params(metric: D, params: HnswParams) -> Self {
         Self::seeded(metric, params, DEFAULT_SEED)
@@ -48,10 +63,21 @@ impl<D: Distance> HnswIndex<D> {
     /// Build an empty index with an explicit RNG seed (for reproducible tests).
     #[must_use]
     pub fn seeded(metric: D, params: HnswParams, seed: u64) -> Self {
+        Self::seeded_with_store(metric, params, seed, InMemoryVectorStore::new())
+    }
+}
+
+// --- constructor that lets the caller supply any VectorStore ---
+
+impl<D: Distance, V: VectorStore> HnswIndex<D, V> {
+    /// Build an empty index with a caller-supplied [`VectorStore`] and seed.
+    #[must_use]
+    pub fn seeded_with_store(metric: D, params: HnswParams, seed: u64, vectors: V) -> Self {
         Self {
             metric,
             params,
             nodes: HashMap::new(),
+            vectors,
             entry_point: None,
             dim: None,
             rng: StdRng::seed_from_u64(seed),
@@ -82,10 +108,10 @@ impl<D: Distance> HnswIndex<D> {
         self.entry_point
     }
 
-    /// Fetch a vector by id.
+    /// Fetch a vector by id (delegates to the underlying [`VectorStore`]).
     #[must_use]
-    pub fn get(&self, id: VectorId) -> Option<&Vector> {
-        self.nodes.get(&id).map(|n| &n.vector)
+    pub fn get(&self, id: VectorId) -> Option<Vector> {
+        self.vectors.get(id)
     }
 
     /// Highest layer the node with `id` occupies, or `None` if absent.
@@ -95,7 +121,7 @@ impl<D: Distance> HnswIndex<D> {
     }
 }
 
-impl<D: Distance> Index<D> for HnswIndex<D> {
+impl<D: Distance, V: VectorStore> Index<D> for HnswIndex<D, V> {
     type Error = KovaIndexError;
 
     fn insert(&mut self, id: VectorId, vector: Vector) -> Result<(), Self::Error> {

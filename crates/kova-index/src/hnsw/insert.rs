@@ -2,17 +2,26 @@
 //!
 //! Orchestrates the three helpers built on previous days:
 //! - [`super::layer::random_level`] picks the new node's top layer
-//! - [`HnswIndex::search_layer`] finds candidate neighbours per layer
-//! - [`HnswIndex::select_neighbors_heuristic`] picks `M` from those candidates
+//! - `HnswIndex::search_layer` finds candidate neighbours per layer
+//! - `HnswIndex::select_neighbors_heuristic` picks `M` from those candidates
+//!
+//! Path A : vectors are stored in [`kova_core::VectorStore`]; nodes hold only
+//! neighbour lists. Distance computations against existing nodes go through
+//! `self.vectors.get(id)`.
 
-use kova_core::{Distance, Vector, VectorId};
+use kova_core::{Distance, Vector, VectorId, VectorStore};
 
 use super::HnswIndex;
 use super::layer::random_level;
 use super::node::Node;
 use crate::KovaIndexError;
 
-impl<D: Distance> HnswIndex<D> {
+/// Convert a `VectorStore::Error` (only `Debug`-bound) into a [`KovaIndexError`].
+fn store_err<E: std::fmt::Debug>(e: E) -> KovaIndexError {
+    KovaIndexError::Storage(format!("{e:?}"))
+}
+
+impl<D: Distance, V: VectorStore> HnswIndex<D, V> {
     /// Insert `(id, vector)` into the index. Implements HNSW Algorithm 1.
     pub(crate) fn insert_impl(
         &mut self,
@@ -37,7 +46,8 @@ impl<D: Distance> HnswIndex<D> {
         // ---- First node: becomes the entry point and we're done ----
         if self.entry_point.is_none() {
             let dim = vector.dim();
-            self.nodes.insert(id, Node::new(vector, new_level));
+            self.vectors.put(id, vector).map_err(store_err)?;
+            self.nodes.insert(id, Node::new(new_level));
             self.dim = Some(dim);
             self.entry_point = Some(id);
             return Ok(());
@@ -47,6 +57,7 @@ impl<D: Distance> HnswIndex<D> {
         let top_level = self.nodes[&entry_id].top_layer();
 
         // ---- Phase A : greedy descent through layers above new_level ----
+        // The new vector is still ours; pass it as the query.
         let mut current_ep = entry_id;
         if new_level < top_level {
             for layer in ((new_level + 1)..=top_level).rev() {
@@ -73,10 +84,11 @@ impl<D: Distance> HnswIndex<D> {
         }
 
         // ---- Phase C : register the node, wire edges, prune overflow ----
-        self.nodes.insert(id, Node::new(vector, new_level));
+        // `vector` is moved into the store here. After this line we look it
+        // up via `self.vectors.get(id)` if we need it again.
+        self.vectors.put(id, vector).map_err(store_err)?;
+        self.nodes.insert(id, Node::new(new_level));
 
-        // Take the neighbour lists out so we can index by layer without
-        // tripping the borrow checker once we start mutating self.nodes.
         let layers_with_neighbours: Vec<(usize, Vec<(VectorId, f32)>)> =
             neighbours_per_layer.into_iter().enumerate().collect();
 
@@ -109,8 +121,7 @@ impl<D: Distance> HnswIndex<D> {
     fn prune_neighbours(&mut self, node_id: VectorId, layer: usize) {
         let cap = self.params.m_for_layer(layer);
 
-        // Snapshot the candidate list while holding the immutable borrow,
-        // then drop it before mutating self.
+        // Snapshot the candidate list, then drop all borrows before mutating.
         let candidates = {
             let Some(node) = self.nodes.get(&node_id) else {
                 return;
@@ -118,13 +129,15 @@ impl<D: Distance> HnswIndex<D> {
             if node.neighbors[layer].len() <= cap {
                 return;
             }
-            let node_vec = &node.vector;
+            let Some(node_vec) = self.vectors.get(node_id) else {
+                return;
+            };
             let mut scored: Vec<(VectorId, f32)> = node.neighbors[layer]
                 .iter()
                 .filter_map(|&nn_id| {
-                    self.nodes
-                        .get(&nn_id)
-                        .map(|nn| (nn_id, self.metric.distance(node_vec, &nn.vector)))
+                    self.vectors
+                        .get(nn_id)
+                        .map(|nn_vec| (nn_id, self.metric.distance(&node_vec, &nn_vec)))
                 })
                 .collect();
             scored.sort_by(|a, b| a.1.total_cmp(&b.1));
@@ -202,7 +215,6 @@ mod tests {
     #[test]
     #[allow(clippy::cast_precision_loss)]
     fn seeded_inserts_are_deterministic() {
-        // Same seed + same input order = structurally identical graph.
         let mut a = HnswIndex::seeded(L2, super::super::HnswParams::default(), 42);
         let mut b = HnswIndex::seeded(L2, super::super::HnswParams::default(), 42);
 
@@ -221,15 +233,12 @@ mod tests {
     #[test]
     #[allow(clippy::cast_precision_loss)]
     fn neighbour_lists_respect_layer_cap() {
-        // After many inserts, no node's layer-0 neighbour list may exceed m_max0
-        // (the pruning step must enforce this).
         let mut idx = HnswIndex::seeded(L2, super::super::HnswParams::default(), 11);
         let cap = idx.params().m_max0;
         for i in 0..40 {
             let f = i as f32;
             idx.insert(id(i), v(vec![f, f + 0.5])).unwrap();
         }
-        // Direct invariant check via the private nodes map (same module tree).
         for node in idx.nodes.values() {
             assert!(node.neighbors[0].len() <= cap);
         }

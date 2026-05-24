@@ -26,4 +26,10 @@ pub enum KovaIndexError {
     /// Underlying validation from `kova-core`.
     #[error(transparent)]
     Core(#[from] kova_core::KovaError),
+
+    /// Error from the underlying [`kova_core::VectorStore`] impl.
+    /// Carries a stringified `Debug` so we don't have to be generic over
+    /// the store's concrete error type here.
+    #[error("vector store error: {0}")]
+    Storage(String),
 }

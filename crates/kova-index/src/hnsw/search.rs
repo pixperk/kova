@@ -1,20 +1,21 @@
 //! HNSW search : the workhorse `search_layer` (Algorithm 2) and the
 //! user-facing `search_impl` (Algorithm 5).
+//!
+//! Path A : neighbours' vectors are fetched via [`kova_core::VectorStore`]
+//! at each distance computation. Returns owned [`Vector`] per call; cloning
+//! cost is the tradeoff for the storage abstraction.
 
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashSet};
 
-use kova_core::{Distance, Vector, VectorId};
+use kova_core::{Distance, Vector, VectorId, VectorStore};
 
 use super::HnswIndex;
 use crate::KovaIndexError;
 use crate::scored::ScoredId;
 
-impl<D: Distance> HnswIndex<D> {
+impl<D: Distance, V: VectorStore> HnswIndex<D, V> {
     /// Bounded best-first walk at `layer`, seeded by `entry_points`.
-    ///
-    /// Returns up to `ef` `(id, distance)` pairs sorted ascending by distance.
-    /// Allocates fresh state per call so concurrent reads do not interfere.
     pub(crate) fn search_layer(
         &self,
         query: &Vector,
@@ -35,10 +36,10 @@ impl<D: Distance> HnswIndex<D> {
             if !visited.insert(ep) {
                 continue;
             }
-            let Some(node) = self.nodes.get(&ep) else {
+            let Some(ep_vec) = self.vectors.get(ep) else {
                 continue;
             };
-            let distance = self.metric.distance(query, &node.vector);
+            let distance = self.metric.distance(query, &ep_vec);
             let scored = ScoredId { id: ep, distance };
             candidates.push(Reverse(scored));
             results.push(scored);
@@ -48,8 +49,6 @@ impl<D: Distance> HnswIndex<D> {
         }
 
         while let Some(Reverse(c)) = candidates.pop() {
-            // No remaining candidate can improve results : the closest
-            // unexplored is already worse than our current worst result.
             if let Some(worst) = results.peek()
                 && c.distance > worst.distance
             {
@@ -59,7 +58,6 @@ impl<D: Distance> HnswIndex<D> {
             let Some(c_node) = self.nodes.get(&c.id) else {
                 continue;
             };
-            // Defensively skip if c does not live at this layer.
             let Some(neighbours) = c_node.neighbors.get(layer) else {
                 continue;
             };
@@ -68,10 +66,10 @@ impl<D: Distance> HnswIndex<D> {
                 if !visited.insert(n_id) {
                     continue;
                 }
-                let Some(n_node) = self.nodes.get(&n_id) else {
+                let Some(n_vec) = self.vectors.get(n_id) else {
                     continue;
                 };
-                let n_dist = self.metric.distance(query, &n_node.vector);
+                let n_dist = self.metric.distance(query, &n_vec);
                 let worst_dist = results.peek().map_or(f32::INFINITY, |w| w.distance);
 
                 if results.len() < ef || n_dist < worst_dist {
@@ -96,10 +94,6 @@ impl<D: Distance> HnswIndex<D> {
     }
 
     /// User-facing search : HNSW Algorithm 5.
-    ///
-    /// Greedy descent through upper layers with `ef = 1`, then one
-    /// `search_layer` at layer 0 with `ef = max(ef_search, k)`. Returns up
-    /// to `k` `(id, distance)` pairs sorted ascending by distance.
     pub(crate) fn search_impl(
         &self,
         query: &Vector,
@@ -123,10 +117,8 @@ impl<D: Distance> HnswIndex<D> {
         }
 
         let top_level = self.nodes[&entry_id].top_layer();
-        // ef_search must be at least k to return k results.
         let ef = self.params.ef_search.max(k);
 
-        // Greedy descent through upper layers (ef = 1).
         let mut current_ep = entry_id;
         for layer in (1..=top_level).rev() {
             let nearest = self.search_layer(query, &[current_ep], 1, layer);
@@ -135,19 +127,21 @@ impl<D: Distance> HnswIndex<D> {
             }
         }
 
-        // Layer-0 search with the full beam.
         let mut results = self.search_layer(query, &[current_ep], ef, 0);
         results.truncate(k);
         Ok(results)
     }
 }
 
+// Test-only helpers : only available on the default in-memory store so we
+// don't have to worry about fallible `put` in test code.
 #[cfg(test)]
-impl<D: Distance> HnswIndex<D> {
+impl<D: Distance> HnswIndex<D, kova_core::InMemoryVectorStore> {
     /// Test-only: stash a node directly with empty neighbour lists.
     pub(crate) fn test_insert_node(&mut self, id: VectorId, vector: Vector, top_layer: usize) {
         let dim = vector.dim();
-        self.nodes.insert(id, super::Node::new(vector, top_layer));
+        self.vectors.put(id, vector).expect("infallible store");
+        self.nodes.insert(id, super::Node::new(top_layer));
         if self.dim.is_none() {
             self.dim = Some(dim);
         }
@@ -167,7 +161,7 @@ impl<D: Distance> HnswIndex<D> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kova_core::L2;
+    use kova_core::{InMemoryVectorStore, L2};
 
     fn v(data: Vec<f32>) -> Vector {
         Vector::try_new(data).expect("test vector")
@@ -183,7 +177,7 @@ mod tests {
 
     #[test]
     fn empty_index_returns_empty() {
-        let idx: HnswIndex<L2> = HnswIndex::new(L2);
+        let idx: HnswIndex<L2, InMemoryVectorStore> = HnswIndex::new(L2);
         let q = v(vec![0.0]);
         let out = idx.search_layer(&q, &[id(1)], 4, 0);
         assert!(out.is_empty());
@@ -210,15 +204,13 @@ mod tests {
 
     #[test]
     fn finds_closer_neighbour_via_edge() {
-        // A at 10, B at 1, edge between them at layer 0. Query is at 0.
         let mut idx = HnswIndex::new(L2);
-        idx.test_insert_node(id(1), v(vec![10.0]), 0); // A
-        idx.test_insert_node(id(2), v(vec![1.0]), 0); // B
+        idx.test_insert_node(id(1), v(vec![10.0]), 0);
+        idx.test_insert_node(id(2), v(vec![1.0]), 0);
         idx.test_add_edge(id(1), id(2), 0);
         idx.test_add_edge(id(2), id(1), 0);
 
         let q = v(vec![0.0]);
-        // Enter at A; B should win at ef=1 because B is closer to Q.
         let out = idx.search_layer(&q, &[id(1)], 1, 0);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].0, id(2));
@@ -226,7 +218,6 @@ mod tests {
 
     #[test]
     fn ef_bounds_result_size() {
-        // 5 nodes on a fully-connected layer-0 graph.
         let mut idx = HnswIndex::new(L2);
         let points = [(1, 0.1), (2, 0.2), (3, 5.0), (4, 10.0), (5, 100.0)];
         for &(n, x) in &points {
@@ -241,16 +232,14 @@ mod tests {
         }
 
         let q = v(vec![0.0]);
-        let out = idx.search_layer(&q, &[id(3)], 2, 0); // enter at the middle node
+        let out = idx.search_layer(&q, &[id(3)], 2, 0);
         assert_eq!(out.len(), 2);
-        // The two closest are id 1 (0.1) and id 2 (0.2).
         assert_eq!(out[0].0, id(1));
         assert_eq!(out[1].0, id(2));
     }
 
     #[test]
     fn multiple_entry_points() {
-        // No edges. Each entry point is its own island.
         let mut idx = HnswIndex::new(L2);
         idx.test_insert_node(id(1), v(vec![1.0]), 0);
         idx.test_insert_node(id(2), v(vec![2.0]), 0);
@@ -266,7 +255,6 @@ mod tests {
 
     #[test]
     fn results_sorted_ascending() {
-        // Walk from id 1 across edges to discover 2 and 3.
         let mut idx = HnswIndex::new(L2);
         idx.test_insert_node(id(1), v(vec![5.0]), 0);
         idx.test_insert_node(id(2), v(vec![1.0]), 0);
@@ -277,7 +265,6 @@ mod tests {
         let q = v(vec![0.0]);
         let out = idx.search_layer(&q, &[id(1)], 3, 0);
         assert_eq!(out.len(), 3);
-        // Ascending: 2 (d=1), 3 (d=3), 1 (d=5).
         assert_eq!(out[0].0, id(2));
         assert_eq!(out[1].0, id(3));
         assert_eq!(out[2].0, id(1));
@@ -289,7 +276,7 @@ mod tests {
 
     #[test]
     fn search_impl_empty_index_returns_empty() {
-        let idx: HnswIndex<L2> = HnswIndex::new(L2);
+        let idx: HnswIndex<L2, InMemoryVectorStore> = HnswIndex::new(L2);
         let out = idx.search_impl(&v(vec![0.0]), 5).unwrap();
         assert!(out.is_empty());
     }
@@ -331,8 +318,6 @@ mod tests {
         }
     }
 
-    /// Helper: insert `n` random `dim`-d vectors into both index types,
-    /// run `queries` random queries, return mean recall@`k`.
     #[allow(clippy::cast_precision_loss)]
     fn measure_recall(n: u64, dim: usize, k: usize, queries: usize, data_seed: u64) -> f32 {
         use crate::{FlatIndex, Index};
@@ -379,8 +364,6 @@ mod tests {
         assert!(r > 0.9, "recall@10 at n=300 was {r:.3}, expected > 0.9");
     }
 
-    /// Bigger scale, more realistic dim. Default test so CI catches
-    /// regressions at the 10k milestone. ~5s on a modern laptop.
     #[test]
     fn recall_at_10_vs_flat_on_10k_dim32() {
         let r = measure_recall(10_000, 32, 10, 20, 99);
@@ -390,8 +373,6 @@ mod tests {
         );
     }
 
-    /// 50k scale. Ignored by default (~75s); run with
-    /// `cargo test --release -- --ignored` for full validation.
     #[test]
     #[ignore = "slow: ~75s; run with --ignored"]
     fn recall_at_10_vs_flat_on_50k_dim32() {

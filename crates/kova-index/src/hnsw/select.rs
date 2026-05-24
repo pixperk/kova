@@ -8,11 +8,11 @@
 //! This is what gives the HNSW graph its small-world property. Replacing it
 //! with naive "top-m by distance to query" silently caps recall around 70%.
 
-use kova_core::{Distance, VectorId};
+use kova_core::{Distance, VectorId, VectorStore};
 
 use super::HnswIndex;
 
-impl<D: Distance> HnswIndex<D> {
+impl<D: Distance, V: VectorStore> HnswIndex<D, V> {
     /// Pick up to `m` neighbours from `candidates`, preferring diversity.
     ///
     /// `candidates` must be sorted ascending by distance to the query
@@ -34,17 +34,17 @@ impl<D: Distance> HnswIndex<D> {
                 break;
             }
 
-            let Some(c_node) = self.nodes.get(&c_id) else {
+            let Some(c_vec) = self.vectors.get(c_id) else {
                 continue;
             };
 
             // c is "dominated" if any already-selected s is closer to c than
             // the query is : i.e. s covers c's direction.
             let dominated = result.iter().any(|&(s_id, _)| {
-                let Some(s_node) = self.nodes.get(&s_id) else {
+                let Some(s_vec) = self.vectors.get(s_id) else {
                     return false;
                 };
-                self.metric.distance(&c_node.vector, &s_node.vector) < c_to_query
+                self.metric.distance(&c_vec, &s_vec) < c_to_query
             });
 
             if !dominated {
