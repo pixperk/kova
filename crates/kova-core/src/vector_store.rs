@@ -61,6 +61,21 @@ pub trait VectorStore {
     fn dim(&self) -> Option<usize> {
         None
     }
+
+    /// Pre-grow capacity for `additional` upcoming `put`s.
+    ///
+    /// Hint, not a guarantee : implementations are free to ignore it
+    /// (default does), but file-backed stores override to grow once
+    /// instead of paying the per-`put` grow cost. Caller's responsibility
+    /// to ensure the requested capacity actually fits ; this is an
+    /// optimisation, not an allocation reservation.
+    ///
+    /// # Errors
+    /// Returns `Self::Error` if the underlying grow operation fails (e.g.
+    /// `ENOSPC` for a file-backed store).
+    fn reserve(&mut self, _additional: usize) -> Result<(), Self::Error> {
+        Ok(())
+    }
 }
 
 /// Trivial in-memory [`VectorStore`] backed by a `HashMap`.

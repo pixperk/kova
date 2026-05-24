@@ -79,6 +79,32 @@ pub trait MetadataStore {
     fn contains(&self, id: VectorId) -> bool {
         self.get(id).is_some()
     }
+
+    /// Insert many `(id, metadata)` pairs as a single logical batch.
+    ///
+    /// Default implementation just calls [`Self::put`] for each item.
+    /// Backends that benefit from batching (e.g. a file-backed store
+    /// that rewrites the whole file on every `put`) should override to
+    /// amortise the per-item cost across the batch.
+    ///
+    /// # Object safety
+    /// This method takes a generic `IntoIterator`, which makes it
+    /// callable only when `Self: Sized`. Use [`Self::put`] in a loop if
+    /// you need to call through `&dyn MetadataStore`.
+    ///
+    /// # Errors
+    /// Returns `Self::Error` on the first failure ; partial application
+    /// of preceding items is implementation-defined.
+    fn put_many<I>(&mut self, items: I) -> Result<(), Self::Error>
+    where
+        I: IntoIterator<Item = (VectorId, Metadata)>,
+        Self: Sized,
+    {
+        for (id, meta) in items {
+            self.put(id, meta)?;
+        }
+        Ok(())
+    }
 }
 
 /// Trivial in-memory [`MetadataStore`] backed by a `HashMap`.
