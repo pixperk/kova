@@ -24,12 +24,18 @@
 //! ```
 
 use std::error::Error as StdError;
+use std::path::Path;
 
-use kova_core::{Distance, Metadata, MetadataStore, VectorId, VectorStore};
-use kova_index::{HnswIndex, KovaIndexError};
+use kova_core::{Distance, Metadata, MetadataStore, Vector, VectorId, VectorStore};
+use kova_index::{HnswIndex, HnswParams, Index, KovaIndexError};
 use thiserror::Error;
 
-use crate::Wal;
+use crate::{FileMetadataStore, FileWal, Lsn, MmapVectorStore, Record, Wal};
+
+/// Default RNG seed for [`Shard::from_parts`] / [`Shard::open`], mirroring
+/// `HnswIndex::new`'s default. Tests that need a different seed call
+/// [`Shard::from_parts_seeded`] / [`Shard::open_seeded`].
+const DEFAULT_SEED: u64 = 0xDEAD_BEEF_DEAD_BEEF;
 
 /// Errors produced by [`Shard`] operations.
 ///
@@ -105,10 +111,339 @@ where
     M: MetadataStore,
     W: Wal,
 {
-    #[allow(dead_code)] // populated in the next chunk (insert/search/replay)
-    pub(crate) index: HnswIndex<D, V>,
-    #[allow(dead_code)]
-    pub(crate) metadata: M,
-    #[allow(dead_code)]
-    pub(crate) wal: W,
+    index: HnswIndex<D, V>,
+    metadata: M,
+    wal: W,
+}
+
+// -----------------------------------------------------------------------------
+// Generic impl : works for any compatible quartet of primitives.
+// -----------------------------------------------------------------------------
+
+impl<D, V, M, W> Shard<D, V, M, W>
+where
+    D: Distance,
+    V: VectorStore,
+    M: MetadataStore,
+    W: Wal,
+{
+    /// Compose a shard from already-constructed primitives, using the
+    /// default RNG seed for the index. Runs WAL replay before returning,
+    /// so the index catches up with whatever state the stores were left in.
+    ///
+    /// # Errors
+    /// Returns [`ShardError`] if WAL iteration or any replayed mutation fails.
+    pub fn from_parts(
+        metric: D,
+        params: HnswParams,
+        vectors: V,
+        metadata: M,
+        wal: W,
+    ) -> Result<Self, ShardError> {
+        Self::from_parts_seeded(metric, params, DEFAULT_SEED, vectors, metadata, wal)
+    }
+
+    /// Like [`Self::from_parts`] but with an explicit RNG seed. Used by
+    /// tests that need reproducible graph construction.
+    ///
+    /// # Errors
+    /// See [`Self::from_parts`].
+    pub fn from_parts_seeded(
+        metric: D,
+        params: HnswParams,
+        seed: u64,
+        vectors: V,
+        metadata: M,
+        wal: W,
+    ) -> Result<Self, ShardError> {
+        let index = HnswIndex::seeded_with_store(metric, params, seed, vectors);
+        let mut shard = Self {
+            index,
+            metadata,
+            wal,
+        };
+        shard.replay()?;
+        Ok(shard)
+    }
+
+    /// Insert `(id, vector, metadata)` under the log-then-mutate discipline :
+    ///
+    /// 1. Reject duplicate ids upfront (cheap O(1) `HashMap` check on the index).
+    /// 2. Build a [`Record::Insert`] and `append` + `sync` it to the WAL.
+    ///    After `sync` returns Ok, the WAL is the durable witness.
+    /// 3. Apply to the in-memory index (which also writes through to the
+    ///    [`VectorStore`]), then the [`MetadataStore`].
+    ///
+    /// If the process dies anywhere in step 3, replay on reopen will redo
+    /// the operation idempotently. If it dies in step 1 or 2, the caller's
+    /// `append`/`sync` returns Err and they know the write isn't durable.
+    ///
+    /// # Errors
+    /// - [`ShardError::Index`] with `KovaIndexError::DuplicateId` if `id`
+    ///   already exists in the shard.
+    /// - [`ShardError::Backend`] from the WAL `append` / `sync`, the
+    ///   vector store `put` (inside `index.insert`), or the metadata store `put`.
+    pub fn insert(
+        &mut self,
+        id: VectorId,
+        vector: Vector,
+        metadata: Metadata,
+    ) -> Result<(), ShardError> {
+        // Cheap upfront duplicate check : `HashMap` lookup, no vector clone.
+        // Failing here means no WAL append, no state change ; the WAL stays
+        // clean of duplicate records by construction, which keeps replay
+        // simple (it can assume every Insert is for a fresh id).
+        if self.index.top_layer_of(id).is_some() {
+            return Err(KovaIndexError::DuplicateId { id }.into());
+        }
+
+        // 1. Build the record. Clones are unavoidable : Record needs to own
+        //    the data for serialisation, and the index needs it for insertion.
+        let record = Record::Insert {
+            id,
+            vector: vector.clone(),
+            metadata: metadata.clone(),
+        };
+
+        // 2. Durability barrier.
+        self.wal.append(&record).map_err(ShardError::backend)?;
+        self.wal.sync().map_err(ShardError::backend)?;
+
+        // 3. Apply. `index.insert` writes through to the underlying VectorStore.
+        self.index.insert(id, vector)?;
+        self.metadata
+            .put(id, metadata)
+            .map_err(ShardError::backend)?;
+
+        Ok(())
+    }
+
+    /// k-nearest search. Returns hits in increasing distance order, each
+    /// with its attached metadata read from the metadata store.
+    ///
+    /// Missing metadata (e.g. an id present in the index but absent from
+    /// the metadata store, which shouldn't happen under normal operation
+    /// but can after partial recovery) is filled with an empty `Metadata`
+    /// rather than failing the whole query.
+    ///
+    /// # Errors
+    /// Returns [`ShardError::Index`] if the index search fails (e.g.
+    /// dimension mismatch).
+    pub fn search(&self, query: &Vector, k: usize) -> Result<Vec<SearchHit>, ShardError> {
+        let hits = self.index.search(query, k)?;
+        let results = hits
+            .into_iter()
+            .map(|(id, distance)| {
+                let metadata = self.metadata.get(id).unwrap_or_default();
+                SearchHit {
+                    id,
+                    distance,
+                    metadata,
+                }
+            })
+            .collect();
+        Ok(results)
+    }
+
+    /// Whether the shard currently holds an entry for `id`.
+    ///
+    /// O(1) check against the index's in-memory node map ; does not touch
+    /// the vector store or metadata store.
+    #[must_use]
+    pub fn contains(&self, id: VectorId) -> bool {
+        self.index.top_layer_of(id).is_some()
+    }
+
+    /// Number of vectors currently in the shard.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.index.len()
+    }
+
+    /// Whether the shard is empty.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.index.len() == 0
+    }
+
+    /// Replay every WAL record (LSN order) into the index + stores.
+    ///
+    /// Called once during construction. The stores may already hold
+    /// persisted state from a previous run ; the index is always fresh
+    /// (graph structure is in-memory only). Every backend `put` is
+    /// idempotent (overwrite-in-place), so re-applying a record that was
+    /// already partially applied before a crash is safe.
+    ///
+    /// We materialise the records into a `Vec` up front because the
+    /// `iter_from` borrow conflicts with the mutable borrows we need on
+    /// `self.index` / `self.metadata` to apply them.
+    fn replay(&mut self) -> Result<(), ShardError> {
+        let records: Vec<(Lsn, Record)> = self
+            .wal
+            .iter_from(Lsn::ZERO)
+            .collect::<Result<_, _>>()
+            .map_err(ShardError::backend)?;
+
+        for (_lsn, record) in records {
+            match record {
+                Record::Insert {
+                    id,
+                    vector,
+                    metadata,
+                } => {
+                    self.index.insert(id, vector)?;
+                    self.metadata
+                        .put(id, metadata)
+                        .map_err(ShardError::backend)?;
+                }
+                Record::Delete { id } => {
+                    // HNSW delete lands in the delete milestone (tombstone +
+                    // free-list). For now replay only propagates the delete
+                    // to the metadata store ; the index is left as-is.
+                    self.metadata.delete(id).map_err(ShardError::backend)?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Concrete impl : the production file-backed combo. Wires up `FileWal +
+// MmapVectorStore + FileMetadataStore` from a single data directory.
+// -----------------------------------------------------------------------------
+
+impl<D: Distance> Shard<D, MmapVectorStore, FileMetadataStore, FileWal> {
+    /// Open (or create) a file-backed shard rooted at `dir`. Uses the
+    /// default RNG seed.
+    ///
+    /// On first open, creates the directory and empty backing files. On
+    /// subsequent opens, the stores recover their persisted state and the
+    /// WAL is replayed to rebuild the in-memory index.
+    ///
+    /// `dim` pins the vector dimension. If the underlying `vectors.mmap`
+    /// already exists with a different dim, [`MmapVectorStore::open`]
+    /// surfaces the mismatch as [`crate::KovaStorageError::CorruptRecord`].
+    ///
+    /// # Errors
+    /// Any [`crate::KovaStorageError`] from the backing primitives bubbles
+    /// up as [`ShardError::Backend`].
+    pub fn open(
+        dir: impl AsRef<Path>,
+        dim: usize,
+        metric: D,
+        params: HnswParams,
+    ) -> Result<Self, ShardError> {
+        Self::open_seeded(dir, dim, metric, params, DEFAULT_SEED)
+    }
+
+    /// Like [`Self::open`] but with an explicit RNG seed.
+    ///
+    /// # Errors
+    /// See [`Self::open`].
+    pub fn open_seeded(
+        dir: impl AsRef<Path>,
+        dim: usize,
+        metric: D,
+        params: HnswParams,
+        seed: u64,
+    ) -> Result<Self, ShardError> {
+        let dir = dir.as_ref();
+        std::fs::create_dir_all(dir).map_err(ShardError::backend)?;
+
+        let wal = FileWal::open(dir.join("wal")).map_err(ShardError::backend)?;
+        let vectors =
+            MmapVectorStore::open(dir.join("vectors.mmap"), dim).map_err(ShardError::backend)?;
+        let metadata =
+            FileMetadataStore::open(dir.join("metadata.bin")).map_err(ShardError::backend)?;
+
+        Self::from_parts_seeded(metric, params, seed, vectors, metadata, wal)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kova_core::{InMemoryMetadataStore, InMemoryVectorStore, L2, Value};
+    use kova_index::HnswParams;
+
+    use crate::InMemoryWal;
+
+    fn v(data: Vec<f32>) -> Vector {
+        Vector::try_new(data).unwrap()
+    }
+
+    fn id(n: u64) -> VectorId {
+        VectorId::new(n)
+    }
+
+    fn tag_meta(tag: &str) -> Metadata {
+        let mut m = Metadata::new();
+        m.insert("tag".into(), Value::String(tag.into()));
+        m
+    }
+
+    /// Smoke test : compose in-memory primitives, insert a couple of
+    /// vectors, search, verify hits + metadata. Exercises every public
+    /// method on the generic impl in one flow.
+    #[test]
+    fn insert_then_search_with_in_memory_primitives() {
+        let mut shard = Shard::from_parts(
+            L2,
+            HnswParams::default(),
+            InMemoryVectorStore::new(),
+            InMemoryMetadataStore::new(),
+            InMemoryWal::new(),
+        )
+        .unwrap();
+
+        assert!(shard.is_empty());
+        assert_eq!(shard.len(), 0);
+
+        shard
+            .insert(id(1), v(vec![1.0, 0.0]), tag_meta("alpha"))
+            .unwrap();
+        shard
+            .insert(id(2), v(vec![0.0, 1.0]), tag_meta("beta"))
+            .unwrap();
+
+        assert_eq!(shard.len(), 2);
+        assert!(shard.contains(id(1)));
+        assert!(!shard.contains(id(99)));
+
+        let hits = shard.search(&v(vec![1.0, 0.05]), 2).unwrap();
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].id, id(1)); // nearest to (1.0, 0.05)
+        assert_eq!(
+            hits[0].metadata.get("tag"),
+            Some(&Value::String("alpha".into()))
+        );
+    }
+
+    /// Inserting the same id twice errors with `DuplicateId` and does not
+    /// append a second WAL record (the duplicate check fires before any
+    /// state change).
+    #[test]
+    fn duplicate_insert_is_rejected() {
+        let mut shard = Shard::from_parts(
+            L2,
+            HnswParams::default(),
+            InMemoryVectorStore::new(),
+            InMemoryMetadataStore::new(),
+            InMemoryWal::new(),
+        )
+        .unwrap();
+
+        shard.insert(id(7), v(vec![1.0]), Metadata::new()).unwrap();
+        let err = shard
+            .insert(id(7), v(vec![2.0]), Metadata::new())
+            .unwrap_err();
+        match err {
+            ShardError::Index(KovaIndexError::DuplicateId { id: got }) => {
+                assert_eq!(got, id(7));
+            }
+            other => panic!("expected DuplicateId, got {other:?}"),
+        }
+        assert_eq!(shard.len(), 1);
+    }
 }
