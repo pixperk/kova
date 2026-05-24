@@ -128,6 +128,16 @@ impl<D: Distance, V: VectorStore> HnswIndex<D, V> {
         }
 
         let mut results = self.search_layer(query, &[current_ep], ef, 0);
+
+        // Tombstoned ids stay in the graph (so traversal works) but are
+        // filtered out of returned hits. Filtering after `search_layer`
+        // means the result count may be smaller than `k` when many
+        // candidates in the neighbourhood are deleted ; vacuum eventually
+        // restores result quality.
+        if !self.tombstones.is_empty() {
+            results.retain(|(id, _)| !self.tombstones.contains(id));
+        }
+
         results.truncate(k);
         Ok(results)
     }

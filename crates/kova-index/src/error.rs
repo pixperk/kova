@@ -23,6 +23,20 @@ pub enum KovaIndexError {
         id: VectorId,
     },
 
+    /// Tried to delete / tombstone a `VectorId` that is not in the index.
+    #[error("vector ID not found: {id}")]
+    NotFound {
+        /// The `VectorId` that was looked up.
+        id: VectorId,
+    },
+
+    /// Tried to delete a `VectorId` that is already tombstoned.
+    #[error("vector ID already deleted: {id}")]
+    AlreadyDeleted {
+        /// The `VectorId` that was already deleted.
+        id: VectorId,
+    },
+
     /// Underlying validation from `kova-core`.
     #[error(transparent)]
     Core(#[from] kova_core::KovaError),

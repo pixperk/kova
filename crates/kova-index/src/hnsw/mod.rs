@@ -6,7 +6,7 @@
 //! strategies (in-memory, mmap, distributed) plug in by implementing
 //! [`VectorStore`].
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use kova_core::{Distance, InMemoryVectorStore, Vector, VectorId, VectorStore};
 use rand::SeedableRng;
@@ -40,6 +40,11 @@ pub struct HnswIndex<D: Distance, V: VectorStore = InMemoryVectorStore> {
     /// Vector bytes are in `vectors`.
     nodes: HashMap<VectorId, Node>,
     vectors: V,
+    /// Logically-deleted ids. Their graph nodes and vectors stay in place
+    /// so `search_layer` can still traverse through them (preserves graph
+    /// connectivity), but `search` filters them out of the returned hits.
+    /// Vacuum (future milestone) actually frees the storage.
+    tombstones: HashSet<VectorId>,
     entry_point: Option<VectorId>,
     dim: Option<usize>,
     rng: StdRng,
@@ -78,6 +83,7 @@ impl<D: Distance, V: VectorStore> HnswIndex<D, V> {
             params,
             nodes: HashMap::new(),
             vectors,
+            tombstones: HashSet::new(),
             entry_point: None,
             dim: None,
             rng: StdRng::seed_from_u64(seed),
@@ -131,6 +137,41 @@ impl<D: Distance, V: VectorStore> HnswIndex<D, V> {
     pub fn top_layer_of(&self, id: VectorId) -> Option<usize> {
         self.nodes.get(&id).map(Node::top_layer)
     }
+
+    /// Mark `id` as logically deleted.
+    ///
+    /// The node and its vector stay in place so search can still traverse
+    /// through the graph ; subsequent searches simply filter `id` out of
+    /// the returned hits. Vacuum (future milestone) is what actually
+    /// reclaims storage.
+    ///
+    /// # Errors
+    /// - [`KovaIndexError::NotFound`] if `id` was never inserted.
+    /// - [`KovaIndexError::AlreadyDeleted`] if `id` is already tombstoned.
+    pub fn tombstone(&mut self, id: VectorId) -> Result<(), KovaIndexError> {
+        if !self.nodes.contains_key(&id) {
+            return Err(KovaIndexError::NotFound { id });
+        }
+        if !self.tombstones.insert(id) {
+            return Err(KovaIndexError::AlreadyDeleted { id });
+        }
+        Ok(())
+    }
+
+    /// Whether `id` is currently tombstoned.
+    #[must_use]
+    pub fn is_tombstoned(&self, id: VectorId) -> bool {
+        self.tombstones.contains(&id)
+    }
+
+    /// Number of tombstoned ids.
+    ///
+    /// `self.len() - self.tombstone_count()` gives the count of live ids
+    /// — what a user-facing layer typically wants to report.
+    #[must_use]
+    pub fn tombstone_count(&self) -> usize {
+        self.tombstones.len()
+    }
 }
 
 impl<D: Distance, V: VectorStore> Index<D> for HnswIndex<D, V> {
@@ -182,5 +223,72 @@ mod tests {
         let idx = HnswIndex::new(L2);
         assert!(idx.get(VectorId::new(1)).is_none());
         assert!(idx.top_layer_of(VectorId::new(1)).is_none());
+    }
+
+    // ---------- tombstone behaviour ----------
+
+    fn vec(data: Vec<f32>) -> Vector {
+        Vector::try_new(data).unwrap()
+    }
+
+    fn vid(n: u64) -> VectorId {
+        VectorId::new(n)
+    }
+
+    #[test]
+    fn tombstone_unknown_id_errors_not_found() {
+        let mut idx = HnswIndex::new(L2);
+        let err = idx.tombstone(vid(7)).unwrap_err();
+        assert!(matches!(err, KovaIndexError::NotFound { id } if id == vid(7)));
+        assert_eq!(idx.tombstone_count(), 0);
+    }
+
+    #[test]
+    fn tombstone_existing_id_succeeds() {
+        let mut idx = HnswIndex::new(L2);
+        idx.insert(vid(1), vec(vec![1.0, 2.0])).unwrap();
+        assert!(!idx.is_tombstoned(vid(1)));
+
+        idx.tombstone(vid(1)).unwrap();
+        assert!(idx.is_tombstoned(vid(1)));
+        assert_eq!(idx.tombstone_count(), 1);
+    }
+
+    #[test]
+    fn tombstone_already_deleted_errors() {
+        let mut idx = HnswIndex::new(L2);
+        idx.insert(vid(1), vec(vec![1.0, 2.0])).unwrap();
+        idx.tombstone(vid(1)).unwrap();
+
+        let err = idx.tombstone(vid(1)).unwrap_err();
+        assert!(matches!(err, KovaIndexError::AlreadyDeleted { id } if id == vid(1)));
+        assert_eq!(idx.tombstone_count(), 1);
+    }
+
+    #[test]
+    fn search_filters_tombstoned_ids() {
+        let mut idx = HnswIndex::new(L2);
+        idx.insert(vid(1), vec(vec![1.0, 0.0])).unwrap();
+        idx.insert(vid(2), vec(vec![0.0, 1.0])).unwrap();
+        idx.insert(vid(3), vec(vec![1.0, 1.0])).unwrap();
+
+        // Sanity : all three are searchable.
+        let hits = idx.search(&vec(vec![1.0, 0.0]), 3).unwrap();
+        let ids: Vec<_> = hits.iter().map(|(i, _)| *i).collect();
+        assert!(ids.contains(&vid(1)));
+        assert!(ids.contains(&vid(2)));
+        assert!(ids.contains(&vid(3)));
+
+        // Tombstone id 1 ; it should disappear from results even though
+        // it's the nearest neighbour of the query.
+        idx.tombstone(vid(1)).unwrap();
+        let hits = idx.search(&vec(vec![1.0, 0.0]), 3).unwrap();
+        let ids: Vec<_> = hits.iter().map(|(i, _)| *i).collect();
+        assert!(
+            !ids.contains(&vid(1)),
+            "tombstoned id 1 should not be returned"
+        );
+        assert!(ids.contains(&vid(2)));
+        assert!(ids.contains(&vid(3)));
     }
 }
