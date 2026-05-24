@@ -137,6 +137,40 @@ Deferred until measurements justify it.
 correctness baseline, it owns its vectors directly. The asymmetry
 reflects different roles, not inconsistent design.
 
+### Storage traits use associated error types ; `Shard` boxes them
+
+`VectorStore`, `MetadataStore`, and `Wal` all expose an associated
+`type Error : std::error::Error + Send + Sync + 'static`. Concrete impls
+pick their own error universe : the file/mmap impls return
+`KovaStorageError`, in-memory impls return `Infallible`, and a future
+S3-backed `Wal` or distributed-log impl returns whatever shape its
+backend naturally produces.
+
+Why not pin every impl to one concrete error type :
+
+- `KovaStorageError` is filesystem-shaped (`Io`, `CorruptRecord`,
+  `Decode`, ...). It has nothing to say about S3 throttling, GCS
+  service errors, or a distributed-log quorum failure. Forcing those
+  into `KovaStorageError` would either grow the enum with cloud
+  variants `kova-storage` has no business knowing about, or stuff
+  everything into a single `Io(io::Error)` and lose the structure.
+- Associated error types make `kova-storage` agnostic to the backends
+  composed under it. The trait commits to a contract (`Error + Send +
+  Sync + 'static`), not to a concrete enum.
+
+`Shard<D, V, M, W>` is generic over all four primitives so the same
+struct serves production (`FileWal + MmapVectorStore + FileMetadataStore`),
+tests (`InMemoryWal + InMemoryVectorStore + InMemoryMetadataStore`), and
+future swaps without code changes. The three backend error types
+converge at the `Shard` seam via `Box<dyn Error + Send + Sync>` : not
+because we want to throw away type information, but because the
+composition layer genuinely cannot enumerate errors from backends it
+doesn't know about. The error chain is preserved ; callers that need
+the original type can `downcast` on the boxed source.
+
+The cost is a small heap allocation per error path (cold). The win is
+that adding a new backend is a trait impl, not a `kova-storage` patch.
+
 ### `MmapVectorStore` slots are self-describing, no sidecar
 
 Each slot in the mmap file carries its own header : an 8-byte id, a
