@@ -180,6 +180,8 @@ impl FileWal {
 }
 
 impl Wal for FileWal {
+    type Error = KovaStorageError;
+
     fn append(&mut self, record: &Record) -> Result<Lsn, KovaStorageError> {
         let frame = encode_record(record)?;
         if self.active.bytes_written + frame.len() as u64 > self.max_segment_bytes

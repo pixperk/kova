@@ -22,6 +22,8 @@ impl InMemoryWal {
 }
 
 impl Wal for InMemoryWal {
+    type Error = KovaStorageError;
+
     fn append(&mut self, record: &Record) -> Result<Lsn, KovaStorageError> {
         let lsn = Lsn::new(self.next_lsn);
         self.records.push((lsn, record.clone()));
