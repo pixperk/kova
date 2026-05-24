@@ -366,6 +366,7 @@ mod tests {
     use super::*;
     use kova_core::{InMemoryMetadataStore, InMemoryVectorStore, L2, Value};
     use kova_index::HnswParams;
+    use tempfile::tempdir;
 
     use crate::InMemoryWal;
 
@@ -445,5 +446,154 @@ mod tests {
             other => panic!("expected DuplicateId, got {other:?}"),
         }
         assert_eq!(shard.len(), 1);
+    }
+
+    // ---------- file-backed tests : exercise the concrete `Shard::open` path ----------
+
+    /// First `open` on an empty directory creates the three backing files
+    /// and the shard reports zero size.
+    #[test]
+    fn open_creates_empty_shard_and_files() {
+        let dir = tempdir().unwrap();
+        let shard = Shard::open(dir.path(), 3, L2, HnswParams::default()).unwrap();
+
+        assert!(shard.is_empty());
+        assert_eq!(shard.len(), 0);
+
+        assert!(
+            dir.path().join("wal").exists(),
+            "wal/ directory should exist"
+        );
+        assert!(
+            dir.path().join("vectors.mmap").exists(),
+            "vectors.mmap should exist"
+        );
+        assert!(
+            dir.path().join("metadata.bin").exists(),
+            "metadata.bin should exist"
+        );
+    }
+
+    /// Same insert+search flow as the in-memory smoke test, but through
+    /// the file-backed combo. Confirms `Shard::open` wires up the right
+    /// primitives end-to-end.
+    #[test]
+    fn insert_then_search_file_backed() {
+        let dir = tempdir().unwrap();
+        let mut shard = Shard::open(dir.path(), 2, L2, HnswParams::default()).unwrap();
+
+        shard
+            .insert(id(1), v(vec![1.0, 0.0]), tag_meta("alpha"))
+            .unwrap();
+        shard
+            .insert(id(2), v(vec![0.0, 1.0]), tag_meta("beta"))
+            .unwrap();
+
+        let hits = shard.search(&v(vec![1.0, 0.05]), 2).unwrap();
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].id, id(1));
+        assert_eq!(
+            hits[0].metadata.get("tag"),
+            Some(&Value::String("alpha".into()))
+        );
+    }
+
+    /// The whole point of the persistence layer : drop a shard, open it
+    /// again on the same directory, and the inserts are still there with
+    /// their metadata intact.
+    ///
+    /// Mechanically this exercises every recovery path :
+    /// - `MmapVectorStore::open` walks slots to rebuild `id_to_slot`
+    /// - `FileMetadataStore::open` deserializes the bincode blob
+    /// - `FileWal::open` enumerates segments
+    /// - `Shard::replay` walks the WAL and re-applies every record into
+    ///   the fresh in-memory HNSW index
+    #[test]
+    fn reopen_recovers_inserted_vectors() {
+        let dir = tempdir().unwrap();
+
+        {
+            let mut shard = Shard::open(dir.path(), 2, L2, HnswParams::default()).unwrap();
+            shard
+                .insert(id(1), v(vec![1.0, 0.0]), tag_meta("alpha"))
+                .unwrap();
+            shard
+                .insert(id(2), v(vec![0.0, 1.0]), tag_meta("beta"))
+                .unwrap();
+            shard
+                .insert(id(3), v(vec![0.5, 0.5]), tag_meta("gamma"))
+                .unwrap();
+        } // shard dropped : releases mmap + files
+
+        let shard = Shard::open(dir.path(), 2, L2, HnswParams::default()).unwrap();
+        assert_eq!(shard.len(), 3);
+        assert!(shard.contains(id(1)));
+        assert!(shard.contains(id(2)));
+        assert!(shard.contains(id(3)));
+
+        let hits = shard.search(&v(vec![1.0, 0.0]), 1).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, id(1));
+        assert_eq!(
+            hits[0].metadata.get("tag"),
+            Some(&Value::String("alpha".into()))
+        );
+    }
+
+    /// Reopening with a `dim` that doesn't match the existing
+    /// `vectors.mmap` header surfaces as a `ShardError::Backend` whose
+    /// source mentions the dim mismatch. Caller can downcast to inspect
+    /// the original `KovaStorageError` if needed ; here we just check the
+    /// message contains "dim".
+    #[test]
+    fn reopen_with_wrong_dim_errors() {
+        let dir = tempdir().unwrap();
+
+        {
+            let mut shard = Shard::open(dir.path(), 3, L2, HnswParams::default()).unwrap();
+            shard
+                .insert(id(1), v(vec![1.0, 2.0, 3.0]), Metadata::new())
+                .unwrap();
+        }
+
+        // Can't use `.unwrap_err()` : the Ok variant (`Shard`) isn't Debug
+        // (HnswIndex isn't Debug, deliberately), so we destructure manually.
+        let Err(err) = Shard::open(dir.path(), 4, L2, HnswParams::default()) else {
+            panic!("expected error on dim mismatch");
+        };
+        match err {
+            ShardError::Backend(ref source) => {
+                let msg = format!("{source}");
+                assert!(msg.contains("dim"), "expected dim error, got: {msg}");
+            }
+            other => panic!("expected Backend error, got {other:?}"),
+        }
+    }
+
+    /// Replay is idempotent : opening, dropping, and opening again N
+    /// times leaves the shard in the same state every time. This is the
+    /// invariant the crash recovery test (next milestone) will lean on.
+    #[test]
+    fn replay_is_idempotent_across_multiple_reopens() {
+        let dir = tempdir().unwrap();
+
+        {
+            let mut shard = Shard::open(dir.path(), 2, L2, HnswParams::default()).unwrap();
+            shard
+                .insert(id(1), v(vec![1.0, 0.0]), tag_meta("a"))
+                .unwrap();
+            shard
+                .insert(id(2), v(vec![0.0, 1.0]), tag_meta("b"))
+                .unwrap();
+        }
+
+        for round in 0..3 {
+            let shard = Shard::open(dir.path(), 2, L2, HnswParams::default()).unwrap();
+            assert_eq!(shard.len(), 2, "round {round}: wrong len");
+            assert!(shard.contains(id(1)), "round {round}: missing id 1");
+            assert!(shard.contains(id(2)), "round {round}: missing id 2");
+            let hits = shard.search(&v(vec![1.0, 0.0]), 1).unwrap();
+            assert_eq!(hits[0].id, id(1), "round {round}: wrong nearest");
+        }
     }
 }
