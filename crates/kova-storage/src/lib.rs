@@ -6,9 +6,11 @@
 //! follow the standard log-then-mutate discipline : every mutation hits a
 //! fsynced WAL record before any in-memory or on-disk state changes.
 
+mod atomic;
 mod error;
 mod vector_store;
 mod wal;
+pub use atomic::atomic_write;
 pub use error::KovaStorageError;
 pub use vector_store::MmapVectorStore;
 pub use wal::{FileWal, InMemoryWal, Lsn, Record, Wal};
