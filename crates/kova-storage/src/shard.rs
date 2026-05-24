@@ -310,25 +310,85 @@ where
         Ok(results)
     }
 
-    /// Whether the shard currently holds an entry for `id`.
+    /// Delete `id` from the shard, under the same 3-phase discipline as
+    /// [`Self::insert`].
     ///
-    /// O(1) check against the index's in-memory node map ; does not touch
-    /// the vector store or metadata store.
+    /// Logical, not structural : the graph node and the vector bytes
+    /// stay in place so `search_layer` can keep traversing through this
+    /// id ; subsequent [`Self::search`] calls just filter it out of the
+    /// returned hits, and [`Self::contains`] returns `false`.
+    /// [`MetadataStore::delete`] is called so the attribute bag is gone
+    /// immediately. Vacuum (a future milestone) is what actually frees
+    /// the storage bytes and clears the tombstones.
+    ///
+    /// # Id reuse
+    /// `id`s **cannot** be re-inserted after delete until vacuum runs ;
+    /// the graph node is still in place, so [`Self::insert`]'s duplicate
+    /// check fires. This is a deliberate v1 limitation, not a bug.
+    ///
+    /// # Errors
+    /// - [`ShardError::Index`] with `KovaIndexError::NotFound` if `id`
+    ///   was never inserted.
+    /// - [`ShardError::Index`] with `KovaIndexError::AlreadyDeleted` if
+    ///   `id` is already tombstoned.
+    /// - [`ShardError::Backend`] from `wal.append` / `wal.sync`.
+    ///
+    /// # Panics
+    /// Panics with a clear message on phase-3 apply failure ; see
+    /// [`Self::insert`] for the rationale.
+    pub fn delete(&mut self, id: VectorId) -> Result<(), ShardError> {
+        // Phase 1 : pre-commit validation.
+        if self.index.top_layer_of(id).is_none() {
+            return Err(KovaIndexError::NotFound { id }.into());
+        }
+        if self.index.is_tombstoned(id) {
+            return Err(KovaIndexError::AlreadyDeleted { id }.into());
+        }
+
+        // Phase 2 : commit.
+        let record = Record::Delete { id };
+        self.wal.append(&record).map_err(ShardError::backend)?;
+        self.wal.sync().map_err(ShardError::backend)?;
+
+        // Phase 3 : apply. Post-commit failures panic.
+        if let Err(e) = self.index.tombstone(id) {
+            panic!(
+                "Shard::delete phase-3 apply failure on index.tombstone: {e:?} \
+                 (WAL has committed the record ; aborting so replay can reconcile)"
+            );
+        }
+        if let Err(e) = self.metadata.delete(id) {
+            panic!(
+                "Shard::delete phase-3 apply failure on metadata.delete: {e:?} \
+                 (WAL has committed the record ; aborting so replay can reconcile)"
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Whether the shard currently holds a live entry for `id`.
+    ///
+    /// Returns `false` for ids that were inserted then deleted : the
+    /// graph node is still in memory (until vacuum) but the id is
+    /// logically gone, and that's what callers care about.
+    ///
+    /// O(1) ; does not touch the vector store or metadata store.
     #[must_use]
     pub fn contains(&self, id: VectorId) -> bool {
-        self.index.top_layer_of(id).is_some()
+        self.index.top_layer_of(id).is_some() && !self.index.is_tombstoned(id)
     }
 
-    /// Number of vectors currently in the shard.
+    /// Number of live (non-tombstoned) vectors in the shard.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.index.len()
+        self.index.len() - self.index.tombstone_count()
     }
 
-    /// Whether the shard is empty.
+    /// Whether the shard has any live entries.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.index.len() == 0
+        self.len() == 0
     }
 
     /// Replay every WAL record (LSN order) into the index + stores.
@@ -362,9 +422,15 @@ where
                         .map_err(ShardError::backend)?;
                 }
                 Record::Delete { id } => {
-                    // HNSW delete lands in the delete milestone (tombstone +
-                    // free-list). For now replay only propagates the delete
-                    // to the metadata store ; the index is left as-is.
+                    // Tombstone in the index + drop from metadata. The
+                    // graph node and vector bytes stay (vacuum reclaims).
+                    //
+                    // Ordering matters : `Shard::insert` rejects duplicate
+                    // ids by graph-node presence, so the WAL never holds
+                    // Delete{id} without a prior Insert{id} (modulo the
+                    // crash test which inserts then dies — that has a
+                    // matching Insert in the same WAL).
+                    self.index.tombstone(id)?;
                     self.metadata.delete(id).map_err(ShardError::backend)?;
                 }
             }
@@ -723,5 +789,143 @@ mod tests {
             let hits = shard.search(&v(vec![1.0, 0.0]), 1).unwrap();
             assert_eq!(hits[0].id, id(1), "round {round}: wrong nearest");
         }
+    }
+
+    // ---------- delete behaviour ----------
+
+    /// `delete` flips `contains`, drops `len`, and filters the id from
+    /// future search hits. Exercises the happy path end-to-end on
+    /// in-memory primitives.
+    #[test]
+    fn delete_then_contains_and_search_reflect_it() {
+        let mut shard = Shard::from_parts(
+            L2,
+            HnswParams::default(),
+            InMemoryVectorStore::new(),
+            InMemoryMetadataStore::new(),
+            InMemoryWal::new(),
+        )
+        .unwrap();
+
+        shard
+            .insert(id(1), v(vec![1.0, 0.0]), tag_meta("alpha"))
+            .unwrap();
+        shard
+            .insert(id(2), v(vec![0.0, 1.0]), tag_meta("beta"))
+            .unwrap();
+        assert_eq!(shard.len(), 2);
+
+        shard.delete(id(1)).unwrap();
+        assert_eq!(shard.len(), 1);
+        assert!(!shard.contains(id(1)));
+        assert!(shard.contains(id(2)));
+
+        // The nearest neighbour of (1.0, 0.0) is id 1, but it's tombstoned.
+        let hits = shard.search(&v(vec![1.0, 0.0]), 2).unwrap();
+        let ids: Vec<_> = hits.iter().map(|h| h.id).collect();
+        assert!(!ids.contains(&id(1)), "tombstoned id should not appear");
+        assert!(ids.contains(&id(2)));
+    }
+
+    /// Deleting a nonexistent id errors with `NotFound` before any WAL
+    /// append. Verified by counting log records after the failed call.
+    #[test]
+    fn delete_unknown_id_errors_no_poison() {
+        let mut shard = Shard::from_parts(
+            L2,
+            HnswParams::default(),
+            InMemoryVectorStore::new(),
+            InMemoryMetadataStore::new(),
+            InMemoryWal::new(),
+        )
+        .unwrap();
+        shard.insert(id(1), v(vec![1.0]), Metadata::new()).unwrap();
+
+        let err = shard.delete(id(99)).unwrap_err();
+        assert!(matches!(
+            err,
+            ShardError::Index(KovaIndexError::NotFound { id }) if id == VectorId::new(99)
+        ));
+
+        // Sanity : the live id is still present.
+        assert!(shard.contains(id(1)));
+        assert_eq!(shard.len(), 1);
+    }
+
+    /// Deleting an already-deleted id errors with `AlreadyDeleted` ;
+    /// state and WAL are unchanged.
+    #[test]
+    fn delete_already_deleted_errors() {
+        let mut shard = Shard::from_parts(
+            L2,
+            HnswParams::default(),
+            InMemoryVectorStore::new(),
+            InMemoryMetadataStore::new(),
+            InMemoryWal::new(),
+        )
+        .unwrap();
+        shard.insert(id(1), v(vec![1.0]), Metadata::new()).unwrap();
+        shard.delete(id(1)).unwrap();
+
+        let err = shard.delete(id(1)).unwrap_err();
+        assert!(matches!(
+            err,
+            ShardError::Index(KovaIndexError::AlreadyDeleted { id }) if id == VectorId::new(1)
+        ));
+        assert_eq!(shard.len(), 0);
+    }
+
+    /// V1 limitation : ids can't be reused after delete (the graph node
+    /// is still in place, so insert's duplicate check fires). Vacuum
+    /// is the future milestone that lifts this restriction.
+    #[test]
+    fn reinsert_after_delete_errors_until_vacuum() {
+        let mut shard = Shard::from_parts(
+            L2,
+            HnswParams::default(),
+            InMemoryVectorStore::new(),
+            InMemoryMetadataStore::new(),
+            InMemoryWal::new(),
+        )
+        .unwrap();
+        shard.insert(id(1), v(vec![1.0]), Metadata::new()).unwrap();
+        shard.delete(id(1)).unwrap();
+
+        let err = shard
+            .insert(id(1), v(vec![9.0]), Metadata::new())
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ShardError::Index(KovaIndexError::DuplicateId { id }) if id == VectorId::new(1)
+        ));
+    }
+
+    /// Deletes survive reopen : the WAL `Delete` record is replayed, the
+    /// re-built in-memory index has the tombstone, and the metadata
+    /// entry is gone from `metadata.bin`.
+    #[test]
+    fn delete_persists_across_reopen() {
+        let dir = tempdir().unwrap();
+
+        {
+            let mut shard = Shard::open(dir.path(), 2, L2, HnswParams::default()).unwrap();
+            shard
+                .insert(id(1), v(vec![1.0, 0.0]), tag_meta("a"))
+                .unwrap();
+            shard
+                .insert(id(2), v(vec![0.0, 1.0]), tag_meta("b"))
+                .unwrap();
+            shard.delete(id(1)).unwrap();
+        }
+
+        let shard = Shard::open(dir.path(), 2, L2, HnswParams::default()).unwrap();
+        assert_eq!(shard.len(), 1);
+        assert!(!shard.contains(id(1)));
+        assert!(shard.contains(id(2)));
+
+        let hits = shard.search(&v(vec![1.0, 0.0]), 2).unwrap();
+        let ids: Vec<_> = hits.iter().map(|h| h.id).collect();
+        assert!(!ids.contains(&id(1)));
+        assert!(ids.contains(&id(2)));
     }
 }
