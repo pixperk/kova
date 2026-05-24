@@ -15,12 +15,12 @@ with gRPC between nodes. Every byte, every index, every network call is ours.
 | -------------- | ----------- | ---------------------------------------------------------------------- |
 | `kova-core`    | shipped     | `Vector`, `Distance` trait + `Cosine` / `L2` / `InnerProduct` (SIMD)   |
 | `kova-index`   | shipped     | `Index` trait, `FlatIndex` baseline, `HnswIndex` (insert + search)     |
-| `kova-storage` | in progress | Segmented WAL, `MmapVectorStore`, `FileMetadataStore`, `atomic_write`, `Shard` (log-then-mutate, SIGKILL-survival tested); delete + checkpoints next |
+| `kova-storage` | in progress | Segmented WAL, `MmapVectorStore`, `FileMetadataStore`, `atomic_write`, `Shard` (log-then-mutate, SIGKILL-survival tested), delete (tombstone + search filter), batched inserts (group-commit fsync); checkpoints + vacuum next |
 | `kova-query`   | not started | KQL parser, planner, executor                                          |
 | `kova-cluster` | not started | Consistent hashing, quorum replication, coordinator                    |
 | `kova-server`  | not started | gRPC node binary                                                       |
 
-153 tests passing across the workspace; `cargo clippy --workspace --all-targets -- -D warnings` clean.
+168 tests passing across the workspace; `cargo clippy --workspace --all-targets -- -D warnings` clean.
 
 ## Build
 
@@ -126,7 +126,7 @@ The load-bearing invariant is the ACK ordering :
 the parent reads `ACKED <id>` the record is fsynced. Pipe contents are
 preserved across `SIGKILL` on Linux, so the parent sees exactly what
 the child flushed. The reverse (every durable insert was ACKed) is
-*not* required and does not hold — the kill can land between
+*not* required and does not hold - the kill can land between
 `wal.sync` and the next `flush`, leaving a durable insert the parent
 never knew about. The test correctly tolerates extras ; the only thing
 it refuses to tolerate is a missing ACKed record.
@@ -143,7 +143,7 @@ cargo test -p kova-storage --test crash_recovery
 cargo test -p kova-storage --release --test crash_recovery -- --ignored --nocapture
 ```
 
-Kill delays are deterministic — `1 + (iter * 173) % 1500` ms — so a
+Kill delays are deterministic - `1 + (iter * 173) % 1500` ms - so a
 failure on iteration N is reproducible without a `rand` dependency. The
 sequence spans from "kill before any insert lands" to "kill near the
 end of the run."
@@ -307,7 +307,7 @@ in-memory state from the durable record.
 
 To keep this rare, phase 1 is aggressive : it catches every failure mode
 we can detect statically (duplicate id, dim mismatch, including the
-first-insert case where the index hasn't pinned its own dim yet — we
+first-insert case where the index hasn't pinned its own dim yet - we
 fall back to the underlying `VectorStore::dim()` if the store has one).
 What's left in phase 3 is genuinely exceptional : disk full, EIO,
 filesystem corruption. For those, panic is the only safe call.
@@ -315,6 +315,66 @@ filesystem corruption. For those, panic is the only safe call.
 Tests `dim_mismatch_on_insert_does_not_poison_wal` and
 `dim_mismatch_on_first_insert_is_caught_via_store_dim` enforce the
 no-poison guarantee.
+
+### Delete is logical, not structural
+
+`Shard::delete(id)` doesn't remove the node from the HNSW graph or the
+vector from `MmapVectorStore`. It marks `id` as tombstoned in an
+in-memory `HashSet` and drops the entry from `MetadataStore`. The graph
+node and vector bytes stay in place.
+
+The reason is the hybrid pattern every production HNSW ships (FAISS,
+hnswlib, Qdrant) : structural removal of an HNSW node requires
+rewiring the neighbour lists of every node that pointed to it, which
+is expensive and error-prone. Tombstoning is O(1) and preserves graph
+connectivity for traversal. Cost : tombstoned vectors take up storage
++ some search-time CPU (distance is computed for them during
+`search_layer`, then they're filtered before results return).
+
+`search` filters tombstoned ids from the result list after
+`search_layer`. Result count may be smaller than `k` if many candidates
+in the neighbourhood are deleted ; vacuum (next milestone) is what
+restores both storage and quality.
+
+V1 limitation : ids cannot be reused after delete until vacuum runs.
+`Shard::insert(deleted_id, ...)` errors with `DuplicateId` because the
+graph node is still in place. The
+`reinsert_after_delete_errors_until_vacuum` test pins this contract so
+nobody quietly "fixes" it before vacuum is ready.
+
+### Batched inserts amortise the fsync
+
+`Shard::insert_many(items)` groups a batch under a single WAL commit :
+
+```text
+   for each item:    wal.append(record)        (cheap, just buffered I/O)
+   ─────────────────────────────────────────
+   once at end:      wal.sync()                (the actual fsync)
+                     metadata.put_many(...)    (one full-file flush)
+                     for each: index.insert    (sequential by HNSW design)
+```
+
+Per-op cost dominates singleton `insert` because `wal.sync` is a real
+disk barrier (~5-10 ms on SSD) and `FileMetadataStore::put` rewrites
+the whole file with `atomic_write` (also fsynced). Group-committing
+N items collapses both into a single barrier each.
+
+Three trait additions support the batch path :
+
+| Method                              | Default impl  | Override |
+| ----------------------------------- | ------------- | -------- |
+| `VectorStore::reserve(n)`           | no-op         | `MmapVectorStore` grows the file once |
+| `MetadataStore::put_many(items)`    | loops `put`   | `FileMetadataStore` updates the map and flushes once at the end (with snapshot-rollback on failure) |
+| `HnswIndex::reserve_store(n)`       | inherent      | pass-through to `vectors.reserve` |
+
+All three preserve the existing trait surface (defaults cover every
+current caller). `Shard::insert_many` puts `reserve_store` and dim/
+duplicate validation in phase 1, so disk-full + bad input reject the
+whole batch before the WAL is touched. Phase-3 apply failures panic
+per the same Postgres-style rule as singleton `insert`.
+
+Batches are atomic from the caller's view : the whole batch commits or
+none of it does. There's no partial-batch state to observe.
 
 ### Metadata is not mmapped, and on purpose
 
@@ -365,24 +425,19 @@ immediately.
 
 ## Coming up : `kova-storage`
 
-`Shard` composition + SIGKILL crash recovery have shipped (see the
-[Crash recovery](#crash-recovery) section). Three milestones left to
-close out the storage layer :
+`Shard` composition, SIGKILL crash recovery, delete, and batched inserts
+have all shipped. One milestone left to close out the storage layer :
 
-1. **Delete.** HNSW tombstoning (skip in `search_layer`),
-   `VectorStore::remove` with a free-list of holes, `MetadataStore::delete`.
-   The hybrid pattern that FAISS / hnswlib / Qdrant ship : cheap
-   tombstone on the hot path, periodic vacuum on the cold path.
-2. **Batched inserts.** `Shard::insert_many` with group-commit (N
-   appends, 1 fsync). Plus `MmapVectorStore::reserve(n)` to skip the
-   per-insert grow-remap dance, and `FileMetadataStore::flush_deferred`
-   to skip the per-put rewrite. The headline win is amortised fsync —
-   1000 inserts share one disk barrier instead of paying 1000.
-3. **GFS-pattern checkpoints + log truncation.** Periodic snapshots of
-   in-memory state, tagged with LSN ; recovery loads the checkpoint
-   then replays only newer WAL records. After the checkpoint is durable,
-   older WAL segments are physically deleted. Vacuum (from milestone 1)
-   ties in here.
+**Checkpoints + log truncation + vacuum** (bundled into one
+stop-the-world operation). HNSW graph is serialised to a `graph.{N}.snapshot`
+file alongside compact `vectors.{N}.mmap` and `metadata.{N}.bin` ; a
+manifest commits the new generation atomically. On reopen, `Shard::open`
+loads the manifest's components and replays WAL only from the checkpoint
+LSN forward. The compaction step doubles as vacuum (storage reclaim
+from tombstones), and the WAL is truncated to records past the
+checkpoint LSN. Trigger is manual (`Shard::checkpoint()`) plus a
+read-only `should_checkpoint(&Policy)` hint so callers can poll without
+hidden latency in the insert path.
 
 ## Longer-term scope
 
