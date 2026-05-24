@@ -15,12 +15,12 @@ with gRPC between nodes. Every byte, every index, every network call is ours.
 | -------------- | ----------- | ---------------------------------------------------------------------- |
 | `kova-core`    | shipped     | `Vector`, `Distance` trait + `Cosine` / `L2` / `InnerProduct` (SIMD)   |
 | `kova-index`   | shipped     | `Index` trait, `FlatIndex` baseline, `HnswIndex` (insert + search)     |
-| `kova-storage` | in progress | WAL + segmentation done; mmap, Shard, checkpoints, recovery test next  |
+| `kova-storage` | in progress | Segmented WAL, `MmapVectorStore`, `FileMetadataStore`, `atomic_write`; `Shard` + recovery test next |
 | `kova-query`   | not started | KQL parser, planner, executor                                          |
 | `kova-cluster` | not started | Consistent hashing, quorum replication, coordinator                    |
 | `kova-server`  | not started | gRPC node binary                                                       |
 
-106 tests passing across the workspace; `cargo clippy --workspace -- -D warnings` clean.
+143 tests passing across the workspace; `cargo clippy --workspace -- -D warnings` clean.
 
 ## Build
 
@@ -137,6 +137,26 @@ Deferred until measurements justify it.
 correctness baseline, it owns its vectors directly. The asymmetry
 reflects different roles, not inconsistent design.
 
+### `MmapVectorStore` slots are self-describing, no sidecar
+
+Each slot in the mmap file carries its own header : an 8-byte id, a
+present flag, and padding to keep the vector bytes aligned. The whole
+slot is `16 + dim * 4` bytes, fixed stride. The alternative would be a
+*sidecar* file mapping `id -> offset`, the way most embedded KV stores
+keep an index alongside the data.
+
+The trade :
+
+- **Cost** : ~0.5% storage overhead at 768-dim vectors. Open is O(N) :
+  walk every slot to rebuild the in-memory `id_to_slot` map.
+- **Win** : no two-file atomicity problem. A sidecar index and the data
+  file are two separate writes ; a crash between them leaves the pair
+  inconsistent and recovery has to reconcile. Self-describing slots
+  can't drift from themselves : the data *is* the index.
+
+For the sizes we care about (millions of vectors, opened rarely), the
+O(N) open cost is invisible and the consistency story is much simpler.
+
 ### WAL is segmented and recoverable from day one
 
 The write-ahead log lives in a directory of `wal-{16hex}.log` segment
@@ -150,6 +170,41 @@ truncation and bounds nothing about replay time. Segmentation costs us
 ~50 LOC and unlocks the full WAL design pattern from production
 databases. Same code shape will support log shipping, archive, and
 multi-segment recovery without further refactoring.
+
+### Metadata is not mmapped, and on purpose
+
+Vectors live in `MmapVectorStore` because they are fixed-stride, hot, and
+huge in aggregate : index search hits `vectors.get(id)` thousands of times
+per query, and an `id * stride` offset calculation plus zero-copy mmap
+read is the right tool.
+
+Metadata is the opposite shape. It's variable-size (open key-value
+bags), cold (read only for the final `k` candidates, not on every graph
+edge), and small in aggregate. `FileMetadataStore` keeps the whole map
+in memory and persists via `atomic_write` on mutation : a periodic
+full-file snapshot, no mmap, no sidecar offset index, no free-list.
+
+Forcing mmap onto variable-size data would mean building a separate
+`id -> (offset, length)` sidecar plus a free-list for resize-on-update,
+which is a B-tree in disguise. Different access patterns deserve
+different storage strategies ; the `MetadataStore` trait is the seam so
+the implementation can change without touching callers when scale
+eventually demands it.
+
+### Unsafe is encapsulated, not sprinkled
+
+`kova-core` is `#![forbid(unsafe_code)]` : foundational types are
+pure-safe Rust, no exceptions. `kova-storage` has exactly one `unsafe`
+block in the whole crate, inside a private `map_file()` helper that
+wraps `memmap2::MmapMut::map_mut`. The safety contract (file must not
+be truncated or written to by another process while the map is live)
+is documented once at the helper ; every other call site in
+`MmapVectorStore` goes through the safe wrapper.
+
+The rule : `unsafe` is a contract, and contracts are easier to audit
+when there's exactly one of them. Adding a second `unsafe` block
+anywhere in storage should require a comment explaining why the
+existing wrapper isn't sufficient.
 
 ### `serde::Deserialize` on `Vector` is hand-rolled
 
@@ -166,20 +221,18 @@ immediately.
 ## Coming up : `kova-storage`
 
 The current focus : turning the in-memory index into a real database that
-survives `kill -9`. Short-term goals, in order :
+survives `kill -9`. The persistence primitives are in place : segmented
+WAL, `MmapVectorStore`, `FileMetadataStore`, and `atomic_write`. What's
+left is wiring them together and proving the wiring holds under crash.
 
-1. **Memory-mapped `VectorStore`.** Fixed-stride flat file ; lookup by id
-   is an offset calculation, reads are zero-copy via `mmap`.
-2. **Atomic-write utility.** `tmp + fsync + rename + dirsync` helper used
-   wherever we need crash-safe file replacement (snapshots, checkpoints).
-3. **`Shard` composition.** Ties `Index`, `VectorStore`, `MetadataStore`,
+1. **`Shard` composition.** Ties `Index`, `VectorStore`, `MetadataStore`,
    and `Wal` together. Implements the log-then-mutate discipline so every
    `insert` hits a fsynced WAL record before any in-memory mutation.
-4. **Crash recovery test.** Spawn a child process that inserts vectors,
+2. **Crash recovery test.** Spawn a child process that inserts vectors,
    `SIGKILL` it at a random point, reopen, verify every acknowledged
    write is durable. Run 100 iterations with varied kill timing.
    This is the milestone where Kova becomes a real database.
-5. **GFS-pattern checkpoints + log truncation.** Periodic snapshots of
+3. **GFS-pattern checkpoints + log truncation.** Periodic snapshots of
    in-memory state, tagged with LSN ; recovery loads checkpoint then
    replays only newer WAL records. After the checkpoint is durable,
    older WAL segments are physically deleted.
