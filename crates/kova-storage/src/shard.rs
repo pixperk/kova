@@ -166,54 +166,119 @@ where
         Ok(shard)
     }
 
-    /// Insert `(id, vector, metadata)` under the log-then-mutate discipline :
+    /// Insert `(id, vector, metadata)` under the log-then-mutate discipline.
     ///
-    /// 1. Reject duplicate ids upfront (cheap O(1) `HashMap` check on the index).
-    /// 2. Build a [`Record::Insert`] and `append` + `sync` it to the WAL.
-    ///    After `sync` returns Ok, the WAL is the durable witness.
-    /// 3. Apply to the in-memory index (which also writes through to the
-    ///    [`VectorStore`]), then the [`MetadataStore`].
+    /// Three phases, with the WAL `sync` as the **commit point** :
     ///
-    /// If the process dies anywhere in step 3, replay on reopen will redo
-    /// the operation idempotently. If it dies in step 1 or 2, the caller's
-    /// `append`/`sync` returns Err and they know the write isn't durable.
+    /// 1. **Pre-commit validation.** Cheap upfront checks (duplicate id,
+    ///    dim mismatch). On failure, returns Err *before* touching the
+    ///    WAL ; no state change anywhere.
+    /// 2. **Commit.** `wal.append` + `wal.sync`. After `sync` returns Ok,
+    ///    the operation is durable.
+    /// 3. **Apply.** Mutate the in-memory index (which writes through to
+    ///    the [`VectorStore`]) and the [`MetadataStore`].
+    ///
+    /// # Failure semantics
+    ///
+    /// - Returning `Ok(())` means the operation is committed **and** applied.
+    /// - Returning `Err(...)` means the operation was rejected in phase 1
+    ///   and the shard state is unchanged.
+    /// - A failure in **phase 3** (after WAL commit) is treated as a
+    ///   broken invariant : the WAL says the op happened, the in-memory
+    ///   state disagrees. The only safe move is to abort the process so
+    ///   replay on reopen reconciles. This impl **panics** in that case.
+    ///   The crash test exercises this path ; pre-commit validation is
+    ///   aggressive precisely to keep phase-3 failures genuinely rare
+    ///   (disk full, EIO, etc., not "user passed a bad input").
+    ///
+    /// Returning a misleading `Err` after WAL commit is the alternative
+    ///  and the worse one : the caller can't safely retry, since the
+    /// duplicate-check would pass while the WAL already holds an
+    /// `Insert{id}` record. Two records for the same id would then crash
+    /// replay on next reopen. See the design note in the README.
     ///
     /// # Errors
     /// - [`ShardError::Index`] with `KovaIndexError::DuplicateId` if `id`
-    ///   already exists in the shard.
-    /// - [`ShardError::Backend`] from the WAL `append` / `sync`, the
-    ///   vector store `put` (inside `index.insert`), or the metadata store `put`.
+    ///   already exists.
+    /// - [`ShardError::Index`] with `KovaIndexError::DimensionMismatch` if
+    ///   `vector.dim()` doesn't match the shard's pinned dim.
+    /// - [`ShardError::Backend`] from `wal.append` / `wal.sync`.
+    ///
+    /// # Panics
+    /// Panics with a clear message if the in-memory apply (phase 3) fails
+    /// after a successful WAL commit. See "Failure semantics" above.
     pub fn insert(
         &mut self,
         id: VectorId,
         vector: Vector,
         metadata: Metadata,
     ) -> Result<(), ShardError> {
-        // Cheap upfront duplicate check : `HashMap` lookup, no vector clone.
-        // Failing here means no WAL append, no state change ; the WAL stays
-        // clean of duplicate records by construction, which keeps replay
-        // simple (it can assume every Insert is for a fresh id).
+        // ----------------------------------------------------------------
+        // Phase 1 : pre-commit validation.
+        //
+        // Every failure-mode we can detect statically is rejected here,
+        // before the WAL is touched. The WAL stays clean of records that
+        // could not have applied successfully, which keeps replay simple
+        // (every replayed Insert can be assumed valid by construction).
+        // ----------------------------------------------------------------
+
+        // Duplicate id : O(1) HashMap lookup on the in-memory node map.
         if self.index.top_layer_of(id).is_some() {
             return Err(KovaIndexError::DuplicateId { id }.into());
         }
 
-        // 1. Build the record. Clones are unavoidable : Record needs to own
-        //    the data for serialisation, and the index needs it for insertion.
+        // Dim mismatch : check against the index's pinned dim first (set
+        // by the first insert), falling back to the underlying store's
+        // pinned dim (e.g. MmapVectorStore reads it from the file header
+        // at open time, so it's known even before the first insert).
+        if let Some(expected) = self.index.dim().or_else(|| self.index.store_dim())
+            && vector.dim() != expected
+        {
+            return Err(KovaIndexError::DimensionMismatch {
+                expected,
+                got: vector.dim(),
+            }
+            .into());
+        }
+
+        // ----------------------------------------------------------------
+        // Phase 2 : commit.
+        //
+        // Clones are unavoidable : Record needs to own the data for
+        // serialisation, and phase 3 needs it for the apply.
+        // ----------------------------------------------------------------
         let record = Record::Insert {
             id,
             vector: vector.clone(),
             metadata: metadata.clone(),
         };
 
-        // 2. Durability barrier.
         self.wal.append(&record).map_err(ShardError::backend)?;
         self.wal.sync().map_err(ShardError::backend)?;
 
-        // 3. Apply. `index.insert` writes through to the underlying VectorStore.
-        self.index.insert(id, vector)?;
-        self.metadata
-            .put(id, metadata)
-            .map_err(ShardError::backend)?;
+        // ----------------------------------------------------------------
+        // Phase 3 : apply (post-commit).
+        //
+        // Any failure here means the WAL committed an op that in-memory
+        // state failed to apply. There is no clean recovery in-process :
+        // the caller's view ("did it commit?") and the WAL's view
+        // ("yes") have already diverged from the apply layer's view ("no").
+        //
+        // Panic. The process dies, the next reopen replays the WAL, and
+        // the durable record gets re-applied to a fresh in-memory state.
+        // ----------------------------------------------------------------
+        if let Err(e) = self.index.insert(id, vector) {
+            panic!(
+                "Shard::insert phase-3 apply failure on index.insert: {e:?} \
+                 (WAL has committed the record ; aborting so replay can reconcile)"
+            );
+        }
+        if let Err(e) = self.metadata.put(id, metadata) {
+            panic!(
+                "Shard::insert phase-3 apply failure on metadata.put: {e:?} \
+                 (WAL has committed the record ; aborting so replay can reconcile)"
+            );
+        }
 
         Ok(())
     }
@@ -538,6 +603,69 @@ mod tests {
             hits[0].metadata.get("tag"),
             Some(&Value::String("alpha".into()))
         );
+    }
+
+    /// Dim mismatch on `insert` is caught in the pre-commit phase, so no
+    /// WAL record is written. Verified by counting WAL records via
+    /// `iter_from(Lsn::ZERO)` after the failed insert.
+    #[test]
+    fn dim_mismatch_on_insert_does_not_poison_wal() {
+        let dir = tempdir().unwrap();
+        let mut shard = Shard::open(dir.path(), 3, L2, HnswParams::default()).unwrap();
+
+        // First good insert : establishes the index's dim.
+        shard
+            .insert(id(1), v(vec![1.0, 2.0, 3.0]), Metadata::new())
+            .unwrap();
+
+        // Wrong-dim insert : should fail before WAL append.
+        let err = shard
+            .insert(id(2), v(vec![1.0, 2.0]), Metadata::new())
+            .unwrap_err();
+        match err {
+            ShardError::Index(KovaIndexError::DimensionMismatch { expected, got }) => {
+                assert_eq!(expected, 3);
+                assert_eq!(got, 2);
+            }
+            other => panic!("expected DimensionMismatch, got {other:?}"),
+        }
+
+        // Reopen : WAL replay should see exactly ONE record. If the bad
+        // insert had appended, replay would see two and fail on apply
+        // (the second `Insert{2}` with wrong dim).
+        drop(shard);
+        let shard = Shard::open(dir.path(), 3, L2, HnswParams::default()).unwrap();
+        assert_eq!(shard.len(), 1);
+        assert!(shard.contains(id(1)));
+        assert!(!shard.contains(id(2)));
+    }
+
+    /// Dim mismatch caught even on the FIRST insert (before the index has
+    /// pinned its own dim), because the underlying `MmapVectorStore` has
+    /// its dim from the file header. Same no-poison guarantee.
+    #[test]
+    fn dim_mismatch_on_first_insert_is_caught_via_store_dim() {
+        let dir = tempdir().unwrap();
+        let mut shard = Shard::open(dir.path(), 3, L2, HnswParams::default()).unwrap();
+
+        // Index hasn't seen any inserts ; dim() is None. But the store
+        // (MmapVectorStore) has dim = 3 from the file header. The
+        // pre-commit check uses store_dim() as fallback.
+        let err = shard
+            .insert(id(1), v(vec![1.0, 2.0]), Metadata::new())
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ShardError::Index(KovaIndexError::DimensionMismatch {
+                expected: 3,
+                got: 2
+            })
+        ));
+
+        // No WAL record poison : reopen, search, all good.
+        drop(shard);
+        let shard = Shard::open(dir.path(), 3, L2, HnswParams::default()).unwrap();
+        assert_eq!(shard.len(), 0);
     }
 
     /// Reopening with a `dim` that doesn't match the existing
