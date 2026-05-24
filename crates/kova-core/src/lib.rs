@@ -12,10 +12,12 @@
 mod distance;
 mod error;
 mod id;
+mod metadata;
 mod vector;
 mod vector_store;
 pub use distance::{Cosine, Distance, InnerProduct, L2};
 pub use error::KovaError;
 pub use id::VectorId;
+pub use metadata::{InMemoryMetadataStore, Metadata, MetadataStore, Value};
 pub use vector::Vector;
 pub use vector_store::{InMemoryVectorStore, VectorStore};
