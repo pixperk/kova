@@ -332,6 +332,11 @@ impl VectorStore for MmapVectorStore {
     fn len(&self) -> usize {
         self.id_to_slot.len()
     }
+
+    /// Pinned dim, read from the file header at open time. Always `Some`.
+    fn dim(&self) -> Option<usize> {
+        Some(self.dim)
+    }
 }
 
 #[cfg(test)]

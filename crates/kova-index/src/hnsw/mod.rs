@@ -114,6 +114,18 @@ impl<D: Distance, V: VectorStore> HnswIndex<D, V> {
         self.vectors.get(id)
     }
 
+    /// Pinned dim of the underlying [`VectorStore`], if any.
+    ///
+    /// Distinct from [`Self::dim`] : [`Self::dim`] is the index's own
+    /// pinned dim (set on the first insert). `store_dim` asks the
+    /// underlying store directly. Useful when a caller wants to validate
+    /// an input vector against the store's pinned dim *before* the index
+    /// has seen any inserts.
+    #[must_use]
+    pub fn store_dim(&self) -> Option<usize> {
+        self.vectors.dim()
+    }
+
     /// Highest layer the node with `id` occupies, or `None` if absent.
     #[must_use]
     pub fn top_layer_of(&self, id: VectorId) -> Option<usize> {

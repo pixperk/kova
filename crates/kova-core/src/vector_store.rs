@@ -45,6 +45,22 @@ pub trait VectorStore {
     fn contains(&self, id: VectorId) -> bool {
         self.get(id).is_some()
     }
+
+    /// Pinned vector dimension, if the store has one.
+    ///
+    /// Returns `Some(d)` for stores that fix the dimension at construction
+    /// (e.g. mmap stores reading dim from their file header). Returns
+    /// `None` for stores that infer the dimension from the first `put`.
+    ///
+    /// Used by upstream composition layers (e.g. `kova-storage::Shard`)
+    /// to validate inserts against the pinned dim *before* committing to
+    /// the WAL, instead of discovering the mismatch during apply.
+    ///
+    /// Default returns `None` ; only stores that genuinely pin a dim
+    /// should override.
+    fn dim(&self) -> Option<usize> {
+        None
+    }
 }
 
 /// Trivial in-memory [`VectorStore`] backed by a `HashMap`.
