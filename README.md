@@ -31,6 +31,43 @@ cargo clippy --workspace -- -D warnings
 cargo bench -p kova-core
 ```
 
+## Features
+
+- **HNSW index** (`HnswIndex`), hand-rolled. Default params (`M=16`,
+  `ef_construction=200`, `ef_search=50`) hit recall > 0.9 at 50k
+  vectors with no tuning. `FlatIndex` brute-force baseline shares the
+  `Index` trait so recall is diffed against ground truth.
+- **SIMD distance** via `wide::f32x8` for `L2`, `Cosine`, and
+  `InnerProduct`. 4x to 17x speedup over scalar, with `wide` falling
+  back to scalar on platforms without 8-lane f32 SIMD.
+- **Memory-mapped vector store** (`MmapVectorStore`). Fixed-stride flat
+  file, self-describing slots (16-byte header + `dim * 4` bytes), zero-
+  copy reads via `bytemuck`.
+- **Segmented write-ahead log** (`FileWal`). 64 MB rotation,
+  length + CRC32 framing, torn-tail recovery, multi-segment replay in
+  LSN order.
+- **File-backed metadata store** with open-shaped attribute bags per id
+  (`HashMap<String, Value>` where `Value` covers `String` / `I64` /
+  `F64` / `Bool` / `Array`).
+- **Atomic file replacement** (`atomic_write`: tmp + fsync + rename +
+  dirsync) for crash-safe checkpoints and snapshots.
+- **3-phase `Shard` ops** (validate, commit, apply) with pre-commit
+  input validation and panic-on-apply-failure for honest WAL semantics.
+- **Batched inserts** with group-commit fsync. N records share one
+  durability barrier, plus a single metadata flush for the whole batch.
+- **Logical delete** via HNSW tombstones. O(1) per delete ; vacuum
+  (next milestone) reclaims storage and re-enables id reuse.
+- **SIGKILL crash-recovery tested**: 100 iterations with randomised
+  kill timing, 15,020 acked inserts, zero failures. See the
+  [Crash recovery](#crash-recovery) section.
+- **Pluggable backends**: `VectorStore`, `MetadataStore`, and `Wal`
+  expose associated `Error` types, so future S3-backed log, columnar
+  metadata, distributed store, etc. drop in at the trait level without
+  touching `Shard`.
+- **Bring your own embeddings.** Kova stores and searches vectors ;
+  generating them from text or images is a separate concern (OpenAI,
+  Cohere, sentence-transformers, whatever your stack already uses).
+
 ## Distance benchmarks
 
 SIMD-accelerated `Distance` impls in `kova-core` (`wide::f32x8`, 8-wide).
@@ -453,3 +490,34 @@ Beyond `kova-storage` :
   for membership and leader election only ; shard logic is hand-rolled.
 - **Client SDKs** in **Rust**, **Go**, and **TypeScript** so callers
   outside the project can talk to a Kova cluster idiomatically.
+
+## Design philosophy
+
+Kova trusts the write-ahead log absolutely and the in-memory state
+never. Every mutation is logged, fsynced, and only then applied ; if
+the apply step diverges from the log, the process aborts and recovery
+reconciles on reopen. The pattern is older than any ANN library :
+Postgres ships it, RocksDB ships it, and a SIGKILL torture passing
+15,020 acked inserts across 100 iterations is the receipt.
+
+Pluggable seams over premature optimisation. `VectorStore`,
+`MetadataStore`, and `Wal` are traits with associated error types so a
+future S3-backed log or columnar metadata store drops in without
+touching `Shard`. Within those seams, decisions are concrete : mmap for
+hot fixed-stride data, full-file flush for cold variable-size data,
+in-memory `HashSet` for tombstones because they're recoverable from
+the log. The traits are where the future lives ; the impls are where
+the work happens.
+
+Validate aggressively, panic narrowly. Pre-commit checks catch every
+input-level failure (duplicate id, dim mismatch, malformed batch)
+before the WAL is touched, so post-commit failures are exclusively
+"the disk is broken" cases. When those do fire, panicking is the
+honest answer : the operation is already committed in the log, and
+pretending otherwise to the caller is the only way to corrupt the log
+on retry.
+
+Built from scratch, on purpose. Every byte format, every fsync, every
+neighbour list. Existing libraries would have shipped Phase 3 in a
+weekend ; the point isn't to ship fast, it's to understand the system
+the libraries hide.
