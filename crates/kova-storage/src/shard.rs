@@ -23,6 +23,7 @@
 //!   metadata.bin     <- FileMetadataStore file
 //! ```
 
+use std::collections::HashSet;
 use std::error::Error as StdError;
 use std::path::Path;
 
@@ -308,6 +309,125 @@ where
             })
             .collect();
         Ok(results)
+    }
+
+    /// Insert many `(id, vector, metadata)` triples as a single batch.
+    ///
+    /// Same 3-phase discipline as [`Self::insert`], but the entire batch
+    /// commits or rejects together :
+    ///
+    /// 1. **Pre-commit validation.** Every item is checked (duplicate
+    ///    against the existing index, duplicate within the batch, dim
+    ///    mismatch). The first failure rejects the *whole* batch ; no
+    ///    WAL append, no state change. The vector store is pre-grown to
+    ///    fit the whole batch here too, so disk-full surfaces upfront.
+    /// 2. **Commit.** All `Insert` records are appended to the WAL, then
+    ///    **one** `wal.sync` covers the whole batch. This is the
+    ///    headline win : group-committing N records amortises the fsync
+    ///    cost across the batch.
+    /// 3. **Apply.** Index inserts run one-at-a-time (HNSW construction
+    ///    is inherently sequential), but the metadata store's
+    ///    `put_many` collapses N full-file rewrites into one. Post-commit
+    ///    failures **panic** per the same Postgres-style rule as
+    ///    [`Self::insert`].
+    ///
+    /// # Performance shape
+    ///
+    /// Per-op fsync cost dominates singleton `insert`. For N inserts :
+    /// - Singleton `insert` x N  : ~N × (wal.sync + metadata flush)
+    /// - `insert_many`           : 1 × wal.sync + 1 × metadata flush + N × mmap writes
+    ///
+    /// At realistic batch sizes (100-10k) the speedup is multiple orders
+    /// of magnitude on disk-backed shards. In-memory composition sees
+    /// only the WAL append amortisation (already cheap, no real fsync).
+    ///
+    /// # Errors
+    /// See [`Self::insert`] for the per-failure-mode error set. The
+    /// batch is rejected on the first failure.
+    ///
+    /// # Panics
+    /// On phase-3 apply failure (rare ; pre-commit validation aims to
+    /// eliminate the easy cases). See [`Self::insert`] for the rationale.
+    pub fn insert_many<I>(&mut self, items: I) -> Result<(), ShardError>
+    where
+        I: IntoIterator<Item = (VectorId, Vector, Metadata)>,
+    {
+        let items: Vec<(VectorId, Vector, Metadata)> = items.into_iter().collect();
+        if items.is_empty() {
+            return Ok(());
+        }
+
+        // -------- Phase 1 : validate the whole batch --------
+        //
+        // `expected_dim` starts from whatever's pinned (index first,
+        // store-fallback second) and may be set by the first item in
+        // the batch when both are None.
+        let mut expected_dim = self.index.dim().or_else(|| self.index.store_dim());
+        let mut seen_in_batch: HashSet<VectorId> = HashSet::with_capacity(items.len());
+
+        for (id, vector, _) in &items {
+            if self.index.top_layer_of(*id).is_some() {
+                return Err(KovaIndexError::DuplicateId { id: *id }.into());
+            }
+            if !seen_in_batch.insert(*id) {
+                // Duplicate within the batch itself.
+                return Err(KovaIndexError::DuplicateId { id: *id }.into());
+            }
+            match expected_dim {
+                Some(d) if vector.dim() != d => {
+                    return Err(KovaIndexError::DimensionMismatch {
+                        expected: d,
+                        got: vector.dim(),
+                    }
+                    .into());
+                }
+                None => {
+                    // First insert into a totally fresh shard sets the dim
+                    // for the rest of the batch.
+                    expected_dim = Some(vector.dim());
+                }
+                _ => {}
+            }
+        }
+
+        // Pre-grow the vector store to fit the whole batch. Failures
+        // here (e.g. ENOSPC) reject the batch before WAL commit, which
+        // is exactly what we want.
+        self.index.reserve_store(items.len())?;
+
+        // -------- Phase 2 : group-commit --------
+        for (id, vector, metadata) in &items {
+            let record = Record::Insert {
+                id: *id,
+                vector: vector.clone(),
+                metadata: metadata.clone(),
+            };
+            self.wal.append(&record).map_err(ShardError::backend)?;
+        }
+        self.wal.sync().map_err(ShardError::backend)?;
+
+        // -------- Phase 3 : apply, panic on failure --------
+        // HNSW insertion is sequential by nature ; we just run it for
+        // each. The wins for batching live in WAL + metadata, not here.
+        for (id, vector, _) in &items {
+            if let Err(e) = self.index.insert(*id, vector.clone()) {
+                panic!(
+                    "Shard::insert_many phase-3 apply failure on index.insert ({id}): {e:?} \
+                     (WAL has committed the batch ; aborting so replay can reconcile)"
+                );
+            }
+        }
+
+        // ONE metadata flush for the whole batch.
+        let metadata_items = items.into_iter().map(|(id, _, m)| (id, m));
+        if let Err(e) = self.metadata.put_many(metadata_items) {
+            panic!(
+                "Shard::insert_many phase-3 apply failure on metadata.put_many: {e:?} \
+                 (WAL has committed the batch ; aborting so replay can reconcile)"
+            );
+        }
+
+        Ok(())
     }
 
     /// Delete `id` from the shard, under the same 3-phase discipline as
@@ -927,5 +1047,185 @@ mod tests {
         let ids: Vec<_> = hits.iter().map(|h| h.id).collect();
         assert!(!ids.contains(&id(1)));
         assert!(ids.contains(&id(2)));
+    }
+
+    // ---------- batched insert behaviour ----------
+
+    /// Happy path : [`Shard::insert_many`] a small batch, every id is
+    /// searchable with its metadata, `len` reflects the batch size.
+    #[test]
+    fn insert_many_happy_path_in_memory() {
+        let mut shard = Shard::from_parts(
+            L2,
+            HnswParams::default(),
+            InMemoryVectorStore::new(),
+            InMemoryMetadataStore::new(),
+            InMemoryWal::new(),
+        )
+        .unwrap();
+
+        let batch = (0u16..10)
+            .map(|n| {
+                (
+                    id(u64::from(n)),
+                    v(vec![f32::from(n), f32::from(n + 1)]),
+                    tag_meta(&format!("t{n}")),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        shard.insert_many(batch).unwrap();
+
+        assert_eq!(shard.len(), 10);
+        for n in 0..10 {
+            assert!(shard.contains(id(n)), "id {n} missing after batch");
+        }
+
+        let hits = shard.search(&v(vec![5.0, 6.0]), 1).unwrap();
+        assert_eq!(hits[0].id, id(5));
+        assert_eq!(
+            hits[0].metadata.get("tag"),
+            Some(&Value::String("t5".into()))
+        );
+    }
+
+    /// Empty batch is a clean no-op : returns Ok, no state change, no
+    /// WAL record.
+    #[test]
+    fn insert_many_empty_batch_is_noop() {
+        let mut shard = Shard::from_parts(
+            L2,
+            HnswParams::default(),
+            InMemoryVectorStore::new(),
+            InMemoryMetadataStore::new(),
+            InMemoryWal::new(),
+        )
+        .unwrap();
+        let empty: Vec<(VectorId, Vector, Metadata)> = Vec::new();
+        shard.insert_many(empty).unwrap();
+        assert!(shard.is_empty());
+    }
+
+    /// Duplicate id within the batch itself rejects the whole batch
+    /// pre-commit ; nothing lands in the shard.
+    #[test]
+    fn insert_many_rejects_duplicate_within_batch() {
+        let mut shard = Shard::from_parts(
+            L2,
+            HnswParams::default(),
+            InMemoryVectorStore::new(),
+            InMemoryMetadataStore::new(),
+            InMemoryWal::new(),
+        )
+        .unwrap();
+
+        let batch = vec![
+            (id(1), v(vec![1.0, 0.0]), Metadata::new()),
+            (id(2), v(vec![0.0, 1.0]), Metadata::new()),
+            (id(1), v(vec![9.9, 9.9]), Metadata::new()), // duplicate of id 1
+        ];
+
+        let err = shard.insert_many(batch).unwrap_err();
+        assert!(matches!(
+            err,
+            ShardError::Index(KovaIndexError::DuplicateId { id }) if id == VectorId::new(1)
+        ));
+        assert!(shard.is_empty(), "no item should have landed");
+    }
+
+    /// Duplicate against an id already in the index also rejects the
+    /// whole batch pre-commit.
+    #[test]
+    fn insert_many_rejects_duplicate_against_existing() {
+        let mut shard = Shard::from_parts(
+            L2,
+            HnswParams::default(),
+            InMemoryVectorStore::new(),
+            InMemoryMetadataStore::new(),
+            InMemoryWal::new(),
+        )
+        .unwrap();
+
+        shard
+            .insert(id(42), v(vec![1.0, 2.0]), Metadata::new())
+            .unwrap();
+
+        let batch = vec![
+            (id(1), v(vec![1.0, 0.0]), Metadata::new()),
+            (id(42), v(vec![9.0, 9.0]), Metadata::new()), // collides with existing
+        ];
+
+        let err = shard.insert_many(batch).unwrap_err();
+        assert!(matches!(
+            err,
+            ShardError::Index(KovaIndexError::DuplicateId { id }) if id == VectorId::new(42)
+        ));
+        // Original id 42 still present, id 1 was never written.
+        assert_eq!(shard.len(), 1);
+        assert!(shard.contains(id(42)));
+        assert!(!shard.contains(id(1)));
+    }
+
+    /// Dim mismatch in any item rejects the whole batch pre-commit.
+    #[test]
+    fn insert_many_rejects_dim_mismatch() {
+        let mut shard = Shard::from_parts(
+            L2,
+            HnswParams::default(),
+            InMemoryVectorStore::new(),
+            InMemoryMetadataStore::new(),
+            InMemoryWal::new(),
+        )
+        .unwrap();
+
+        let batch = vec![
+            (id(1), v(vec![1.0, 0.0]), Metadata::new()),
+            (id(2), v(vec![0.0, 1.0, 0.0]), Metadata::new()), // 3-dim vs 2-dim
+        ];
+
+        let err = shard.insert_many(batch).unwrap_err();
+        assert!(matches!(
+            err,
+            ShardError::Index(KovaIndexError::DimensionMismatch {
+                expected: 2,
+                got: 3
+            })
+        ));
+        assert!(shard.is_empty());
+    }
+
+    /// File-backed end-to-end : `insert_many` a batch, drop, reopen,
+    /// verify every id survives. Exercises the WAL group-commit replay path.
+    #[test]
+    fn insert_many_persists_across_reopen() {
+        let dir = tempdir().unwrap();
+        let batch: Vec<_> = (0u16..50)
+            .map(|n| {
+                (
+                    id(u64::from(n)),
+                    v(vec![f32::from(n), f32::from(100 - n)]),
+                    tag_meta(&format!("k{n}")),
+                )
+            })
+            .collect();
+
+        {
+            let mut shard = Shard::open(dir.path(), 2, L2, HnswParams::default()).unwrap();
+            shard.insert_many(batch).unwrap();
+            assert_eq!(shard.len(), 50);
+        }
+
+        let shard = Shard::open(dir.path(), 2, L2, HnswParams::default()).unwrap();
+        assert_eq!(shard.len(), 50);
+        for n in 0..50 {
+            assert!(shard.contains(id(n)), "id {n} missing after reopen");
+        }
+        // Spot-check metadata round-tripped.
+        let hits = shard.search(&v(vec![5.0, 95.0]), 1).unwrap();
+        assert_eq!(hits[0].id, id(5));
+        assert_eq!(
+            hits[0].metadata.get("tag"),
+            Some(&Value::String("k5".into()))
+        );
     }
 }
