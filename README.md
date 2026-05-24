@@ -85,9 +85,10 @@ Criterion mean, single core. The scalar baseline is shown for context.
 | `InnerProduct`  |   768 |  668 ns  |  75 ns  |  8.9x   |
 | `InnerProduct`  | 1,536 | 1,310 ns | 151 ns  |  8.7x   |
 
-`L2` and `InnerProduct` get the raw 8-wide SIMD benefit (~5-6x). `Cosine`
-gets ~12x because the SIMD pass also folded `dot`, `|a|^2`, and `|b|^2` into
-a single loop (the previous scalar version did three separate passes).
+`L2` and `InnerProduct` get the raw 8-wide SIMD benefit, scaling from
+~5x at dim 128 up to ~8-9x at dim 1,536. `Cosine` is roughly double
+that (peaking at ~18x) because the SIMD pass also folded `dot`, `|a|^2`,
+and `|b|^2` into a single loop instead of three separate passes.
 
 ## HNSW vs Flat (dim 32, k=10, L2)
 
@@ -105,7 +106,7 @@ SIMD raises *both* lines on this table, but flat benefits more : its inner
 loop is *just* distance computation, while HNSW spends most of its time on
 graph traversal (HashMap lookups, heap operations). The HNSW crossover point
 shifts to roughly 10k vectors with SIMD; below that, the linear scan wins.
-At 100k HNSW is still **~9x** ahead, and the gap keeps growing with N.
+At 100k HNSW is **~16x** ahead, and the gap keeps growing with N.
 
 | Operation                               | Latency |
 | --------------------------------------- | ------- |
