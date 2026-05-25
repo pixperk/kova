@@ -102,10 +102,18 @@ pub struct MmapVectorStore {
     dim: usize,
     /// Bytes per slot : `SLOT_HEADER_SIZE + dim * 4`.
     stride: u64,
-    /// Next free slot index.
+    /// High-water mark : the slot index past the last one ever allocated.
+    /// Monotonically increases ; never decreases. Reused (freed) slots
+    /// live in `free_list` rather than reducing this.
     next_slot: u64,
     /// In-memory map from id to slot index. Rebuilt on open.
     id_to_slot: HashMap<VectorId, u64>,
+    /// Slots that were once allocated but are now free (their `present`
+    /// byte is 0). `put` pops from this before allocating a fresh slot,
+    /// so deletes don't grow the file when followed by inserts.
+    /// Rebuilt on open by scanning slots with `present == 0`. Never
+    /// persisted directly ; it's a function of the file's slot bytes.
+    free_list: Vec<u64>,
     path: PathBuf,
     capacity_bytes: u64,
 }
@@ -148,6 +156,7 @@ impl MmapVectorStore {
                 stride,
                 next_slot: 0,
                 id_to_slot: HashMap::new(),
+                free_list: Vec::new(),
                 path,
                 capacity_bytes: INITIAL_CAPACITY_BYTES,
             });
@@ -176,14 +185,19 @@ impl MmapVectorStore {
 
         let next_slot = u64::from_le_bytes(mmap[16..24].try_into().expect("8 bytes"));
 
-        // Walk slots 0..next_slot and rebuild id_to_slot.
+        // Walk slots 0..next_slot and rebuild id_to_slot + free_list in
+        // one pass. Each slot is either present (goes in id_to_slot) or
+        // absent (was freed at some point, goes in free_list for reuse).
         let mut id_to_slot = HashMap::with_capacity(next_slot as usize);
+        let mut free_list: Vec<u64> = Vec::new();
         for slot in 0..next_slot {
             let off = (HEADER_SIZE + slot * stride) as usize;
             let id = u64::from_le_bytes(mmap[off..off + 8].try_into().expect("8 bytes"));
             let present = mmap[off + 8];
             if present == 1 {
                 id_to_slot.insert(VectorId::new(id), slot);
+            } else {
+                free_list.push(slot);
             }
         }
 
@@ -194,6 +208,7 @@ impl MmapVectorStore {
             stride,
             next_slot,
             id_to_slot,
+            free_list,
             path,
             capacity_bytes: existing_size,
         })
@@ -239,7 +254,9 @@ impl VectorStore for MmapVectorStore {
     ///       v
     ///   id in id_to_slot ?
     ///       |-- yes --> reuse existing slot (overwrite in place)
-    ///       |-- no  --> slot = next_slot         (allocate fresh)
+    ///       |-- no  --> free_list non-empty ?
+    ///                       |-- yes --> slot = free_list.pop()   (reuse freed slot)
+    ///                       |-- no  --> slot = next_slot         (allocate fresh)
     ///       v
     ///   needed = HEADER_SIZE + (slot+1) * stride
     ///       |
@@ -265,10 +282,19 @@ impl VectorStore for MmapVectorStore {
             });
         }
 
-        // Decide which slot to use : overwrite if id exists, else allocate.
-        let (slot, is_new) = match self.id_to_slot.get(&id) {
-            Some(&existing_slot) => (existing_slot, false),
-            None => (self.next_slot, true),
+        // Decide which slot to use. Three cases :
+        // - id already present : overwrite its existing slot in place
+        // - id new + free list has capacity : reuse a freed slot (no growth)
+        // - id new + free list empty : allocate a fresh slot at next_slot
+        //
+        // Only the third case bumps next_slot (the high-water mark).
+        // Only the first case skips inserting into id_to_slot.
+        let (slot, is_new_id, allocate_fresh) = match self.id_to_slot.get(&id) {
+            Some(&existing_slot) => (existing_slot, false, false),
+            None => match self.free_list.pop() {
+                Some(reused) => (reused, true, false),
+                None => (self.next_slot, true, true),
+            },
         };
 
         // If this would overflow capacity, grow first.
@@ -290,10 +316,12 @@ impl VectorStore for MmapVectorStore {
         self.mmap[data_off..data_off + self.dim * 4].copy_from_slice(vec_bytes);
 
         // Update bookkeeping.
-        if is_new {
+        if is_new_id {
+            self.id_to_slot.insert(id, slot);
+        }
+        if allocate_fresh {
             self.next_slot += 1;
             self.write_next_slot_to_header();
-            self.id_to_slot.insert(id, slot);
         }
 
         Ok(())
@@ -327,6 +355,42 @@ impl VectorStore for MmapVectorStore {
         let data_bytes = &self.mmap[data_off..data_off + self.dim * 4];
         let floats: &[f32] = bytemuck::cast_slice(data_bytes);
         Vector::try_new(floats.to_vec()).ok()
+    }
+
+    /// Remove the entry for `id`, freeing its slot for reuse.
+    ///
+    /// ```text
+    ///   remove(id)
+    ///       |
+    ///       v
+    ///   slot = id_to_slot.remove(id) ?  -- None --> return Ok(())   (idempotent)
+    ///       |
+    ///       v
+    ///   mmap[slot_off + 8] = 0           (clear present flag, in-place mmap write)
+    ///       |
+    ///       v
+    ///   free_list.push(slot)             (slot is now reusable by future put)
+    /// ```
+    ///
+    /// The vector bytes at the slot are left in place ; they'll be
+    /// overwritten the next time this slot is reused via [`Self::put`].
+    /// The file is **never** truncated : `set_len` shrinks aren't
+    /// SIGBUS-safe under a live mmap, and the freed capacity is more
+    /// useful for reuse anyway.
+    fn remove(&mut self, id: VectorId) -> Result<(), Self::Error> {
+        // Idempotent : remove of an unknown id is not an error.
+        let Some(slot) = self.id_to_slot.remove(&id) else {
+            return Ok(());
+        };
+
+        // Clear the `present` flag on the slot. Single-byte mmap write.
+        let off = (HEADER_SIZE + slot * self.stride) as usize;
+        self.mmap[off + 8] = 0;
+
+        // Make the slot reusable by future `put`.
+        self.free_list.push(slot);
+
+        Ok(())
     }
 
     fn len(&self) -> usize {
@@ -512,5 +576,149 @@ mod tests {
             store.get(id(39_999)),
             Some(v(vec![39_999.0, 0.0, 0.0, 0.0]))
         );
+    }
+
+    // ---------- remove + free-list behaviour ----------
+
+    /// Remove drops the entry from `len` / `get` / `contains` (the
+    /// observable surface) but doesn't shrink the file. The freed slot
+    /// is held internally for reuse.
+    #[test]
+    fn remove_present_id_makes_it_invisible() {
+        let dir = tempdir().unwrap();
+        let mut store = MmapVectorStore::open(dir.path().join("vs.dat"), 2).unwrap();
+        store.put(id(1), v(vec![1.0, 2.0])).unwrap();
+        store.put(id(2), v(vec![3.0, 4.0])).unwrap();
+        assert_eq!(store.len(), 2);
+
+        store.remove(id(1)).unwrap();
+        assert_eq!(store.len(), 1);
+        assert!(store.get(id(1)).is_none());
+        assert!(!store.contains(id(1)));
+        assert!(store.contains(id(2)));
+    }
+
+    /// Remove of an id that was never inserted is a clean no-op.
+    #[test]
+    fn remove_missing_id_is_noop() {
+        let dir = tempdir().unwrap();
+        let mut store = MmapVectorStore::open(dir.path().join("vs.dat"), 2).unwrap();
+        store.put(id(1), v(vec![1.0, 2.0])).unwrap();
+
+        store.remove(id(99)).unwrap();
+        assert_eq!(store.len(), 1);
+        assert!(store.contains(id(1)));
+    }
+
+    /// After a remove, the next put for a new id should reuse the freed
+    /// slot rather than allocating a fresh one. We detect this by
+    /// observing that the file size doesn't grow.
+    #[test]
+    fn put_after_remove_reuses_freed_slot() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("vs.dat");
+        let mut store = MmapVectorStore::open(&path, 2).unwrap();
+
+        // Fill to a few slots ; record next_slot.
+        store.put(id(1), v(vec![1.0, 0.0])).unwrap();
+        store.put(id(2), v(vec![2.0, 0.0])).unwrap();
+        store.put(id(3), v(vec![3.0, 0.0])).unwrap();
+        let high_water_before = store.next_slot;
+        assert_eq!(high_water_before, 3);
+
+        // Remove id 2 ; now slot 1 is free.
+        store.remove(id(2)).unwrap();
+        assert_eq!(store.free_list.len(), 1);
+
+        // Put a fresh id ; should consume the freed slot, not bump next_slot.
+        store.put(id(42), v(vec![42.0, 0.0])).unwrap();
+        assert_eq!(
+            store.next_slot, high_water_before,
+            "next_slot should not have advanced"
+        );
+        assert!(
+            store.free_list.is_empty(),
+            "free list should have been drained"
+        );
+
+        // Both id 42 and the un-removed ids are still readable.
+        assert_eq!(store.get(id(42)), Some(v(vec![42.0, 0.0])));
+        assert_eq!(store.get(id(1)), Some(v(vec![1.0, 0.0])));
+        assert_eq!(store.get(id(3)), Some(v(vec![3.0, 0.0])));
+        assert!(store.get(id(2)).is_none());
+    }
+
+    /// The free list is rebuilt on open by scanning slots with `present == 0`.
+    /// Drop the store, reopen, the freed slot is still in the free list.
+    #[test]
+    fn reopen_recovers_free_list() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("vs.dat");
+
+        {
+            let mut store = MmapVectorStore::open(&path, 2).unwrap();
+            store.put(id(1), v(vec![1.0, 0.0])).unwrap();
+            store.put(id(2), v(vec![2.0, 0.0])).unwrap();
+            store.put(id(3), v(vec![3.0, 0.0])).unwrap();
+            store.remove(id(1)).unwrap();
+            store.remove(id(3)).unwrap();
+            // free_list now has 2 entries (slots 0 and 2).
+        }
+
+        let store = MmapVectorStore::open(&path, 2).unwrap();
+        // live entries survive
+        assert_eq!(store.len(), 1);
+        assert_eq!(store.get(id(2)), Some(v(vec![2.0, 0.0])));
+        // freed slots are picked back up
+        assert_eq!(store.free_list.len(), 2);
+        assert_eq!(store.next_slot, 3);
+    }
+
+    /// Reopen + put of a new id should still reuse a freed slot from
+    /// the prior session : exercises the full "free list survives a
+    /// drop + reopen" cycle and confirms the file doesn't grow.
+    #[test]
+    fn put_after_reopen_reuses_freed_slot() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("vs.dat");
+
+        {
+            let mut store = MmapVectorStore::open(&path, 2).unwrap();
+            store.put(id(1), v(vec![1.0, 0.0])).unwrap();
+            store.put(id(2), v(vec![2.0, 0.0])).unwrap();
+            store.remove(id(1)).unwrap();
+        }
+
+        let mut store = MmapVectorStore::open(&path, 2).unwrap();
+        let high_water_before = store.next_slot;
+        store.put(id(99), v(vec![99.0, 0.0])).unwrap();
+        assert_eq!(
+            store.next_slot, high_water_before,
+            "next_slot stable across put"
+        );
+        assert_eq!(store.get(id(99)), Some(v(vec![99.0, 0.0])));
+    }
+
+    /// remove + put of the same id sequence : the put after remove
+    /// allocates from the free list (the slot the remove freed),
+    /// so the data is at the same slot as before. Subtle correctness
+    /// check that overwrite-via-remove-then-put behaves cleanly.
+    #[test]
+    fn remove_then_put_same_id_reuses_its_old_slot() {
+        let dir = tempdir().unwrap();
+        let mut store = MmapVectorStore::open(dir.path().join("vs.dat"), 2).unwrap();
+        store.put(id(1), v(vec![1.0, 2.0])).unwrap();
+        let slot_before = store.id_to_slot[&id(1)];
+
+        store.remove(id(1)).unwrap();
+        assert!(!store.contains(id(1)));
+
+        store.put(id(1), v(vec![9.0, 9.0])).unwrap();
+        let slot_after = store.id_to_slot[&id(1)];
+
+        // The free list had exactly one entry (slot_before), so the new
+        // put for id 1 reuses that same slot.
+        assert_eq!(slot_after, slot_before, "id 1 should land at its old slot");
+        assert_eq!(store.get(id(1)), Some(v(vec![9.0, 9.0])));
     }
 }
