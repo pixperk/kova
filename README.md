@@ -14,13 +14,13 @@ with gRPC between nodes. Every byte, every index, every network call is ours.
 | Crate          | Status      | What it provides                                                       |
 | -------------- | ----------- | ---------------------------------------------------------------------- |
 | `kova-core`    | shipped     | `Vector`, `Distance` trait + `Cosine` / `L2` / `InnerProduct` (SIMD)   |
-| `kova-index`   | shipped     | `Index` trait, `FlatIndex` baseline, `HnswIndex` (insert + search)     |
-| `kova-storage` | in progress | Segmented WAL, `MmapVectorStore` (free-list slot reuse), `FileMetadataStore`, `atomic_write` + streaming variant, `Shard` (log-then-mutate, SIGKILL-survival tested), delete (tombstone + search filter), batched inserts (group-commit fsync), HNSW vacuum + graph snapshot + Manifest primitives; `Shard::checkpoint` next |
+| `kova-index`   | shipped     | `Index` trait, `FlatIndex` baseline, `HnswIndex` (insert + search + two-pass vacuum + streaming snapshot) |
+| `kova-storage` | shipped     | Segmented WAL, `MmapVectorStore` (free-list slot reuse, crash-mid-init recovery), `FileMetadataStore`, `atomic_write` (+ streaming variant), `Manifest` commit point, `Shard` (log-then-mutate, batched inserts, logical delete, vacuum, checkpoint + WAL truncate, generation-numbered snapshots). SIGKILL-tested across 55,697 acks and 962 checkpoints. |
 | `kova-query`   | not started | KQL parser, planner, executor                                          |
 | `kova-cluster` | not started | Consistent hashing, quorum replication, coordinator                    |
 | `kova-server`  | not started | gRPC node binary                                                       |
 
-200 tests passing across the workspace; `cargo clippy --workspace --all-targets -- -D warnings` clean.
+234 tests passing across the workspace; `cargo clippy --workspace --all-targets -- -D warnings` clean.
 
 ## Build
 
@@ -33,40 +33,58 @@ cargo bench -p kova-core
 
 ## Features
 
-- **HNSW index** (`HnswIndex`), hand-rolled. Default params (`M=16`,
-  `ef_construction=200`, `ef_search=50`) hit recall > 0.9 at 50k
-  vectors with no tuning. `FlatIndex` brute-force baseline shares the
-  `Index` trait so recall is diffed against ground truth.
-- **SIMD distance** via `wide::f32x8` for `L2`, `Cosine`, and
-  `InnerProduct`. 4x to 17x speedup over scalar, with `wide` falling
-  back to scalar on platforms without 8-lane f32 SIMD.
-- **Memory-mapped vector store** (`MmapVectorStore`). Fixed-stride flat
-  file, self-describing slots (16-byte header + `dim * 4` bytes), zero-
-  copy reads via `bytemuck`.
-- **Segmented write-ahead log** (`FileWal`). 64 MB rotation,
-  length + CRC32 framing, torn-tail recovery, multi-segment replay in
-  LSN order.
-- **File-backed metadata store** with open-shaped attribute bags per id
-  (`HashMap<String, Value>` where `Value` covers `String` / `I64` /
-  `F64` / `Bool` / `Array`).
-- **Atomic file replacement** (`atomic_write`: tmp + fsync + rename +
-  dirsync) for crash-safe checkpoints and snapshots.
-- **3-phase `Shard` ops** (validate, commit, apply) with pre-commit
-  input validation and panic-on-apply-failure for honest WAL semantics.
+**Index**
+
+- **HNSW**, hand-rolled. Default params (`M=16`, `ef_construction=200`,
+  `ef_search=50`) hit recall > 0.9 at 50k vectors without tuning.
+- **Two-pass vacuum** physically removes tombstoned nodes and repairs
+  the neighbour lists of every survivor that pointed at one. Bounded
+  by the M/2 skip rule so well-connected nodes don't pay for re-search.
+- **Streaming snapshot** (`write_snapshot`/`read_snapshot`) serializes
+  the whole graph through a `Write` so checkpoints don't double-buffer.
+- **`FlatIndex` baseline** shares the `Index` trait, used as ground
+  truth for recall validation.
+
+**Distance**
+
+- **SIMD** via `wide::f32x8` for `L2`, `Cosine`, `InnerProduct`. 4x-17x
+  over scalar; falls back to scalar where 8-lane f32 isn't available.
+
+**Storage**
+
+- **Memory-mapped vector store** with fixed-stride self-describing
+  slots (`16 + dim*4` bytes). Free-list reuses freed slots so deletes
+  followed by inserts don't grow the file. Crash-mid-init recovery on
+  reopen.
+- **Segmented WAL** with 64 MB rotation, length + CRC32 framing,
+  torn-tail recovery, and O(1) truncation by deleting superseded
+  segments.
+- **File-backed metadata** with open-shaped attribute bags
+  (`String` / `I64` / `F64` / `Bool` / `Array`), full-file snapshot on
+  mutation via `atomic_write`.
+- **Atomic file replacement** (tmp + fsync + rename + dirsync), both
+  buffer and streaming variants.
+
+**Shard (composition)**
+
+- **3-phase ops** (validate, commit, apply) with pre-commit validation
+  and panic-on-apply-failure for honest WAL semantics.
 - **Batched inserts** with group-commit fsync. N records share one
-  durability barrier, plus a single metadata flush for the whole batch.
-- **Logical delete** via HNSW tombstones. O(1) per delete ; vacuum
-  (next milestone) reclaims storage and re-enables id reuse.
-- **SIGKILL crash-recovery tested**: 100 iterations with randomised
-  kill timing, 15,020 acked inserts, zero failures. See the
-  [Crash recovery](#crash-recovery) section.
-- **Pluggable backends**: `VectorStore`, `MetadataStore`, and `Wal`
-  expose associated `Error` types, so future S3-backed log, columnar
-  metadata, distributed store, etc. drop in at the trait level without
-  touching `Shard`.
-- **Bring your own embeddings.** Kova stores and searches vectors ;
-  generating them from text or images is a separate concern (OpenAI,
-  Cohere, sentence-transformers, whatever your stack already uses).
+  durability barrier and one metadata flush.
+- **Logical delete + vacuum**: O(1) tombstones, search-time filter,
+  vacuum physically removes them and re-enables id reuse.
+- **Checkpoint + WAL truncate**: stop-the-world snapshot of the index,
+  manifest commits the new generation atomically, WAL truncates past
+  the checkpoint LSN. Generation-numbered snapshots make the swap
+  crash-safe.
+- **SIGKILL-tested**: 300 torture iterations, 55,697 acked inserts,
+  962 checkpoints, zero failures. See [Crash recovery](#crash-recovery).
+
+**Extensibility**
+
+- `VectorStore`, `MetadataStore`, and `Wal` are traits with associated
+  `Error` types, so a future S3-backed log, columnar metadata, or
+  distributed store drops in at the trait level without touching `Shard`.
 
 ## Distance benchmarks
 
@@ -390,14 +408,119 @@ connectivity for traversal. Cost : tombstoned vectors take up storage
 
 `search` filters tombstoned ids from the result list after
 `search_layer`. Result count may be smaller than `k` if many candidates
-in the neighbourhood are deleted ; vacuum (next milestone) is what
-restores both storage and quality.
+in the neighbourhood are deleted ; that's what vacuum (see below) is
+for : physical removal + graph repair restores both storage and recall.
 
-V1 limitation : ids cannot be reused after delete until vacuum runs.
+Ids cannot be reused after delete until vacuum runs.
 `Shard::insert(deleted_id, ...)` errors with `DuplicateId` because the
 graph node is still in place. The
-`reinsert_after_delete_errors_until_vacuum` test pins this contract so
-nobody quietly "fixes" it before vacuum is ready.
+`reinsert_after_delete_errors_until_vacuum` test pins this contract.
+
+### Vacuum is a two-pass graph repair, not a rebuild
+
+`HnswIndex::vacuum_tombstones` physically removes tombstoned nodes and
+patches the holes they leave in the graph. The naive approach (drop
+nodes + drop their edges) breaks reachability : a survivor whose only
+path to the entry point ran through a tombstoned node gets stranded.
+The expensive approach (rebuild the whole graph from scratch) is
+correct but wastes everything we already paid to insert.
+
+The two-pass middle path :
+
+```text
+PASS 1 : collect (node, layer) -> {removed tombstones it pointed at}
+PASS 2 : for each affected (node, layer) :
+           drop the dead neighbour ids
+           if remaining live neighbours >= M/2 : skip
+           else : run search_layer to find fresh M neighbours
+                  prune overflow with `select_neighbours_heuristic`
+```
+
+The **M/2 skip rule** is the bit that makes this cheap. HNSW only
+needs *good* neighbours, not *complete* ones. A node that lost one
+edge out of M still has plenty of routes to the entry point ; paying
+for a re-search just to top it back up to M would dominate vacuum
+time for no recall win. We only re-search nodes that fell below half
+their capacity, which is rare for well-connected nodes and exactly
+right for the few that mattered.
+
+Entry-point handling is its own case. If the current entry point was
+tombstoned, we pick the surviving node on the highest layer (ties
+broken by id for determinism) ; if no nodes survive at the entry
+layer, we drop down. `vacuum_entry_point_*` and
+`vacuum_with_all_nodes_tombstoned_empties_index` pin both paths.
+
+Cost : O(affected_nodes × M) for the prune phase, plus
+O(re_searched_nodes × log N) for the re-search phase. On typical
+workloads `re_searched_nodes` is a small fraction of
+`affected_nodes`. `vacuum_leaves_no_dead_edges_in_live_nodes` is the
+load-bearing invariant test.
+
+### Checkpoint commits through a manifest, atomic at the manifest
+
+`Shard::checkpoint` is the bridge between the WAL's append-only world
+and the index's mutable on-disk state. Six phases :
+
+```text
+1. vacuum                 │  physically remove tombstones, repair graph
+2. fsync the WAL          │  capture an LSN we can prove is durable
+3. write graph snapshot   │  streaming serialize -> graph.{N+1}.snapshot
+                          │  (N+1 is the new generation : doesn't touch
+                          │   the old graph.{N}.snapshot the manifest
+                          │   still points at)
+4. atomic_write manifest  │  { version, checkpoint_lsn, snapshot_id=N+1 }
+                          │  -- this is the durable commit point --
+5. truncate the WAL       │  delete segments past checkpoint_lsn
+6. delete graph.{N}.snapshot before this generation
+```
+
+**The manifest is the single commit point.** It's the only file that
+names which snapshot is live ; everything before phase 4 is staging,
+everything after is best-effort cleanup. The crash analysis :
+
+- Kill **before phase 4** : nothing visible changed. Reopen sees the
+  old manifest (or no manifest), loads `graph.{N}.snapshot` (or
+  nothing), replays the full WAL. Any orphaned `graph.{N+1}.snapshot`
+  is cleaned up by `cleanup_orphan_snapshots` on open.
+- Kill **after phase 4** : the new generation is live. Reopen reads
+  the new manifest, loads `graph.{N+1}.snapshot`, replays WAL only
+  past `checkpoint_lsn`. If phase 5 or 6 didn't run, the stale WAL
+  segments and old snapshot get cleaned up on the next checkpoint
+  (or by `cleanup_orphan_snapshots` for the snapshot).
+
+**Generation-numbered snapshots** (`graph.{N}.snapshot`) are what
+keeps phase 3 crash-safe. Overwriting a single `graph.snapshot` file
+would create a window where the file is half-written and the manifest
+still points at it ; even with `atomic_write` for the file itself,
+the manifest commit and the file rename can't be one operation. By
+writing to a fresh generation name, the old snapshot stays valid until
+the manifest commits the swap.
+
+**`atomic_write` (and its streaming variant) is the load-bearing
+primitive.** Both the manifest and each snapshot file are written to
+`{path}.tmp`, fsynced, renamed onto the final path, and then the
+parent directory is fsynced. POSIX guarantees the rename is atomic
+and that after the dirsync the new dirent is durable. Either the old
+file or the new file is observable on reopen ; never a partial write.
+The streaming variant (`atomic_write_streaming`) hands the caller a
+`BufWriter<File>` for the body, so large snapshots don't have to
+materialise the whole payload in memory before writing.
+
+**WAL truncation is delayed past the commit.** Phase 5 runs *after*
+phase 4 returned Ok, so if it crashes mid-truncate we just have extra
+WAL records that replay redundantly on reopen (idempotent : the
+snapshot already has them). Crashing before phase 4 means truncation
+never runs at all, which is also fine. The only ordering that would
+lose data is truncating before committing the manifest, which the
+code structure makes impossible.
+
+`should_checkpoint(&CheckpointPolicy)` is a read-only hint :
+`tombstone_ratio >= X` OR `records_since_checkpoint >= Y`. It returns
+a bool ; the caller decides whether to actually call `checkpoint()`.
+This keeps the insert path free of hidden latency : nothing in the
+hot path ever blocks on snapshot I/O unless the operator explicitly
+asks it to. `checkpoint_locks_in_vacuum_work` and
+`orphan_snapshots_get_cleaned_up_on_open` pin the trickier paths.
 
 ### Batched inserts amortise the fsync
 
@@ -480,21 +603,25 @@ The test `vector_deserialize_rejects_nan` enforces this : if anyone
 "simplifies" by switching to `#[derive(Deserialize)]`, that test fails
 immediately.
 
-## Coming up : `kova-storage`
+## Coming up : `kova-query`
 
-`Shard` composition, SIGKILL crash recovery, delete, and batched inserts
-have all shipped. One milestone left to close out the storage layer :
+The storage layer is closed out. Next milestone is **KQL**, a
+SQL-inspired query language for hybrid searches that combine vector
+similarity with metadata predicates :
 
-**Checkpoints + log truncation + vacuum** (bundled into one
-stop-the-world operation). HNSW graph is serialised to a `graph.{N}.snapshot`
-file alongside compact `vectors.{N}.mmap` and `metadata.{N}.bin` ; a
-manifest commits the new generation atomically. On reopen, `Shard::open`
-loads the manifest's components and replays WAL only from the checkpoint
-LSN forward. The compaction step doubles as vacuum (storage reclaim
-from tombstones), and the WAL is truncated to records past the
-checkpoint LSN. Trigger is manual (`Shard::checkpoint()`) plus a
-read-only `should_checkpoint(&Policy)` hint so callers can poll without
-hidden latency in the insert path.
+```sql
+SELECT id, distance FROM vectors
+WHERE category = 'docs' AND year >= 2024
+ORDER BY embedding <-> $query LIMIT 10
+```
+
+Pest grammar, planner that picks pre-filter vs post-filter based on
+estimated selectivity, executor that walks plans against the existing
+`Shard` API. The interesting work is the planner : at low selectivity
+pre-filtering (scan metadata, then exact-distance the matches) beats
+ANN ; at high selectivity post-filtering (run ANN, then drop
+non-matches) wins. The crossover depends on `k`, recall target, and
+metadata index shape.
 
 ## Longer-term scope
 
@@ -513,31 +640,21 @@ Beyond `kova-storage` :
 
 ## Design philosophy
 
-Kova trusts the write-ahead log absolutely and the in-memory state
-never. Every mutation is logged, fsynced, and only then applied ; if
-the apply step diverges from the log, the process aborts and recovery
-reconciles on reopen. The pattern is older than any ANN library :
-Postgres ships it, RocksDB ships it, and a SIGKILL torture passing
-15,020 acked inserts across 100 iterations is the receipt.
+**The log is truth ; memory is a cache.** Every mutation is logged,
+fsynced, and only then applied. If apply diverges from the log, the
+process aborts and reopen rebuilds from the log. 55,697 acked inserts
+and 962 checkpoints survived 300 SIGKILLs with zero data loss : the
+discipline is what makes that possible, not luck.
 
-Pluggable seams over premature optimisation. `VectorStore`,
-`MetadataStore`, and `Wal` are traits with associated error types so a
-future S3-backed log or columnar metadata store drops in without
-touching `Shard`. Within those seams, decisions are concrete : mmap for
-hot fixed-stride data, full-file flush for cold variable-size data,
-in-memory `HashSet` for tombstones because they're recoverable from
-the log. The traits are where the future lives ; the impls are where
-the work happens.
+**Pluggable seams, concrete impls.** `VectorStore`, `MetadataStore`,
+and `Wal` are traits with associated error types so a future S3 log
+or distributed store drops in without touching `Shard`. Inside those
+seams every choice is opinionated : mmap for hot fixed-stride data,
+full-file snapshots for cold variable-size data, in-memory tombstones
+because the log already has the truth. Traits are where the future
+lives ; impls are where the work happens.
 
-Validate aggressively, panic narrowly. Pre-commit checks catch every
-input-level failure (duplicate id, dim mismatch, malformed batch)
-before the WAL is touched, so post-commit failures are exclusively
-"the disk is broken" cases. When those do fire, panicking is the
-honest answer : the operation is already committed in the log, and
-pretending otherwise to the caller is the only way to corrupt the log
-on retry.
-
-Built from scratch, on purpose. Every byte format, every fsync, every
-neighbour list. Existing libraries would have shipped Phase 3 in a
-weekend ; the point isn't to ship fast, it's to understand the system
-the libraries hide.
+**Built from scratch, on purpose.** Every byte format, every fsync,
+every neighbour list, every checkpoint phase. An existing library
+would ship the same surface in a weekend ; the point isn't to ship
+fast, it's to understand the system the libraries hide.
