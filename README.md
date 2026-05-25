@@ -15,12 +15,12 @@ with gRPC between nodes. Every byte, every index, every network call is ours.
 | -------------- | ----------- | ---------------------------------------------------------------------- |
 | `kova-core`    | shipped     | `Vector`, `Distance` trait + `Cosine` / `L2` / `InnerProduct` (SIMD)   |
 | `kova-index`   | shipped     | `Index` trait, `FlatIndex` baseline, `HnswIndex` (insert + search)     |
-| `kova-storage` | in progress | Segmented WAL, `MmapVectorStore`, `FileMetadataStore`, `atomic_write`, `Shard` (log-then-mutate, SIGKILL-survival tested), delete (tombstone + search filter), batched inserts (group-commit fsync); checkpoints + vacuum next |
+| `kova-storage` | in progress | Segmented WAL, `MmapVectorStore` (free-list slot reuse), `FileMetadataStore`, `atomic_write` + streaming variant, `Shard` (log-then-mutate, SIGKILL-survival tested), delete (tombstone + search filter), batched inserts (group-commit fsync), HNSW vacuum + graph snapshot + Manifest primitives; `Shard::checkpoint` next |
 | `kova-query`   | not started | KQL parser, planner, executor                                          |
 | `kova-cluster` | not started | Consistent hashing, quorum replication, coordinator                    |
 | `kova-server`  | not started | gRPC node binary                                                       |
 
-168 tests passing across the workspace; `cargo clippy --workspace --all-targets -- -D warnings` clean.
+200 tests passing across the workspace; `cargo clippy --workspace --all-targets -- -D warnings` clean.
 
 ## Build
 

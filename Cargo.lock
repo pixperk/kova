@@ -437,9 +437,11 @@ dependencies = [
 name = "kova-index"
 version = "0.1.0"
 dependencies = [
+ "bincode",
  "criterion",
  "kova-core",
  "rand 0.10.1",
+ "serde",
  "thiserror",
 ]
 
