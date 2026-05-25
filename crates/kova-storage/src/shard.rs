@@ -487,6 +487,30 @@ where
         Ok(())
     }
 
+    /// Physically remove all tombstoned ids : rewire the HNSW graph
+    /// so no live node points at a deleted one, free their slots in the
+    /// vector store, reset the tombstone set. Returns the number of
+    /// ids physically removed.
+    ///
+    /// **No on-disk commit.** Vacuum touches in-memory graph state and
+    /// the mmap (clearing slot `present` bytes for reuse), but the WAL
+    /// is unchanged and no manifest is written. The vacuum work is
+    /// recoverable but *wasted* on crash : if the process dies before
+    /// the next [`Shard::checkpoint`], reopen replays the full WAL
+    /// (including the `Delete` records), tombstones come back, and you
+    /// have to vacuum again. Operators usually call `checkpoint()` not
+    /// long after `vacuum()` to lock the work in.
+    ///
+    /// Metadata is **not** touched here : tombstoned ids were already
+    /// pruned from the metadata store at [`Self::delete`] time.
+    ///
+    /// # Errors
+    /// [`ShardError::Index`] surfaces any HNSW-level error during the
+    /// rewiring or the underlying `vectors.remove` call.
+    pub fn vacuum(&mut self) -> Result<usize, ShardError> {
+        Ok(self.index.vacuum_tombstones()?)
+    }
+
     /// Whether the shard currently holds a live entry for `id`.
     ///
     /// Returns `false` for ids that were inserted then deleted : the
@@ -1227,5 +1251,141 @@ mod tests {
             hits[0].metadata.get("tag"),
             Some(&Value::String("k5".into()))
         );
+    }
+
+    // ---------- Shard::vacuum ----------
+
+    /// `vacuum` on a shard with no tombstones is a clean no-op : returns
+    /// 0 and leaves state untouched.
+    #[test]
+    fn vacuum_on_no_tombstones_is_noop() {
+        let mut shard = Shard::from_parts(
+            L2,
+            HnswParams::default(),
+            InMemoryVectorStore::new(),
+            InMemoryMetadataStore::new(),
+            InMemoryWal::new(),
+        )
+        .unwrap();
+        shard
+            .insert(id(1), v(vec![1.0, 0.0]), Metadata::new())
+            .unwrap();
+        shard
+            .insert(id(2), v(vec![0.0, 1.0]), Metadata::new())
+            .unwrap();
+
+        let freed = shard.vacuum().unwrap();
+        assert_eq!(freed, 0);
+        assert_eq!(shard.len(), 2);
+        assert!(shard.contains(id(1)));
+        assert!(shard.contains(id(2)));
+    }
+
+    /// After delete + vacuum, the tombstoned id is fully gone from the
+    /// index (no longer in nodes, not just tombstoned).
+    #[test]
+    fn vacuum_physically_removes_tombstoned_ids() {
+        let mut shard = Shard::from_parts(
+            L2,
+            HnswParams::default(),
+            InMemoryVectorStore::new(),
+            InMemoryMetadataStore::new(),
+            InMemoryWal::new(),
+        )
+        .unwrap();
+        shard
+            .insert(id(1), v(vec![1.0, 0.0]), Metadata::new())
+            .unwrap();
+        shard
+            .insert(id(2), v(vec![0.0, 1.0]), Metadata::new())
+            .unwrap();
+        shard.delete(id(1)).unwrap();
+
+        let freed = shard.vacuum().unwrap();
+        assert_eq!(freed, 1);
+        assert_eq!(shard.len(), 1);
+        assert!(!shard.contains(id(1)));
+        assert!(shard.contains(id(2)));
+    }
+
+    /// The headline lift of the v1 limitation : after vacuum, a deleted
+    /// id can be re-inserted with a fresh vector. Pre-vacuum, the same
+    /// insert would fail with `DuplicateId` because the graph node was
+    /// still around (just tombstoned).
+    #[test]
+    fn vacuum_enables_id_reuse() {
+        let mut shard = Shard::from_parts(
+            L2,
+            HnswParams::default(),
+            InMemoryVectorStore::new(),
+            InMemoryMetadataStore::new(),
+            InMemoryWal::new(),
+        )
+        .unwrap();
+        shard
+            .insert(id(7), v(vec![1.0, 0.0]), tag_meta("first"))
+            .unwrap();
+        shard.delete(id(7)).unwrap();
+
+        // Pre-vacuum : re-insert errors.
+        let err = shard.insert(id(7), v(vec![2.0, 0.0]), tag_meta("second"));
+        assert!(matches!(
+            err,
+            Err(ShardError::Index(KovaIndexError::DuplicateId { .. }))
+        ));
+
+        // Vacuum frees the id ; re-insert now succeeds.
+        shard.vacuum().unwrap();
+        shard
+            .insert(id(7), v(vec![2.0, 0.0]), tag_meta("second"))
+            .unwrap();
+        assert_eq!(shard.len(), 1);
+        assert!(shard.contains(id(7)));
+
+        let hits = shard.search(&v(vec![2.0, 0.0]), 1).unwrap();
+        assert_eq!(hits[0].id, id(7));
+        assert_eq!(
+            hits[0].metadata.get("tag"),
+            Some(&Value::String("second".into()))
+        );
+    }
+
+    /// File-backed end-to-end : insert, delete, vacuum, drop, reopen.
+    /// Since vacuum doesn't write a snapshot or truncate the WAL, the
+    /// reopen replays the full WAL (including the `Delete` records),
+    /// tombstones come back, and the vacuum work is lost. This is the
+    /// documented "vacuum without checkpoint is wasted on crash" trade.
+    ///
+    /// Asserts the post-reopen state is still *correct* (tombstoned id
+    /// is invisible), and that a second vacuum still works.
+    #[test]
+    fn vacuum_work_is_wasted_on_reopen_but_state_stays_correct() {
+        let dir = tempdir().unwrap();
+
+        {
+            let mut shard = Shard::open(dir.path(), 2, L2, HnswParams::default()).unwrap();
+            shard
+                .insert(id(1), v(vec![1.0, 0.0]), tag_meta("a"))
+                .unwrap();
+            shard
+                .insert(id(2), v(vec![0.0, 1.0]), tag_meta("b"))
+                .unwrap();
+            shard.delete(id(1)).unwrap();
+            let freed = shard.vacuum().unwrap();
+            assert_eq!(freed, 1);
+            assert_eq!(shard.len(), 1);
+        }
+
+        // Reopen : WAL replay re-inserts id 1, then re-tombstones it.
+        // From the caller's view the shard still has only id 2 visible.
+        let mut shard = Shard::open(dir.path(), 2, L2, HnswParams::default()).unwrap();
+        assert!(!shard.contains(id(1)));
+        assert!(shard.contains(id(2)));
+        assert_eq!(shard.len(), 1);
+
+        // Vacuum-again works : frees id 1's reborn-then-killed graph node.
+        let freed = shard.vacuum().unwrap();
+        assert_eq!(freed, 1);
+        assert_eq!(shard.len(), 1);
     }
 }
