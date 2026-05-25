@@ -33,6 +33,21 @@ pub trait VectorStore {
     /// Fetch the vector for `id`, if present. Returns an owned clone.
     fn get(&self, id: VectorId) -> Option<Vector>;
 
+    /// Remove the entry for `id`. No-op if `id` isn't present.
+    ///
+    /// Idempotent : removing a missing id is **not** an error. Callers
+    /// that want to distinguish "was actually removed" from "wasn't
+    /// there" check [`Self::contains`] first.
+    ///
+    /// Implementations that store data on disk are free to retain the
+    /// freed capacity for reuse (e.g. an mmap store reusing slots via a
+    /// free list, rather than truncating the file).
+    ///
+    /// # Errors
+    /// Returns `Self::Error` only on underlying I/O failure (mmap flush,
+    /// etc.). The "id-not-present" case is not an error.
+    fn remove(&mut self, id: VectorId) -> Result<(), Self::Error>;
+
     /// Number of vectors stored.
     fn len(&self) -> usize;
 
@@ -107,6 +122,11 @@ impl VectorStore for InMemoryVectorStore {
         self.nodes.get(&id).cloned()
     }
 
+    fn remove(&mut self, id: VectorId) -> Result<(), Self::Error> {
+        self.nodes.remove(&id);
+        Ok(())
+    }
+
     fn len(&self) -> usize {
         self.nodes.len()
     }
@@ -163,5 +183,28 @@ mod tests {
         store.put(id(5), v(vec![5.0])).unwrap();
         assert!(store.contains(id(5)));
         assert!(!store.contains(id(6)));
+    }
+
+    #[test]
+    fn remove_present_drops_entry() {
+        let mut store = InMemoryVectorStore::new();
+        store.put(id(1), v(vec![1.0])).unwrap();
+        store.put(id(2), v(vec![2.0])).unwrap();
+        assert_eq!(store.len(), 2);
+
+        store.remove(id(1)).unwrap();
+        assert!(!store.contains(id(1)));
+        assert!(store.contains(id(2)));
+        assert_eq!(store.len(), 1);
+    }
+
+    #[test]
+    fn remove_missing_is_noop() {
+        let mut store = InMemoryVectorStore::new();
+        store.put(id(1), v(vec![1.0])).unwrap();
+        // Removing an id that was never inserted is not an error.
+        store.remove(id(99)).unwrap();
+        assert_eq!(store.len(), 1);
+        assert!(store.contains(id(1)));
     }
 }
