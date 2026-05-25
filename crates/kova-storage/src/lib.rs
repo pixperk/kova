@@ -8,12 +8,14 @@
 
 mod atomic;
 mod error;
+mod manifest;
 mod metadata_store;
 mod shard;
 mod vector_store;
 mod wal;
-pub use atomic::atomic_write;
+pub use atomic::{atomic_write, atomic_write_streaming};
 pub use error::KovaStorageError;
+pub use manifest::Manifest;
 pub use metadata_store::FileMetadataStore;
 pub use shard::{SearchHit, Shard, ShardError};
 pub use vector_store::MmapVectorStore;
