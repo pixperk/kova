@@ -88,8 +88,12 @@ mod tests {
     #[test]
     fn search_with_k_zero_returns_empty() {
         let mut shard = fresh_in_memory();
-        shard.insert(id(1), v(vec![1.0, 0.0]), Metadata::new()).unwrap();
-        shard.insert(id(2), v(vec![0.0, 1.0]), Metadata::new()).unwrap();
+        shard
+            .insert(id(1), v(vec![1.0, 0.0]), Metadata::new())
+            .unwrap();
+        shard
+            .insert(id(2), v(vec![0.0, 1.0]), Metadata::new())
+            .unwrap();
 
         let hits = shard.search(&v(vec![1.0, 0.0]), 0).unwrap();
         assert!(hits.is_empty());
@@ -100,9 +104,15 @@ mod tests {
     #[test]
     fn search_returns_hits_in_ascending_distance_order() {
         let mut shard = fresh_in_memory();
-        shard.insert(id(1), v(vec![10.0, 0.0]), Metadata::new()).unwrap();
-        shard.insert(id(2), v(vec![1.0, 0.0]), Metadata::new()).unwrap();
-        shard.insert(id(3), v(vec![5.0, 0.0]), Metadata::new()).unwrap();
+        shard
+            .insert(id(1), v(vec![10.0, 0.0]), Metadata::new())
+            .unwrap();
+        shard
+            .insert(id(2), v(vec![1.0, 0.0]), Metadata::new())
+            .unwrap();
+        shard
+            .insert(id(3), v(vec![5.0, 0.0]), Metadata::new())
+            .unwrap();
 
         let hits = shard.search(&v(vec![0.0, 0.0]), 3).unwrap();
         assert_eq!(hits.len(), 3);
@@ -125,8 +135,12 @@ mod tests {
     #[test]
     fn search_returns_metadata_attached_to_each_hit() {
         let mut shard = fresh_in_memory();
-        shard.insert(id(1), v(vec![1.0, 0.0]), tag_meta("alpha")).unwrap();
-        shard.insert(id(2), v(vec![0.0, 1.0]), tag_meta("beta")).unwrap();
+        shard
+            .insert(id(1), v(vec![1.0, 0.0]), tag_meta("alpha"))
+            .unwrap();
+        shard
+            .insert(id(2), v(vec![0.0, 1.0]), tag_meta("beta"))
+            .unwrap();
 
         let hits = shard.search(&v(vec![1.0, 0.05]), 2).unwrap();
         assert_eq!(hits.len(), 2);
@@ -146,8 +160,12 @@ mod tests {
     #[test]
     fn search_with_k_larger_than_len_returns_all_available() {
         let mut shard = fresh_in_memory();
-        shard.insert(id(1), v(vec![1.0, 0.0]), Metadata::new()).unwrap();
-        shard.insert(id(2), v(vec![0.0, 1.0]), Metadata::new()).unwrap();
+        shard
+            .insert(id(1), v(vec![1.0, 0.0]), Metadata::new())
+            .unwrap();
+        shard
+            .insert(id(2), v(vec![0.0, 1.0]), Metadata::new())
+            .unwrap();
 
         let hits = shard.search(&v(vec![1.0, 0.0]), 100).unwrap();
         assert_eq!(hits.len(), 2);
@@ -158,12 +176,17 @@ mod tests {
     #[test]
     fn search_with_dim_mismatch_errors() {
         let mut shard = fresh_in_memory();
-        shard.insert(id(1), v(vec![1.0, 0.0]), Metadata::new()).unwrap();
+        shard
+            .insert(id(1), v(vec![1.0, 0.0]), Metadata::new())
+            .unwrap();
 
         let err = shard.search(&v(vec![1.0, 2.0, 3.0]), 5).unwrap_err();
         assert!(matches!(
             err,
-            ShardError::Index(KovaIndexError::DimensionMismatch { expected: 2, got: 3 })
+            ShardError::Index(KovaIndexError::DimensionMismatch {
+                expected: 2,
+                got: 3
+            })
         ));
     }
 
@@ -173,9 +196,15 @@ mod tests {
     #[test]
     fn search_filters_tombstoned_ids() {
         let mut shard = fresh_in_memory();
-        shard.insert(id(1), v(vec![1.0, 0.0]), tag_meta("a")).unwrap();
-        shard.insert(id(2), v(vec![0.0, 1.0]), tag_meta("b")).unwrap();
-        shard.insert(id(3), v(vec![1.0, 1.0]), tag_meta("c")).unwrap();
+        shard
+            .insert(id(1), v(vec![1.0, 0.0]), tag_meta("a"))
+            .unwrap();
+        shard
+            .insert(id(2), v(vec![0.0, 1.0]), tag_meta("b"))
+            .unwrap();
+        shard
+            .insert(id(3), v(vec![1.0, 1.0]), tag_meta("c"))
+            .unwrap();
 
         shard.delete(id(1)).unwrap();
 
