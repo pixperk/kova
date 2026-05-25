@@ -20,6 +20,7 @@ mod node;
 mod params;
 mod search;
 mod select;
+mod snapshot;
 mod vacuum;
 
 pub(crate) use node::Node;

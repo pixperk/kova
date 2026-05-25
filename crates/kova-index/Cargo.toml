@@ -11,6 +11,8 @@ description = "Index trait, brute-force baseline, and HNSW for Kova."
 kova-core = { path = "../kova-core" }
 thiserror.workspace = true
 rand = "0.10"
+serde = { version = "1", features = ["derive"] }
+bincode = "1"
 
 [dev-dependencies]
 criterion = "0.5"
