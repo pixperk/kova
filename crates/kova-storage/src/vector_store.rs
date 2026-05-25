@@ -138,32 +138,30 @@ impl MmapVectorStore {
 
         let existing_size = file.metadata()?.len();
 
-        if existing_size == 0 {
-            // ---- fresh file branch ----
-            file.set_len(INITIAL_CAPACITY_BYTES)?;
-            let mut mmap = map_file(&file)?;
-
-            // Write the header.
-            mmap[0..8].copy_from_slice(MAGIC);
-            mmap[8..16].copy_from_slice(&(dim as u64).to_le_bytes());
-            mmap[16..24].copy_from_slice(&0u64.to_le_bytes()); // next_slot
-            mmap[24..32].copy_from_slice(&0u64.to_le_bytes()); // reserved
-
-            return Ok(Self {
-                file,
-                mmap,
-                dim,
-                stride,
-                next_slot: 0,
-                id_to_slot: HashMap::new(),
-                free_list: Vec::new(),
-                path,
-                capacity_bytes: INITIAL_CAPACITY_BYTES,
-            });
+        // Fresh-init path. Also taken when we detect a crash-mid-init
+        // file below (size < HEADER_SIZE, or full of zeros where MAGIC
+        // should be) : in both cases the file is semantically empty and
+        // re-initializing in place is correct.
+        if existing_size == 0 || existing_size < HEADER_SIZE {
+            return Self::initialize_fresh(file, path, dim, stride);
         }
 
         // ---- existing file branch : recover ----
         let mmap = map_file(&file)?;
+
+        // Crash-mid-init recovery : if the child got SIGKILL'd between
+        // `set_len(INITIAL_CAPACITY_BYTES)` and the MAGIC write in
+        // `initialize_fresh`, the file on disk is full-size but all
+        // zeros. An all-zero header is unambiguous because MAGIC starts
+        // with 'K' (0x4B), so a real file can never have one. Treat it
+        // the same as a fresh file and re-initialize in place. Without
+        // this, the parent test (or a real-world reopen after crash)
+        // sees the zero header and bails with "invalid magic", even
+        // though no committed state was lost.
+        if mmap[0..8] == [0u8; 8] {
+            drop(mmap);
+            return Self::initialize_fresh(file, path, dim, stride);
+        }
 
         // Validate header magic.
         if &mmap[0..8] != MAGIC {
@@ -211,6 +209,39 @@ impl MmapVectorStore {
             free_list,
             path,
             capacity_bytes: existing_size,
+        })
+    }
+
+    /// Initialize `file` as a fresh store : grow to `INITIAL_CAPACITY_BYTES`,
+    /// write the header, return a ready-to-use `Self`.
+    ///
+    /// Called from `open` for genuinely-empty files AND for files left
+    /// in a partially-initialized state by a crash before the MAGIC
+    /// write (see `open` for the crash-window details).
+    fn initialize_fresh(
+        file: File,
+        path: PathBuf,
+        dim: usize,
+        stride: u64,
+    ) -> Result<Self, KovaStorageError> {
+        file.set_len(INITIAL_CAPACITY_BYTES)?;
+        let mut mmap = map_file(&file)?;
+
+        mmap[0..8].copy_from_slice(MAGIC);
+        mmap[8..16].copy_from_slice(&(dim as u64).to_le_bytes());
+        mmap[16..24].copy_from_slice(&0u64.to_le_bytes()); // next_slot
+        mmap[24..32].copy_from_slice(&0u64.to_le_bytes()); // reserved
+
+        Ok(Self {
+            file,
+            mmap,
+            dim,
+            stride,
+            next_slot: 0,
+            id_to_slot: HashMap::new(),
+            free_list: Vec::new(),
+            path,
+            capacity_bytes: INITIAL_CAPACITY_BYTES,
         })
     }
 
@@ -552,13 +583,52 @@ mod tests {
 
     #[test]
     fn reopen_magic_mismatch_errors() {
+        // Truly garbage header (not all-zero, not MAGIC) must error.
+        // All-zero headers are the crash-mid-init recovery case and are
+        // covered by `reopen_all_zero_header_recovers_as_fresh`.
         let dir = tempdir().unwrap();
         let path = dir.path().join("vs.dat");
         let mut f = File::create(&path).unwrap();
-        f.write_all(&[0u8; 64]).unwrap();
+        let mut bytes = [0u8; 64];
+        bytes[0..8].copy_from_slice(b"NOTKOVA1");
+        f.write_all(&bytes).unwrap();
         drop(f);
         let err = MmapVectorStore::open(&path, 3).unwrap_err();
         assert!(matches!(err, KovaStorageError::CorruptRecord { .. }));
+    }
+
+    #[test]
+    fn reopen_all_zero_header_recovers_as_fresh() {
+        // Simulates a crash between `set_len(INITIAL_CAPACITY_BYTES)` and
+        // the MAGIC write : file is full-size but all zeros. Reopen must
+        // treat it as fresh and re-initialize, not error out as corrupt.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("vs.dat");
+        let f = File::create(&path).unwrap();
+        f.set_len(INITIAL_CAPACITY_BYTES).unwrap();
+        drop(f);
+
+        let mut store = MmapVectorStore::open(&path, 3).unwrap();
+        assert_eq!(store.len(), 0);
+        // And the re-initialized store must be usable, not just openable.
+        store.put(id(1), v(vec![1.0, 2.0, 3.0])).unwrap();
+        assert_eq!(store.get(id(1)), Some(v(vec![1.0, 2.0, 3.0])));
+    }
+
+    #[test]
+    fn reopen_sub_header_size_file_recovers_as_fresh() {
+        // Crash between `OpenOptions::open` and `set_len` : file exists
+        // but is smaller than HEADER_SIZE. Reopen must also treat as fresh.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("vs.dat");
+        let mut f = File::create(&path).unwrap();
+        f.write_all(&[0u8; 4]).unwrap();
+        drop(f);
+
+        let mut store = MmapVectorStore::open(&path, 3).unwrap();
+        assert_eq!(store.len(), 0);
+        store.put(id(1), v(vec![1.0, 2.0, 3.0])).unwrap();
+        assert_eq!(store.get(id(1)), Some(v(vec![1.0, 2.0, 3.0])));
     }
 
     #[test]
