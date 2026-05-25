@@ -219,6 +219,16 @@ impl Wal for FileWal {
         Ok(())
     }
 
+    fn last_lsn(&self) -> Option<Lsn> {
+        // `next_lsn` is the LSN the next append will get. Last-appended
+        // is `next_lsn - 1` ; `None` if nothing's ever been appended.
+        if self.next_lsn == 0 {
+            None
+        } else {
+            Some(Lsn::new(self.next_lsn - 1))
+        }
+    }
+
     fn iter_from(
         &self,
         from: Lsn,
@@ -514,5 +524,42 @@ mod tests {
         // Disk inspection: ensure the directory has fewer files.
         let file_count = fs::read_dir(dir.path()).unwrap().count();
         assert!(file_count < segments_before + 1);
+    }
+
+    // ---------- last_lsn ----------
+
+    #[test]
+    fn last_lsn_is_none_on_empty_wal() {
+        let dir = tempdir().unwrap();
+        let wal = FileWal::open(dir.path()).unwrap();
+        assert_eq!(wal.last_lsn(), None);
+    }
+
+    #[test]
+    fn last_lsn_matches_most_recent_append() {
+        let dir = tempdir().unwrap();
+        let mut wal = FileWal::open(dir.path()).unwrap();
+        let l1 = wal.append(&ins(1)).unwrap();
+        assert_eq!(wal.last_lsn(), Some(l1));
+        let l2 = wal.append(&ins(2)).unwrap();
+        let l3 = wal.append(&ins(3)).unwrap();
+        wal.sync().unwrap();
+        assert_eq!(wal.last_lsn(), Some(l3));
+        assert!(l2 < l3);
+    }
+
+    #[test]
+    fn last_lsn_persists_across_reopen() {
+        let dir = tempdir().unwrap();
+        let before_close = {
+            let mut wal = FileWal::open(dir.path()).unwrap();
+            for n in 0..7 {
+                wal.append(&ins(n)).unwrap();
+            }
+            wal.sync().unwrap();
+            wal.last_lsn()
+        };
+        let reopened = FileWal::open(dir.path()).unwrap();
+        assert_eq!(reopened.last_lsn(), before_close);
     }
 }

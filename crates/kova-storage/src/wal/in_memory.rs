@@ -50,6 +50,17 @@ impl Wal for InMemoryWal {
         self.records.retain(|(lsn, _)| *lsn >= before);
         Ok(())
     }
+
+    fn last_lsn(&self) -> Option<Lsn> {
+        // `next_lsn` is the LSN the NEXT append will get. The last one
+        // we appended (durably or not) is therefore `next_lsn - 1`,
+        // unless we've never appended (next_lsn == 0).
+        if self.next_lsn == 0 {
+            None
+        } else {
+            Some(Lsn::new(self.next_lsn - 1))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -113,5 +124,33 @@ mod tests {
         let mut wal = InMemoryWal::new();
         wal.append(&ins(1)).unwrap();
         assert!(wal.sync().is_ok());
+    }
+
+    #[test]
+    fn last_lsn_is_none_on_empty_wal() {
+        let wal = InMemoryWal::new();
+        assert_eq!(wal.last_lsn(), None);
+    }
+
+    #[test]
+    fn last_lsn_matches_most_recent_append() {
+        let mut wal = InMemoryWal::new();
+        let l1 = wal.append(&ins(1)).unwrap();
+        assert_eq!(wal.last_lsn(), Some(l1));
+        let l2 = wal.append(&ins(2)).unwrap();
+        assert_eq!(wal.last_lsn(), Some(l2));
+    }
+
+    #[test]
+    fn last_lsn_unchanged_by_truncate() {
+        // truncate_before only drops records ; the next-LSN counter
+        // (and therefore last_lsn) keeps advancing monotonically.
+        let mut wal = InMemoryWal::new();
+        for n in 0..5 {
+            wal.append(&ins(n)).unwrap();
+        }
+        let before_truncate = wal.last_lsn();
+        wal.truncate_before(Lsn::new(3)).unwrap();
+        assert_eq!(wal.last_lsn(), before_truncate);
     }
 }

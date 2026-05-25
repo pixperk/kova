@@ -64,4 +64,12 @@ pub trait Wal {
 
     /// Drop records with LSN `< before`. Used after a checkpoint.
     fn truncate_before(&mut self, before: Lsn) -> Result<(), Self::Error>;
+
+    /// Last LSN that has been appended (durably or not). `None` if the
+    /// log is empty (no records ever appended, or all were truncated).
+    ///
+    /// Used by checkpoint to capture the LSN up to which the snapshot
+    /// covers : everything `<= last_lsn` at capture time is baked into
+    /// the snapshot ; anything appended after is in the (truncated) WAL.
+    fn last_lsn(&self) -> Option<Lsn>;
 }
