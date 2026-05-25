@@ -17,6 +17,6 @@ pub use atomic::{atomic_write, atomic_write_streaming};
 pub use error::KovaStorageError;
 pub use manifest::Manifest;
 pub use metadata_store::FileMetadataStore;
-pub use shard::{SearchHit, Shard, ShardError};
+pub use shard::{CheckpointPolicy, SearchHit, Shard, ShardError};
 pub use vector_store::MmapVectorStore;
 pub use wal::{FileWal, InMemoryWal, Lsn, Record, Wal};

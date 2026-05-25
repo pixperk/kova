@@ -229,6 +229,11 @@ impl Wal for FileWal {
         }
     }
 
+    fn segment_count(&self) -> usize {
+        // Finalised segments + the always-present active segment.
+        self.finalized.len() + 1
+    }
+
     fn iter_from(
         &self,
         from: Lsn,

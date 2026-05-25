@@ -72,4 +72,14 @@ pub trait Wal {
     /// covers : everything `<= last_lsn` at capture time is baked into
     /// the snapshot ; anything appended after is in the (truncated) WAL.
     fn last_lsn(&self) -> Option<Lsn>;
+
+    /// Number of "logical segments" the log currently holds. For a
+    /// segmented file backend this is the number of files on disk ;
+    /// for in-memory backends this is always 1.
+    ///
+    /// Used by checkpoint hint policies to trigger when the log is
+    /// growing past a chosen budget.
+    fn segment_count(&self) -> usize {
+        1
+    }
 }

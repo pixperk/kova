@@ -40,6 +40,7 @@
 //! ```
 
 use std::error::Error as StdError;
+use std::path::PathBuf;
 
 use kova_core::{Distance, Metadata, MetadataStore, VectorId, VectorStore};
 use kova_index::{HnswIndex, HnswParams, Index, KovaIndexError};
@@ -47,10 +48,13 @@ use thiserror::Error;
 
 use crate::{Lsn, Record, Wal};
 
+mod checkpoint;
 mod delete;
 mod insert;
 mod open;
 mod search;
+
+pub use checkpoint::CheckpointPolicy;
 
 /// Default RNG seed for [`Shard::from_parts`] / [`Shard::open`], mirroring
 /// `HnswIndex::new`'s default. Tests that need a different seed call
@@ -134,6 +138,18 @@ where
     pub(super) index: HnswIndex<D, V>,
     pub(super) metadata: M,
     pub(super) wal: W,
+    /// Data directory, populated by [`Shard::open`] for the file-backed
+    /// combo. `None` for in-memory composition (`from_parts`) ; in that
+    /// case checkpoint is a no-op (nothing to write to).
+    pub(super) dir: Option<PathBuf>,
+    /// Suffix on the live `graph.{snapshot_id}.snapshot` file, or `0` if
+    /// no checkpoint has run yet. Each [`Shard::checkpoint`] increments
+    /// this and atomic-commits the new value through the manifest.
+    pub(super) snapshot_id: u64,
+    /// LSN captured by the last successful checkpoint. `Lsn::ZERO` if no
+    /// checkpoint has run. Used by `should_checkpoint` to estimate
+    /// "records since last checkpoint" against `wal.last_lsn()`.
+    pub(super) checkpoint_lsn: Lsn,
 }
 
 impl<D, V, M, W> Shard<D, V, M, W>
@@ -177,8 +193,39 @@ where
             index,
             metadata,
             wal,
+            // In-memory composition has no on-disk directory and no
+            // checkpoint state. The file-backed `Shard::open` populates
+            // these via `Self::from_parts_with_checkpoint_state` below.
+            dir: None,
+            snapshot_id: 0,
+            checkpoint_lsn: Lsn::ZERO,
         };
-        shard.replay()?;
+        shard.replay_from(Lsn::ZERO)?;
+        Ok(shard)
+    }
+
+    /// Same as [`Self::from_parts_seeded`] but with explicit checkpoint
+    /// state and a starting replay LSN. Called by the file-backed
+    /// `Shard::open` after it loads a snapshot ; in-memory callers stick
+    /// with `from_parts_seeded`.
+    pub(super) fn from_parts_with_checkpoint_state(
+        index: HnswIndex<D, V>,
+        metadata: M,
+        wal: W,
+        dir: Option<PathBuf>,
+        snapshot_id: u64,
+        checkpoint_lsn: Lsn,
+        replay_from: Lsn,
+    ) -> Result<Self, ShardError> {
+        let mut shard = Self {
+            index,
+            metadata,
+            wal,
+            dir,
+            snapshot_id,
+            checkpoint_lsn,
+        };
+        shard.replay_from(replay_from)?;
         Ok(shard)
     }
 
@@ -206,21 +253,24 @@ where
         self.len() == 0
     }
 
-    /// Replay every WAL record (LSN order) into the index + stores.
+    /// Replay WAL records starting from `from` (inclusive) into the
+    /// index + stores.
     ///
-    /// Called once during construction. The stores may already hold
-    /// persisted state from a previous run ; the index is always fresh
-    /// (graph structure is in-memory only). Every backend `put` is
-    /// idempotent (overwrite-in-place), so re-applying a record that was
-    /// already partially applied before a crash is safe.
+    /// Called once during construction. Pre-snapshot callers replay
+    /// from `Lsn::ZERO` ; post-checkpoint callers replay from
+    /// `manifest.checkpoint_lsn + 1` since records `<=` that LSN are
+    /// already baked into the loaded snapshot. The stores may already
+    /// hold persisted state from a previous run ; every backend `put`
+    /// is idempotent (overwrite-in-place), so re-applying a record that
+    /// was already partially applied before a crash is safe.
     ///
     /// We materialise the records into a `Vec` up front because the
     /// `iter_from` borrow conflicts with the mutable borrows we need on
     /// `self.index` / `self.metadata` to apply them.
-    pub(super) fn replay(&mut self) -> Result<(), ShardError> {
+    pub(super) fn replay_from(&mut self, from: Lsn) -> Result<(), ShardError> {
         let records: Vec<(Lsn, Record)> = self
             .wal
-            .iter_from(Lsn::ZERO)
+            .iter_from(from)
             .collect::<Result<_, _>>()
             .map_err(ShardError::backend)?;
 
