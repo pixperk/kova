@@ -169,10 +169,28 @@ the child flushed. The reverse (every durable insert was ACKed) is
 never knew about. The test correctly tolerates extras ; the only thing
 it refuses to tolerate is a missing ACKed record.
 
-| Test                       | Iterations | Acks   | Failures | Runtime (release) |
-| -------------------------- | ---------- | ------ | -------- | ----------------- |
-| `crash_recovery_smoke`     |          5 |    ~750 |        0 | ~3s               |
-| `crash_recovery_torture`   |        100 | 15,020 |        0 | ~113s             |
+Two flavours of torture. The **`inserts_only`** variant exercises the
+insert path's crash windows (WAL append/sync, index.insert, metadata.put).
+The **`with_checkpoints`** variant interleaves `Shard::checkpoint` calls
+every 25 inserts, so the same SIGKILL roulette also lands inside vacuum,
+snapshot write, manifest commit, WAL truncate, and old-snapshot delete
+windows. The smoke versions of both run by default in `cargo test` ; the
+150-iteration torture versions are `#[ignore]`'d.
+
+| Test                                       | Iterations | Acks   | Checkpoints | Failures | Runtime (release) |
+| ------------------------------------------ | ---------- | ------ | ----------- | -------- | ----------------- |
+| `crash_recovery_smoke_inserts_only`        |          5 |   ~750 |           0 |        0 | ~3s               |
+| `crash_recovery_smoke_with_checkpoints`    |          5 |   ~600 |         ~25 |        0 | ~3s               |
+| `crash_recovery_torture_inserts_only`      |        150 | 30,038 |           0 |        0 | ~125s             |
+| `crash_recovery_torture_with_checkpoints`  |        150 | 25,659 |         962 |        0 | ~127s             |
+
+The checkpointed torture additionally asserts, on every iteration that
+saw a successful checkpoint, that the on-disk `manifest`'s `snapshot_id`
+matches `n_checkpointed` or `n_checkpointed + 1` (the +1 covers the
+small window where the manifest commits but the child gets killed
+before its post-commit `CHECKPOINTED <lsn>` print reaches the parent's
+pipe : the manifest is the durable commit point ; the print is
+best-effort observability).
 
 Run them with :
 
@@ -181,10 +199,11 @@ cargo test -p kova-storage --test crash_recovery
 cargo test -p kova-storage --release --test crash_recovery -- --ignored --nocapture
 ```
 
-Kill delays are deterministic - `1 + (iter * 173) % 1500` ms - so a
-failure on iteration N is reproducible without a `rand` dependency. The
-sequence spans from "kill before any insert lands" to "kill near the
-end of the run."
+Kill delays are deterministic. The smoke variants use a single-bucket
+schedule (`1 + (iter * 173) % 1500` ms) ; the torture variants split
+into three buckets (early/mid/late) so the 150 iterations spread across
+the full `1..3000` ms range, hitting every plausible point in the
+child's lifecycle including post-checkpoint cleanup windows.
 
 ### Known limitation : SIGKILL is not power loss
 
