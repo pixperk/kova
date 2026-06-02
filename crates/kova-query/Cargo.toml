@@ -1,0 +1,18 @@
+[package]
+name = "kova-query"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "KQL : query language for Kova. Parser, binder, planner, executor."
+
+[dependencies]
+kova-core = { path = "../kova-core" }
+kova-storage = { path = "../kova-storage" }
+thiserror.workspace = true
+pest = "2"
+pest_derive = "2"
+
+[lints]
+workspace = true
