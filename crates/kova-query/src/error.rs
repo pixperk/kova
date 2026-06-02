@@ -17,20 +17,19 @@ pub enum KovaQueryError {
     Parse(String),
 
     /// Binder rejected a syntactically-valid statement. Examples :
-    /// unknown field, type mismatch, embedding update attempted,
-    /// CREATE/DROP INDEX in v1.
+    /// unknown field, type mismatch, embedding update attempted.
     #[error("bind error: {0}")]
     Bind(String),
 
-    /// Planner could not produce a valid `PhysicalPlan` for the given
-    /// `LogicalStatement` (e.g., no plan satisfies the constraints).
+    /// Planner could not produce a valid physical plan for the given
+    /// logical statement.
     #[error("plan error: {0}")]
     Plan(String),
 
-    /// Executor failed at runtime. Most often a storage-layer error
-    /// (see [`KovaQueryError::Backend`]) ; this variant covers
-    /// failures that originate in the executor itself (parameter
-    /// binding mismatch, unbound named parameter, etc).
+    /// Executor failed at runtime for a reason that originates in the
+    /// executor itself (parameter binding mismatch, unbound named
+    /// parameter, etc). Storage-layer failures go through
+    /// [`KovaQueryError::Backend`].
     #[error("execution error: {0}")]
     Execution(String),
 

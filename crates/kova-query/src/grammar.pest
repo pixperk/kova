@@ -1,11 +1,12 @@
 // KQL grammar (Pest).
 //
-// Productions are added incrementally. Step 2 of M1.1 introduces
-// the first one (CHECKPOINT). Every production lands with at least
-// one happy-path test and one error-path test in `parser.rs` (or a
-// dedicated `tests/` integration test once the surface grows).
+// The `program` rule is the entry point. Productions are added here
+// as the parser surface grows.
 
-// Placeholder so this file is non-empty for `pest_derive`. Replace
-// with the real top-level `program` rule in step 2.
-//
-// program = { SOI ~ statement ~ ";"? ~ EOI }
+program = { SOI ~ statement ~ ";"? ~ EOI }
+
+statement = { checkpoint_stmt }
+
+checkpoint_stmt = { ^"CHECKPOINT" }
+
+WHITESPACE = _{ " " | "\t" | "\r" | "\n" }
