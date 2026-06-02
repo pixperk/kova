@@ -5,8 +5,62 @@
 
 program = { SOI ~ statement ~ ";"? ~ EOI }
 
-statement = { checkpoint_stmt }
+statement = {
+    checkpoint_stmt
+  | vacuum_stmt
+  | insert_stmt
+  | create_index_stmt
+  | drop_index_stmt
+}
 
 checkpoint_stmt = { ^"CHECKPOINT" }
+vacuum_stmt = { ^"VACUUM" ~ table_ref }
+
+insert_stmt = {
+    ^"INSERT" ~ ^"INTO" ~ table_ref
+    ~ "(" ~ column_list ~ ")"
+    ~ ^"VALUES" ~ values_clause
+}
+
+column_list = { identifier ~ ("," ~ identifier)* }
+
+values_clause = { row_tuple | param }
+row_tuple = { "(" ~ row_value ~ ("," ~ row_value)* ~ ")" }
+row_value = { param }
+
+create_index_stmt = {
+    ^"CREATE" ~ ^"INDEX" ~ identifier? ~ ^"ON" ~ table_ref
+    ~ ^"USING" ~ index_method ~ "(" ~ identifier ~ ")"
+}
+
+index_method = { ^"HASH" | ^"BTREE" | ^"INVERTED" }
+
+drop_index_stmt = { ^"DROP" ~ ^"INDEX" ~ identifier ~ ^"ON" ~ table_ref }
+
+table_ref = { identifier }
+
+param = { positional_param | named_param }
+positional_param = ${ "$" ~ integer }
+named_param = ${ "$" ~ identifier }
+
+// Identifiers cannot collide with reserved keywords. Without this,
+// `CREATE INDEX ON vectors ...` parses "ON" as the optional index
+// name (PEG matches greedily and doesn't backtrack) and the rest of
+// the rule starves. Same trap with VALUES, USING, INTO, etc.
+identifier = @{ !keyword ~ (ASCII_ALPHA | "_") ~ (ASCII_ALPHANUMERIC | "_")* }
+
+// A keyword followed by a non-identifier-char boundary. The boundary
+// check is what stops "INDEXED" from being rejected just because it
+// starts with "INDEX" : after "INDEX" the next char is "E" (an
+// identifier char), so `keyword` fails and the identifier rule wins.
+keyword = _{
+    (
+        ^"CHECKPOINT" | ^"VACUUM" | ^"INSERT" | ^"INTO" | ^"VALUES"
+      | ^"CREATE" | ^"INDEX" | ^"DROP" | ^"ON" | ^"USING"
+      | ^"HASH" | ^"BTREE" | ^"INVERTED"
+    ) ~ !(ASCII_ALPHANUMERIC | "_")
+}
+
+integer = @{ ASCII_DIGIT+ }
 
 WHITESPACE = _{ " " | "\t" | "\r" | "\n" }
