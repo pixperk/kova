@@ -7,7 +7,9 @@
 pub mod ast;
 pub mod error;
 pub mod parser;
+pub mod printer;
 
 pub use ast::AstStatement;
 pub use error::KovaQueryError;
 pub use parser::parse_str;
+pub use printer::print;
