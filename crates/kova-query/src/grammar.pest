@@ -11,6 +11,7 @@ statement = {
   | insert_stmt
   | update_stmt
   | delete_stmt
+  | select_stmt
   | create_index_stmt
   | drop_index_stmt
 }
@@ -60,6 +61,36 @@ update_stmt = {
 
 // `field = value` or `field['key'] = value` for in-place metadata patches.
 set_assignment = { identifier ~ ("[" ~ string_literal ~ "]")? ~ "=" ~ atom_value }
+
+select_stmt = {
+    ^"SELECT" ~ select_list
+    ~ ^"FROM" ~ table_ref
+    ~ (^"WHERE" ~ predicate)?
+    ~ order_by_clause?
+    ~ limit_clause?
+}
+
+// Either the `*` wildcard or a non-empty comma-separated list of items.
+select_list = { wildcard_proj | (select_item ~ ("," ~ select_item)*) }
+
+wildcard_proj = { "*" }
+
+// A single projection : distance expression, COUNT(*), or identifier
+// (which the parser classifies as Id / Metadata / Field). Optional
+// `AS alias`.
+select_item = {
+    (distance_expr | count_star | identifier) ~ (^"AS" ~ identifier)?
+}
+
+count_star = { ^"COUNT" ~ "(" ~ "*" ~ ")" }
+
+order_by_clause = { ^"ORDER" ~ ^"BY" ~ order_by_item ~ ("," ~ order_by_item)* }
+
+order_by_item = { (distance_expr | identifier) ~ order_dir? }
+
+order_dir = { ^"ASC" | ^"DESC" }
+
+limit_clause = { ^"LIMIT" ~ integer }
 
 // -------- Predicate subtree --------
 //
@@ -137,6 +168,8 @@ keyword = _{
       | ^"CREATE" | ^"INDEX" | ^"DROP" | ^"ON" | ^"USING"
       | ^"HASH" | ^"BTREE" | ^"INVERTED"
       | ^"DELETE" | ^"FROM" | ^"WHERE" | ^"UPDATE" | ^"SET"
+      | ^"SELECT" | ^"AS" | ^"ORDER" | ^"BY" | ^"LIMIT" | ^"ASC" | ^"DESC"
+      | ^"COUNT"
       | ^"AND" | ^"OR" | ^"NOT" | ^"IS" | ^"NULL" | ^"IN" | ^"BETWEEN"
       | ^"TRUE" | ^"FALSE"
     ) ~ !(ASCII_ALPHANUMERIC | "_")

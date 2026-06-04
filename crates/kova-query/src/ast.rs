@@ -28,7 +28,58 @@ pub enum AstStatement {
 
 /// `SELECT` statement payload.
 #[derive(Debug, Clone)]
-pub struct AstQuery;
+pub struct AstQuery {
+    /// Projection list. `vec![AstProjection::Wildcard]` for `SELECT *`,
+    /// otherwise one entry per explicit `select_item`.
+    pub projection: Vec<AstProjection>,
+    /// Target table from the `FROM` clause.
+    pub from_table: String,
+    /// Optional WHERE-clause predicate.
+    pub predicate: Option<AstPredicate>,
+    /// Optional ORDER BY items. Empty when the clause is absent.
+    pub order_by: Vec<AstOrderBy>,
+    /// Optional LIMIT.
+    pub limit: Option<u64>,
+}
+
+/// One element of a `SELECT` projection list.
+#[derive(Debug, Clone)]
+pub enum AstProjection {
+    /// `*` : all columns. The parser produces a single-element
+    /// `vec![Wildcard]` ; the binder enforces "wildcard cannot
+    /// appear alongside other items."
+    Wildcard,
+    /// `COUNT(*)` : the only aggregate KQL accepts.
+    CountStar,
+    /// Bare `id` keyword (case-insensitive). The row primary key.
+    Id,
+    /// Bare `metadata` keyword (case-insensitive). The whole bag.
+    Metadata,
+    /// `embedding <op> $param` : a distance expression.
+    DistanceExpr(AstDistance),
+    /// Any other identifier : a metadata field name.
+    Field(String),
+    /// `<projection> AS alias`. Wraps any of the above with a name.
+    Aliased(Box<AstProjection>, String),
+}
+
+/// One item in an `ORDER BY` clause.
+#[derive(Debug, Clone)]
+pub enum AstOrderBy {
+    /// Order by a distance expression : `ORDER BY embedding <-> $1`.
+    Distance(AstDistance, OrderDir),
+    /// Order by a metadata field : `ORDER BY year DESC`.
+    Field(String, OrderDir),
+}
+
+/// Sort direction. Parser defaults to `Asc` when the user omits it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrderDir {
+    /// Ascending. Default for all order keys.
+    Asc,
+    /// Descending.
+    Desc,
+}
 
 /// `INSERT` statement payload.
 #[derive(Debug, Clone)]

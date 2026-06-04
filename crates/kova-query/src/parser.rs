@@ -5,8 +5,8 @@ use pest::iterators::Pair;
 
 use crate::ast::{
     AstAssignment, AstCreateIndex, AstDelete, AstDistance, AstDropIndex, AstExpr, AstInsert,
-    AstInsertSource, AstLiteral, AstPredicate, AstStatement, AstUpdate, AstVacuum, CmpOp,
-    DistanceOp, IndexMethod, ParamRef,
+    AstInsertSource, AstLiteral, AstOrderBy, AstPredicate, AstProjection, AstQuery, AstStatement,
+    AstUpdate, AstVacuum, CmpOp, DistanceOp, IndexMethod, OrderDir, ParamRef,
 };
 use crate::error::KovaQueryError;
 
@@ -55,10 +55,127 @@ pub fn parse_str(input: &str) -> Result<AstStatement, KovaQueryError> {
         Rule::insert_stmt => Ok(AstStatement::Insert(parse_insert(inner))),
         Rule::update_stmt => Ok(AstStatement::Update(parse_update(inner))),
         Rule::delete_stmt => Ok(AstStatement::Delete(parse_delete(inner))),
+        Rule::select_stmt => Ok(AstStatement::Select(parse_select(inner))),
         Rule::create_index_stmt => Ok(AstStatement::CreateIndex(parse_create_index(inner))),
         Rule::drop_index_stmt => Ok(AstStatement::DropIndex(parse_drop_index(inner))),
         rule => unreachable!("unexpected statement variant: {rule:?}"),
     }
+}
+
+/// Build an [`AstQuery`] from a `select_stmt` pair.
+///
+/// Grammar : `select_stmt = { ^"SELECT" ~ select_list ~ ^"FROM" ~
+/// table_ref ~ (^"WHERE" ~ predicate)? ~ order_by_clause? ~
+/// limit_clause? }`. Required children come first ; the optional
+/// clauses (`predicate`, `order_by_clause`, `limit_clause`) follow
+/// in any combination. Dispatch on `as_rule()` to pick them up.
+fn parse_select(pair: Pair<Rule>) -> AstQuery {
+    let mut inner = pair.into_inner();
+    let projection = parse_select_list(inner.next().expect("select_stmt has select_list"));
+    let from_table = parse_table_ref(inner.next().expect("select_stmt has table_ref"));
+
+    let mut predicate = None;
+    let mut order_by = Vec::new();
+    let mut limit = None;
+    for child in inner {
+        match child.as_rule() {
+            Rule::predicate => predicate = Some(parse_predicate(child)),
+            Rule::order_by_clause => order_by = parse_order_by_clause(child),
+            Rule::limit_clause => limit = Some(parse_limit_clause(child)),
+            rule => unreachable!("unexpected select_stmt child: {rule:?}"),
+        }
+    }
+
+    AstQuery {
+        projection,
+        from_table,
+        predicate,
+        order_by,
+        limit,
+    }
+}
+
+/// Build the projection list from a `select_list` pair. Either a
+/// single `Wildcard` element or one item per `select_item` child.
+fn parse_select_list(pair: Pair<Rule>) -> Vec<AstProjection> {
+    pair.into_inner()
+        .map(|child| match child.as_rule() {
+            Rule::wildcard_proj => AstProjection::Wildcard,
+            Rule::select_item => parse_select_item(child),
+            rule => unreachable!("unexpected select_list child: {rule:?}"),
+        })
+        .collect()
+}
+
+/// Build a single [`AstProjection`] from a `select_item` pair.
+///
+/// First visible child is the expression (distance / COUNT(*) /
+/// identifier) ; the optional second child is the alias identifier.
+fn parse_select_item(pair: Pair<Rule>) -> AstProjection {
+    let mut inner = pair.into_inner();
+    let first = inner.next().expect("select_item has expression");
+
+    let base = match first.as_rule() {
+        Rule::distance_expr => AstProjection::DistanceExpr(parse_distance_expr(first)),
+        Rule::count_star => AstProjection::CountStar,
+        Rule::identifier => classify_field_projection(first.as_str()),
+        rule => unreachable!("unexpected select_item child: {rule:?}"),
+    };
+
+    if let Some(alias_pair) = inner.next() {
+        AstProjection::Aliased(Box::new(base), alias_pair.as_str().to_string())
+    } else {
+        base
+    }
+}
+
+/// Route bare identifiers to the typed [`AstProjection`] variants
+/// for the magic column names. Case-insensitive : `id`, `ID`, `Id`
+/// all become [`AstProjection::Id`]. Same for `metadata`.
+fn classify_field_projection(name: &str) -> AstProjection {
+    if name.eq_ignore_ascii_case("id") {
+        AstProjection::Id
+    } else if name.eq_ignore_ascii_case("metadata") {
+        AstProjection::Metadata
+    } else {
+        AstProjection::Field(name.to_string())
+    }
+}
+
+/// Collect ORDER BY items from an `order_by_clause` pair.
+fn parse_order_by_clause(pair: Pair<Rule>) -> Vec<AstOrderBy> {
+    pair.into_inner().map(parse_order_by_item).collect()
+}
+
+/// Build a single [`AstOrderBy`] from an `order_by_item` pair.
+///
+/// First visible child is the expression (distance / identifier) ;
+/// the optional second child is the direction.
+fn parse_order_by_item(pair: Pair<Rule>) -> AstOrderBy {
+    let mut inner = pair.into_inner();
+    let first = inner.next().expect("order_by_item has expression");
+    let dir = inner.next().map_or(OrderDir::Asc, |dir_pair| {
+        if dir_pair.as_str().eq_ignore_ascii_case("desc") {
+            OrderDir::Desc
+        } else {
+            OrderDir::Asc
+        }
+    });
+    match first.as_rule() {
+        Rule::distance_expr => AstOrderBy::Distance(parse_distance_expr(first), dir),
+        Rule::identifier => AstOrderBy::Field(first.as_str().to_string(), dir),
+        rule => unreachable!("unexpected order_by_item child: {rule:?}"),
+    }
+}
+
+/// Extract the integer count from a `limit_clause` pair.
+fn parse_limit_clause(pair: Pair<Rule>) -> u64 {
+    pair.into_inner()
+        .next()
+        .expect("limit_clause has integer")
+        .as_str()
+        .parse()
+        .expect("integer parses as u64 by grammar")
 }
 
 /// Build an [`AstUpdate`] from an `update_stmt` pair.
@@ -1393,6 +1510,186 @@ mod tests {
     fn rejects_update_with_empty_set_list() {
         assert!(matches!(
             parse_str("UPDATE vectors SET WHERE id = $1"),
+            Err(KovaQueryError::Parse(_))
+        ));
+    }
+
+    // ----- SELECT -----
+
+    #[test]
+    fn parses_select_star() {
+        let ast = parse_str("SELECT * FROM vectors").expect("parse Ok");
+        let AstStatement::Select(q) = ast else {
+            panic!("expected Select");
+        };
+        assert_eq!(q.projection.len(), 1);
+        assert!(matches!(q.projection[0], AstProjection::Wildcard));
+        assert_eq!(q.from_table, "vectors");
+        assert!(q.predicate.is_none());
+        assert!(q.order_by.is_empty());
+        assert_eq!(q.limit, None);
+    }
+
+    #[test]
+    fn parses_select_id_and_metadata_route_to_typed_variants() {
+        let ast = parse_str("SELECT id, metadata FROM vectors").expect("parse Ok");
+        let AstStatement::Select(q) = ast else {
+            panic!("expected Select");
+        };
+        assert!(matches!(q.projection[0], AstProjection::Id));
+        assert!(matches!(q.projection[1], AstProjection::Metadata));
+    }
+
+    #[test]
+    fn parses_select_regular_field_uses_field_variant() {
+        let ast = parse_str("SELECT category, year FROM vectors").expect("parse Ok");
+        let AstStatement::Select(q) = ast else {
+            panic!("expected Select");
+        };
+        let names: Vec<String> = q
+            .projection
+            .iter()
+            .map(|p| match p {
+                AstProjection::Field(s) => s.clone(),
+                other => panic!("expected Field, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(names, vec!["category", "year"]);
+    }
+
+    #[test]
+    fn parses_select_distance_expression_with_alias() {
+        let ast =
+            parse_str("SELECT embedding <-> $query AS distance FROM vectors").expect("parse Ok");
+        let AstStatement::Select(q) = ast else {
+            panic!("expected Select");
+        };
+        let AstProjection::Aliased(inner, alias) = &q.projection[0] else {
+            panic!("expected Aliased");
+        };
+        assert_eq!(alias, "distance");
+        let AstProjection::DistanceExpr(dist) = inner.as_ref() else {
+            panic!("expected DistanceExpr inside Aliased");
+        };
+        assert_eq!(dist.metric, DistanceOp::L2);
+        assert!(matches!(dist.param, ParamRef::Named(ref s) if s == "query"));
+    }
+
+    #[test]
+    fn parses_select_count_star() {
+        let ast =
+            parse_str("SELECT COUNT(*) FROM vectors WHERE category = 'docs'").expect("parse Ok");
+        let AstStatement::Select(q) = ast else {
+            panic!("expected Select");
+        };
+        assert!(matches!(q.projection[0], AstProjection::CountStar));
+        assert!(q.predicate.is_some());
+    }
+
+    #[test]
+    fn parses_select_with_where_clause() {
+        let ast = parse_str("SELECT id FROM vectors WHERE id = $1").expect("parse Ok");
+        let AstStatement::Select(q) = ast else {
+            panic!("expected Select");
+        };
+        assert!(matches!(q.predicate, Some(AstPredicate::Eq(_, _))));
+    }
+
+    #[test]
+    fn parses_select_with_order_by_field_desc() {
+        let ast = parse_str("SELECT id FROM vectors ORDER BY year DESC").expect("parse Ok");
+        let AstStatement::Select(q) = ast else {
+            panic!("expected Select");
+        };
+        assert_eq!(q.order_by.len(), 1);
+        let AstOrderBy::Field(name, dir) = &q.order_by[0] else {
+            panic!("expected Field ordering");
+        };
+        assert_eq!(name, "year");
+        assert_eq!(*dir, OrderDir::Desc);
+    }
+
+    #[test]
+    fn parses_select_with_order_by_distance_default_asc() {
+        let ast = parse_str("SELECT id FROM vectors ORDER BY embedding <-> $1").expect("parse Ok");
+        let AstStatement::Select(q) = ast else {
+            panic!("expected Select");
+        };
+        let AstOrderBy::Distance(dist, dir) = &q.order_by[0] else {
+            panic!("expected Distance ordering");
+        };
+        assert_eq!(dist.metric, DistanceOp::L2);
+        assert_eq!(*dir, OrderDir::Asc, "missing direction defaults to Asc");
+    }
+
+    #[test]
+    fn parses_select_with_multiple_order_by_items() {
+        let ast =
+            parse_str("SELECT id FROM vectors ORDER BY year DESC, score ASC").expect("parse Ok");
+        let AstStatement::Select(q) = ast else {
+            panic!("expected Select");
+        };
+        assert_eq!(q.order_by.len(), 2);
+    }
+
+    #[test]
+    fn parses_select_with_limit() {
+        let ast = parse_str("SELECT id FROM vectors LIMIT 100").expect("parse Ok");
+        let AstStatement::Select(q) = ast else {
+            panic!("expected Select");
+        };
+        assert_eq!(q.limit, Some(100));
+    }
+
+    #[test]
+    fn parses_select_full_hybrid_query() {
+        // The canonical hybrid kNN + predicate + ranking query.
+        let ast = parse_str(
+            "SELECT id, embedding <-> $1 AS distance, metadata FROM vectors \
+             WHERE category = 'docs' AND year >= 2024 \
+             ORDER BY embedding <-> $1 LIMIT 10",
+        )
+        .expect("parse Ok");
+        let AstStatement::Select(q) = ast else {
+            panic!("expected Select");
+        };
+        assert_eq!(q.projection.len(), 3);
+        assert!(matches!(q.projection[0], AstProjection::Id));
+        assert!(matches!(q.projection[1], AstProjection::Aliased(_, _)));
+        assert!(matches!(q.projection[2], AstProjection::Metadata));
+        assert_eq!(q.from_table, "vectors");
+        assert!(matches!(q.predicate, Some(AstPredicate::And(_))));
+        assert_eq!(q.order_by.len(), 1);
+        assert_eq!(q.limit, Some(10));
+    }
+
+    #[test]
+    fn parses_select_is_case_insensitive_on_keywords() {
+        let ast = parse_str("select id from vectors where id = $1 order by year desc limit 5")
+            .expect("parse Ok");
+        assert!(matches!(ast, AstStatement::Select(_)));
+    }
+
+    #[test]
+    fn rejects_select_without_from_clause() {
+        assert!(matches!(
+            parse_str("SELECT id"),
+            Err(KovaQueryError::Parse(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_select_with_empty_projection() {
+        assert!(matches!(
+            parse_str("SELECT FROM vectors"),
+            Err(KovaQueryError::Parse(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_select_with_non_integer_limit() {
+        assert!(matches!(
+            parse_str("SELECT id FROM vectors LIMIT 1.5"),
             Err(KovaQueryError::Parse(_))
         ));
     }
