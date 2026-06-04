@@ -52,12 +52,99 @@ pub enum AstInsertSource {
     Param(ParamRef),
 }
 
-/// Value expression. Currently only parameter references ; literal
-/// support lands when a use case forces it.
+/// Value expression. Used wherever a position can hold either a
+/// parameter binding or an inline literal (INSERT row values, atom
+/// right-hand sides, etc.).
 #[derive(Debug, Clone)]
 pub enum AstExpr {
     /// `$1` or `$name`.
     Param(ParamRef),
+    /// Inline literal : string, number, boolean, null.
+    Literal(AstLiteral),
+}
+
+/// Literal value parsed from KQL source. The binder type-checks
+/// these against field types when applicable ; the parser only
+/// guarantees the value lexed cleanly as the listed variant.
+#[derive(Debug, Clone, PartialEq)]
+pub enum AstLiteral {
+    /// Single-quoted string : `'hello'`.
+    String(String),
+    /// Integer literal without a decimal point.
+    I64(i64),
+    /// Floating-point literal containing a decimal point.
+    F64(f64),
+    /// `TRUE` or `FALSE`, case-insensitive.
+    Bool(bool),
+    /// `NULL`.
+    Null,
+}
+
+/// WHERE-clause predicate. Built recursively from atoms and boolean
+/// combinators.
+#[derive(Debug, Clone)]
+pub enum AstPredicate {
+    /// `field = value`.
+    Eq(String, AstExpr),
+    /// `field <op> value` for ops other than `=`.
+    Cmp(String, CmpOp, AstExpr),
+    /// `field IN (lit, lit, ...)`.
+    In(String, Vec<AstLiteral>),
+    /// `field BETWEEN lo AND hi`.
+    Between(String, AstLiteral, AstLiteral),
+    /// `field IS NULL` (`false`) or `field IS NOT NULL` (`true`).
+    IsNull(String, bool),
+    /// `field @> value` : array containment.
+    ArrayContains(String, AstLiteral),
+    /// Boolean AND of two or more child predicates. Flattened :
+    /// `(a AND b) AND c` parses as `And([a, b, c])`.
+    And(Vec<AstPredicate>),
+    /// Boolean OR of two or more child predicates. Flattened.
+    Or(Vec<AstPredicate>),
+    /// Boolean NOT. Single child.
+    Not(Box<AstPredicate>),
+    /// `embedding <op> $q <cmp> radius`. The right side is parsed as
+    /// `f32` directly because the planner consumes it as a distance
+    /// bound ; parameter binding on the right is rejected at the
+    /// binder.
+    DistanceThreshold(AstDistance, CmpOp, f32),
+}
+
+/// Distance expression : `embedding <op> $param`.
+#[derive(Debug, Clone)]
+pub struct AstDistance {
+    /// Metric operator (`L2` / `Cosine` / `InnerProduct`).
+    pub metric: DistanceOp,
+    /// Query vector parameter binding.
+    pub param: ParamRef,
+}
+
+/// Distance metric operator parsed from `<->` / `<=>` / `<#>`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DistanceOp {
+    /// `<->` : Euclidean (L2) distance.
+    L2,
+    /// `<=>` : cosine distance.
+    Cosine,
+    /// `<#>` : (negated) inner product.
+    InnerProduct,
+}
+
+/// Comparison operator for predicate atoms.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CmpOp {
+    /// `=` (equality ; the parser also routes this to `AstPredicate::Eq`).
+    Eq,
+    /// `<` (strictly less than).
+    Lt,
+    /// `<=` (less than or equal).
+    Le,
+    /// `>` (strictly greater than).
+    Gt,
+    /// `>=` (greater than or equal).
+    Ge,
+    /// `!=` or `<>` (not equal).
+    Ne,
 }
 
 /// Parameter reference. Positional or named ; the binder resolves

@@ -13,6 +13,10 @@ statement = {
   | drop_index_stmt
 }
 
+// Test-only anchor : lets the test suite parse a bare predicate
+// before DELETE / UPDATE / SELECT exist as real consumers.
+test_predicate = { SOI ~ predicate ~ EOI }
+
 checkpoint_stmt = { ^"CHECKPOINT" }
 vacuum_stmt = { ^"VACUUM" ~ table_ref }
 
@@ -37,6 +41,60 @@ index_method = { ^"HASH" | ^"BTREE" | ^"INVERTED" }
 
 drop_index_stmt = { ^"DROP" ~ ^"INDEX" ~ identifier ~ ^"ON" ~ table_ref }
 
+// -------- Predicate subtree --------
+//
+// Precedence (lowest binding first) : OR < AND < NOT < atom.
+// Each level wraps the next : or_expr collects and_exprs, and_expr
+// collects not_exprs, not_expr is either NOT'd or a single atom-or-
+// parens, atom_or_parens descends into parens or dispatches an atom.
+
+predicate = { or_expr }
+or_expr = { and_expr ~ (^"OR" ~ and_expr)* }
+and_expr = { not_expr ~ (^"AND" ~ not_expr)* }
+not_expr = { ^"NOT" ~ not_expr | atom_or_parens }
+atom_or_parens = { "(" ~ predicate ~ ")" | atom }
+
+// Atom variants. Order matters within the alternation only when
+// prefixes overlap : `comparison_atom` is last because every other
+// atom also starts with `identifier` and would shadow it if listed
+// first. `distance_threshold` uses the reserved `embedding` keyword
+// so it can never collide with an identifier-based atom.
+atom = {
+    distance_threshold
+  | between_atom
+  | in_atom
+  | is_null_atom
+  | array_contains_atom
+  | comparison_atom
+}
+
+distance_threshold = { distance_expr ~ comparison_op ~ number_literal }
+distance_expr = { ^"embedding" ~ distance_op ~ param }
+//<-> : Euclidean distance, <=> : cosine distance, <#> : inner product (negative for similarity)
+distance_op = { "<->" | "<=>" | "<#>" }
+
+comparison_atom = { identifier ~ comparison_op ~ atom_value }
+in_atom = { identifier ~ ^"IN" ~ "(" ~ literal ~ ("," ~ literal)* ~ ")" }
+between_atom = { identifier ~ ^"BETWEEN" ~ literal ~ ^"AND" ~ literal }
+is_null_atom = { identifier ~ ^"IS" ~ is_null_negation? ~ ^"NULL" }
+is_null_negation = { ^"NOT" }
+array_contains_atom = { identifier ~ "@>" ~ literal }
+
+// Two-char ops listed before their one-char prefixes : PEG is
+// first-match-wins, so `<=` has to be tried before `<`.
+comparison_op = { "<=" | ">=" | "!=" | "<>" | "=" | "<" | ">" }
+atom_value = { literal | param }
+
+// -------- Literals --------
+
+literal = { string_literal | number_literal | boolean_literal | null_literal }
+string_literal = @{ "'" ~ (!"'" ~ ANY)* ~ "'" }
+number_literal = @{ "-"? ~ ASCII_DIGIT+ ~ ("." ~ ASCII_DIGIT+)? }
+boolean_literal = { ^"TRUE" | ^"FALSE" }
+null_literal = { ^"NULL" }
+
+// -------- Shared --------
+
 table_ref = { identifier }
 
 param = { positional_param | named_param }
@@ -58,8 +116,16 @@ keyword = _{
         ^"CHECKPOINT" | ^"VACUUM" | ^"INSERT" | ^"INTO" | ^"VALUES"
       | ^"CREATE" | ^"INDEX" | ^"DROP" | ^"ON" | ^"USING"
       | ^"HASH" | ^"BTREE" | ^"INVERTED"
+      | ^"AND" | ^"OR" | ^"NOT" | ^"IS" | ^"NULL" | ^"IN" | ^"BETWEEN"
+      | ^"TRUE" | ^"FALSE"
     ) ~ !(ASCII_ALPHANUMERIC | "_")
 }
+// `embedding` is intentionally NOT reserved at the lexer level. It's
+// the magic vector-column name in distance expressions (matched via
+// the `^"embedding"` literal in `distance_expr`), but it's also a
+// real metadata column name in `INSERT INTO vectors (id, embedding,
+// metadata)`. The binder enforces the "distance only" rule, not the
+// lexer.
 
 integer = @{ ASCII_DIGIT+ }
 

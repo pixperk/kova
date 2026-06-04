@@ -4,8 +4,8 @@ use pest::Parser;
 use pest::iterators::Pair;
 
 use crate::ast::{
-    AstCreateIndex, AstDropIndex, AstExpr, AstInsert, AstInsertSource, AstStatement, AstVacuum,
-    IndexMethod, ParamRef,
+    AstCreateIndex, AstDistance, AstDropIndex, AstExpr, AstInsert, AstInsertSource, AstLiteral,
+    AstPredicate, AstStatement, AstVacuum, CmpOp, DistanceOp, IndexMethod, ParamRef,
 };
 use crate::error::KovaQueryError;
 
@@ -211,6 +211,299 @@ fn parse_drop_index(pair: Pair<Rule>) -> AstDropIndex {
         .to_string();
     let table = parse_table_ref(inner.next().expect("drop_index_stmt has table_ref"));
     AstDropIndex { name, table }
+}
+
+// =========================================================================
+// Predicate subtree
+// =========================================================================
+//
+// Walks the precedence-climbing grammar (predicate -> or_expr ->
+// and_expr -> not_expr -> atom_or_parens -> atom). Boolean nodes
+// (`And`, `Or`) are flattened : a single-child or_expr/and_expr
+// returns its child directly instead of wrapping in a 1-element
+// combinator. This keeps the produced predicate tree canonical.
+//
+// Every helper carries `#[allow(dead_code)]` because they're only
+// reachable from `parse_predicate_str` (cfg(test)) right now. The
+// allows naturally become redundant once DELETE / UPDATE / SELECT
+// land and call `parse_predicate` from the dispatcher.
+
+/// Entry point. `predicate -> or_expr`.
+#[allow(dead_code)]
+fn parse_predicate(pair: Pair<Rule>) -> AstPredicate {
+    parse_or_expr(
+        pair.into_inner()
+            .next()
+            .expect("predicate has or_expr child"),
+    )
+}
+
+/// `or_expr = { and_expr ~ (^"OR" ~ and_expr)* }`. Multiple children
+/// produce an [`AstPredicate::Or`] ; a single child collapses through.
+#[allow(dead_code)]
+fn parse_or_expr(pair: Pair<Rule>) -> AstPredicate {
+    let children: Vec<AstPredicate> = pair.into_inner().map(parse_and_expr).collect();
+    if children.len() == 1 {
+        children.into_iter().next().expect("len checked")
+    } else {
+        AstPredicate::Or(children)
+    }
+}
+
+/// `and_expr = { not_expr ~ (^"AND" ~ not_expr)* }`. Multiple children
+/// produce an [`AstPredicate::And`] ; a single child collapses through.
+#[allow(dead_code)]
+fn parse_and_expr(pair: Pair<Rule>) -> AstPredicate {
+    let children: Vec<AstPredicate> = pair.into_inner().map(parse_not_expr).collect();
+    if children.len() == 1 {
+        children.into_iter().next().expect("len checked")
+    } else {
+        AstPredicate::And(children)
+    }
+}
+
+/// `not_expr = { ^"NOT" ~ not_expr | atom_or_parens }`. The `^"NOT"`
+/// literal is silent, so we dispatch on the rule of the (single)
+/// visible child : if it's another `not_expr`, this was the NOT
+/// branch ; otherwise it's an `atom_or_parens`.
+#[allow(dead_code)]
+fn parse_not_expr(pair: Pair<Rule>) -> AstPredicate {
+    let inner = pair.into_inner().next().expect("not_expr has a child");
+    match inner.as_rule() {
+        Rule::not_expr => AstPredicate::Not(Box::new(parse_not_expr(inner))),
+        Rule::atom_or_parens => parse_atom_or_parens(inner),
+        rule => unreachable!("unexpected not_expr child: {rule:?}"),
+    }
+}
+
+/// `atom_or_parens = { "(" ~ predicate ~ ")" | atom }`. Either
+/// descends back into a parenthesised predicate or dispatches an atom.
+#[allow(dead_code)]
+fn parse_atom_or_parens(pair: Pair<Rule>) -> AstPredicate {
+    let inner = pair
+        .into_inner()
+        .next()
+        .expect("atom_or_parens has a child");
+    match inner.as_rule() {
+        Rule::predicate => parse_predicate(inner),
+        Rule::atom => parse_atom(inner),
+        rule => unreachable!("unexpected atom_or_parens child: {rule:?}"),
+    }
+}
+
+/// `atom = { distance_threshold | between_atom | in_atom |
+/// is_null_atom | array_contains_atom | comparison_atom }`.
+#[allow(dead_code)]
+fn parse_atom(pair: Pair<Rule>) -> AstPredicate {
+    let inner = pair.into_inner().next().expect("atom has a child");
+    match inner.as_rule() {
+        Rule::distance_threshold => parse_distance_threshold(inner),
+        Rule::between_atom => parse_between_atom(inner),
+        Rule::in_atom => parse_in_atom(inner),
+        Rule::is_null_atom => parse_is_null_atom(inner),
+        Rule::array_contains_atom => parse_array_contains_atom(inner),
+        Rule::comparison_atom => parse_comparison_atom(inner),
+        rule => unreachable!("unexpected atom child: {rule:?}"),
+    }
+}
+
+/// `comparison_atom = { identifier ~ comparison_op ~ atom_value }`.
+/// Splits `=` into [`AstPredicate::Eq`] ; all other ops go to
+/// [`AstPredicate::Cmp`].
+#[allow(dead_code)]
+fn parse_comparison_atom(pair: Pair<Rule>) -> AstPredicate {
+    let mut inner = pair.into_inner();
+    let field = inner
+        .next()
+        .expect("comparison_atom has identifier")
+        .as_str()
+        .to_string();
+    let op = parse_cmp_op(&inner.next().expect("comparison_atom has comparison_op"));
+    let value = parse_atom_value(inner.next().expect("comparison_atom has atom_value"));
+    if matches!(op, CmpOp::Eq) {
+        AstPredicate::Eq(field, value)
+    } else {
+        AstPredicate::Cmp(field, op, value)
+    }
+}
+
+/// `in_atom = { identifier ~ ^"IN" ~ "(" ~ literal ~ ("," ~ literal)* ~ ")" }`.
+#[allow(dead_code)]
+fn parse_in_atom(pair: Pair<Rule>) -> AstPredicate {
+    let mut inner = pair.into_inner();
+    let field = inner
+        .next()
+        .expect("in_atom has identifier")
+        .as_str()
+        .to_string();
+    let values: Vec<AstLiteral> = inner.map(parse_literal).collect();
+    AstPredicate::In(field, values)
+}
+
+/// `between_atom = { identifier ~ ^"BETWEEN" ~ literal ~ ^"AND" ~ literal }`.
+#[allow(dead_code)]
+fn parse_between_atom(pair: Pair<Rule>) -> AstPredicate {
+    let mut inner = pair.into_inner();
+    let field = inner
+        .next()
+        .expect("between_atom has identifier")
+        .as_str()
+        .to_string();
+    let lo = parse_literal(inner.next().expect("between_atom has lo literal"));
+    let hi = parse_literal(inner.next().expect("between_atom has hi literal"));
+    AstPredicate::Between(field, lo, hi)
+}
+
+/// `is_null_atom = { identifier ~ ^"IS" ~ is_null_negation? ~ ^"NULL" }`.
+/// The optional `is_null_negation` is the only visible second child ;
+/// presence detects the `IS NOT NULL` form.
+#[allow(dead_code)]
+fn parse_is_null_atom(pair: Pair<Rule>) -> AstPredicate {
+    let mut inner = pair.into_inner();
+    let field = inner
+        .next()
+        .expect("is_null_atom has identifier")
+        .as_str()
+        .to_string();
+    let negated = inner.next().is_some();
+    AstPredicate::IsNull(field, negated)
+}
+
+/// `array_contains_atom = { identifier ~ "@>" ~ literal }`.
+#[allow(dead_code)]
+fn parse_array_contains_atom(pair: Pair<Rule>) -> AstPredicate {
+    let mut inner = pair.into_inner();
+    let field = inner
+        .next()
+        .expect("array_contains_atom has identifier")
+        .as_str()
+        .to_string();
+    let value = parse_literal(inner.next().expect("array_contains_atom has literal"));
+    AstPredicate::ArrayContains(field, value)
+}
+
+/// `distance_threshold = { distance_expr ~ comparison_op ~ number_literal }`.
+/// The right side parses as `f32` directly because the planner
+/// consumes it as a distance bound.
+#[allow(dead_code)]
+fn parse_distance_threshold(pair: Pair<Rule>) -> AstPredicate {
+    let mut inner = pair.into_inner();
+    let distance = parse_distance_expr(inner.next().expect("distance_threshold has distance_expr"));
+    let op = parse_cmp_op(&inner.next().expect("distance_threshold has comparison_op"));
+    let radius_pair = inner.next().expect("distance_threshold has number_literal");
+    let radius: f32 = radius_pair
+        .as_str()
+        .parse()
+        .expect("number_literal parses as f32 by grammar");
+    AstPredicate::DistanceThreshold(distance, op, radius)
+}
+
+/// `distance_expr = { ^"embedding" ~ distance_op ~ param }`. The
+/// `embedding` keyword is silent ; visible children are `distance_op`
+/// and `param`.
+#[allow(dead_code)]
+fn parse_distance_expr(pair: Pair<Rule>) -> AstDistance {
+    let mut inner = pair.into_inner();
+    let metric = parse_distance_op(&inner.next().expect("distance_expr has distance_op"));
+    let param = parse_param(inner.next().expect("distance_expr has param"));
+    AstDistance { metric, param }
+}
+
+/// Map a `distance_op` pair to the typed enum.
+#[allow(dead_code)]
+fn parse_distance_op(pair: &Pair<Rule>) -> DistanceOp {
+    match pair.as_str() {
+        "<->" => DistanceOp::L2,
+        "<=>" => DistanceOp::Cosine,
+        "<#>" => DistanceOp::InnerProduct,
+        other => unreachable!("unknown distance op: {other}"),
+    }
+}
+
+/// Map a `comparison_op` pair to the typed enum. `!=` and `<>` both
+/// produce [`CmpOp::Ne`].
+#[allow(dead_code)]
+fn parse_cmp_op(pair: &Pair<Rule>) -> CmpOp {
+    match pair.as_str() {
+        "=" => CmpOp::Eq,
+        "<" => CmpOp::Lt,
+        "<=" => CmpOp::Le,
+        ">" => CmpOp::Gt,
+        ">=" => CmpOp::Ge,
+        "!=" | "<>" => CmpOp::Ne,
+        other => unreachable!("unknown comparison op: {other}"),
+    }
+}
+
+/// `atom_value = { literal | param }`. Dispatches by rule.
+#[allow(dead_code)]
+fn parse_atom_value(pair: Pair<Rule>) -> AstExpr {
+    let inner = pair.into_inner().next().expect("atom_value has a child");
+    match inner.as_rule() {
+        Rule::literal => AstExpr::Literal(parse_literal(inner)),
+        Rule::param => AstExpr::Param(parse_param(inner)),
+        rule => unreachable!("unexpected atom_value child: {rule:?}"),
+    }
+}
+
+/// `literal = { string_literal | number_literal | boolean_literal | null_literal }`.
+#[allow(dead_code)]
+fn parse_literal(pair: Pair<Rule>) -> AstLiteral {
+    let inner = pair.into_inner().next().expect("literal has a child");
+    match inner.as_rule() {
+        Rule::string_literal => AstLiteral::String(parse_string_literal(&inner)),
+        Rule::number_literal => parse_number_literal(&inner),
+        Rule::boolean_literal => AstLiteral::Bool(parse_boolean_literal(&inner)),
+        Rule::null_literal => AstLiteral::Null,
+        rule => unreachable!("unexpected literal child: {rule:?}"),
+    }
+}
+
+/// Strip the surrounding single quotes from a `string_literal` pair.
+/// The grammar guarantees both quotes are present.
+#[allow(dead_code)]
+fn parse_string_literal(pair: &Pair<Rule>) -> String {
+    let raw = pair.as_str();
+    raw[1..raw.len() - 1].to_string()
+}
+
+/// Decide [`AstLiteral::I64`] vs [`AstLiteral::F64`] from the source
+/// shape : presence of a decimal point splits them.
+#[allow(dead_code)]
+fn parse_number_literal(pair: &Pair<Rule>) -> AstLiteral {
+    let s = pair.as_str();
+    if s.contains('.') {
+        AstLiteral::F64(s.parse().expect("number_literal parses as f64 by grammar"))
+    } else {
+        AstLiteral::I64(s.parse().expect("number_literal parses as i64 by grammar"))
+    }
+}
+
+/// Case-insensitive boolean from the matched text.
+#[allow(dead_code)]
+fn parse_boolean_literal(pair: &Pair<Rule>) -> bool {
+    pair.as_str().eq_ignore_ascii_case("true")
+}
+
+/// Test-only entry point : parse a bare predicate string. Wired
+/// against the `test_predicate = { SOI ~ predicate ~ EOI }` anchor
+/// so the test suite can exercise the predicate subtree before any
+/// statement that uses WHERE has landed.
+///
+/// # Errors
+///
+/// Returns [`KovaQueryError::Parse`] for any input the predicate
+/// grammar rejects.
+#[cfg(test)]
+fn parse_predicate_str(input: &str) -> Result<AstPredicate, KovaQueryError> {
+    let mut pairs = KqlParser::parse(Rule::test_predicate, input)
+        .map_err(|e| KovaQueryError::Parse(e.to_string()))?;
+    let test_pred = pairs.next().expect("test_predicate present on Ok");
+    let predicate = test_pred
+        .into_inner()
+        .next()
+        .expect("test_predicate has predicate child");
+    Ok(parse_predicate(predicate))
 }
 
 #[cfg(test)]
@@ -560,6 +853,317 @@ mod tests {
     fn rejects_drop_index_without_name() {
         assert!(matches!(
             parse_str("DROP INDEX ON vectors"),
+            Err(KovaQueryError::Parse(_))
+        ));
+    }
+
+    // ----- Predicates : comparison_atom -----
+
+    #[test]
+    fn predicate_eq_with_integer_literal() {
+        let p = parse_predicate_str("id = 5").expect("parse Ok");
+        let AstPredicate::Eq(field, AstExpr::Literal(AstLiteral::I64(5))) = p else {
+            panic!("expected Eq(id, 5), got {p:?}");
+        };
+        assert_eq!(field, "id");
+    }
+
+    #[test]
+    fn predicate_eq_with_string_literal() {
+        let p = parse_predicate_str("name = 'hello'").expect("parse Ok");
+        let AstPredicate::Eq(field, AstExpr::Literal(AstLiteral::String(s))) = p else {
+            panic!("expected Eq with string, got {p:?}");
+        };
+        assert_eq!(field, "name");
+        assert_eq!(s, "hello");
+    }
+
+    #[test]
+    fn predicate_eq_with_positional_param() {
+        let p = parse_predicate_str("id = $1").expect("parse Ok");
+        let AstPredicate::Eq(field, AstExpr::Param(ParamRef::Positional(1))) = p else {
+            panic!("expected Eq with param, got {p:?}");
+        };
+        assert_eq!(field, "id");
+    }
+
+    #[test]
+    fn predicate_eq_with_named_param() {
+        let p = parse_predicate_str("id = $target").expect("parse Ok");
+        let AstPredicate::Eq(_, AstExpr::Param(ParamRef::Named(s))) = p else {
+            panic!("expected Eq with named param, got {p:?}");
+        };
+        assert_eq!(s, "target");
+    }
+
+    #[test]
+    fn predicate_eq_with_boolean_literal() {
+        let p = parse_predicate_str("pinned = TRUE").expect("parse Ok");
+        let AstPredicate::Eq(_, AstExpr::Literal(AstLiteral::Bool(true))) = p else {
+            panic!("expected Eq with true, got {p:?}");
+        };
+    }
+
+    #[test]
+    fn predicate_eq_with_null_literal() {
+        let p = parse_predicate_str("category = NULL").expect("parse Ok");
+        let AstPredicate::Eq(_, AstExpr::Literal(AstLiteral::Null)) = p else {
+            panic!("expected Eq with NULL, got {p:?}");
+        };
+    }
+
+    #[test]
+    fn predicate_eq_with_float_literal() {
+        let p = parse_predicate_str("score = 2.5").expect("parse Ok");
+        let AstPredicate::Eq(_, AstExpr::Literal(AstLiteral::F64(f))) = p else {
+            panic!("expected Eq with f64, got {p:?}");
+        };
+        assert!((f - 2.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn predicate_eq_with_negative_integer() {
+        let p = parse_predicate_str("delta = -5").expect("parse Ok");
+        let AstPredicate::Eq(_, AstExpr::Literal(AstLiteral::I64(-5))) = p else {
+            panic!("expected Eq with -5, got {p:?}");
+        };
+    }
+
+    #[test]
+    fn predicate_cmp_lt() {
+        let p = parse_predicate_str("year < 2024").expect("parse Ok");
+        assert!(matches!(p, AstPredicate::Cmp(_, CmpOp::Lt, _)));
+    }
+
+    #[test]
+    fn predicate_cmp_le() {
+        let p = parse_predicate_str("year <= 2024").expect("parse Ok");
+        assert!(matches!(p, AstPredicate::Cmp(_, CmpOp::Le, _)));
+    }
+
+    #[test]
+    fn predicate_cmp_gt() {
+        let p = parse_predicate_str("year > 2024").expect("parse Ok");
+        assert!(matches!(p, AstPredicate::Cmp(_, CmpOp::Gt, _)));
+    }
+
+    #[test]
+    fn predicate_cmp_ge() {
+        let p = parse_predicate_str("year >= 2024").expect("parse Ok");
+        assert!(matches!(p, AstPredicate::Cmp(_, CmpOp::Ge, _)));
+    }
+
+    #[test]
+    fn predicate_cmp_ne_bang() {
+        let p = parse_predicate_str("year != 2024").expect("parse Ok");
+        assert!(matches!(p, AstPredicate::Cmp(_, CmpOp::Ne, _)));
+    }
+
+    #[test]
+    fn predicate_cmp_ne_angle() {
+        let p = parse_predicate_str("year <> 2024").expect("parse Ok");
+        assert!(matches!(p, AstPredicate::Cmp(_, CmpOp::Ne, _)));
+    }
+
+    // ----- Predicates : other atom shapes -----
+
+    #[test]
+    fn predicate_in_list_with_strings() {
+        let p = parse_predicate_str("category IN ('docs', 'specs', 'rfcs')").expect("parse Ok");
+        let AstPredicate::In(field, values) = p else {
+            panic!("expected In, got {p:?}");
+        };
+        assert_eq!(field, "category");
+        assert_eq!(values.len(), 3);
+        assert!(matches!(values[0], AstLiteral::String(ref s) if s == "docs"));
+    }
+
+    #[test]
+    fn predicate_in_list_with_integers() {
+        let p = parse_predicate_str("year IN (2023, 2024, 2025)").expect("parse Ok");
+        let AstPredicate::In(_, values) = p else {
+            panic!("expected In, got {p:?}");
+        };
+        assert!(matches!(values[0], AstLiteral::I64(2023)));
+    }
+
+    #[test]
+    fn predicate_between() {
+        let p = parse_predicate_str("score BETWEEN 0.5 AND 1.0").expect("parse Ok");
+        let AstPredicate::Between(field, AstLiteral::F64(lo), AstLiteral::F64(hi)) = p else {
+            panic!("expected Between, got {p:?}");
+        };
+        assert_eq!(field, "score");
+        assert!((lo - 0.5).abs() < f64::EPSILON);
+        assert!((hi - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn predicate_is_null() {
+        let p = parse_predicate_str("category IS NULL").expect("parse Ok");
+        let AstPredicate::IsNull(field, negated) = p else {
+            panic!("expected IsNull, got {p:?}");
+        };
+        assert_eq!(field, "category");
+        assert!(!negated);
+    }
+
+    #[test]
+    fn predicate_is_not_null() {
+        let p = parse_predicate_str("category IS NOT NULL").expect("parse Ok");
+        let AstPredicate::IsNull(_, negated) = p else {
+            panic!("expected IsNull, got {p:?}");
+        };
+        assert!(negated);
+    }
+
+    #[test]
+    fn predicate_array_contains() {
+        let p = parse_predicate_str("tags @> 'rust'").expect("parse Ok");
+        let AstPredicate::ArrayContains(field, AstLiteral::String(value)) = p else {
+            panic!("expected ArrayContains, got {p:?}");
+        };
+        assert_eq!(field, "tags");
+        assert_eq!(value, "rust");
+    }
+
+    // ----- Predicates : distance threshold -----
+
+    #[test]
+    fn predicate_distance_threshold_l2() {
+        let p = parse_predicate_str("embedding <-> $1 < 0.5").expect("parse Ok");
+        let AstPredicate::DistanceThreshold(dist, op, radius) = p else {
+            panic!("expected DistanceThreshold, got {p:?}");
+        };
+        assert_eq!(dist.metric, DistanceOp::L2);
+        assert!(matches!(dist.param, ParamRef::Positional(1)));
+        assert_eq!(op, CmpOp::Lt);
+        assert!((radius - 0.5).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn predicate_distance_threshold_cosine() {
+        let p = parse_predicate_str("embedding <=> $query <= 0.3").expect("parse Ok");
+        let AstPredicate::DistanceThreshold(dist, _, _) = p else {
+            panic!("expected DistanceThreshold, got {p:?}");
+        };
+        assert_eq!(dist.metric, DistanceOp::Cosine);
+        assert!(matches!(dist.param, ParamRef::Named(ref s) if s == "query"));
+    }
+
+    #[test]
+    fn predicate_distance_threshold_inner_product() {
+        let p = parse_predicate_str("embedding <#> $1 > -0.1").expect("parse Ok");
+        let AstPredicate::DistanceThreshold(dist, _, radius) = p else {
+            panic!("expected DistanceThreshold, got {p:?}");
+        };
+        assert_eq!(dist.metric, DistanceOp::InnerProduct);
+        assert!((radius - (-0.1)).abs() < f32::EPSILON);
+    }
+
+    // ----- Predicates : boolean combinators -----
+
+    #[test]
+    fn predicate_and_two_terms() {
+        let p = parse_predicate_str("a = 1 AND b = 2").expect("parse Ok");
+        let AstPredicate::And(children) = p else {
+            panic!("expected And, got {p:?}");
+        };
+        assert_eq!(children.len(), 2);
+    }
+
+    #[test]
+    fn predicate_or_two_terms() {
+        let p = parse_predicate_str("a = 1 OR b = 2").expect("parse Ok");
+        let AstPredicate::Or(children) = p else {
+            panic!("expected Or, got {p:?}");
+        };
+        assert_eq!(children.len(), 2);
+    }
+
+    #[test]
+    fn predicate_and_flattens_three_terms() {
+        let p = parse_predicate_str("a = 1 AND b = 2 AND c = 3").expect("parse Ok");
+        let AstPredicate::And(children) = p else {
+            panic!("expected And, got {p:?}");
+        };
+        assert_eq!(children.len(), 3, "AND chain should flatten");
+    }
+
+    #[test]
+    fn predicate_not_single_atom() {
+        let p = parse_predicate_str("NOT a = 1").expect("parse Ok");
+        let AstPredicate::Not(inner) = p else {
+            panic!("expected Not, got {p:?}");
+        };
+        assert!(matches!(*inner, AstPredicate::Eq(_, _)));
+    }
+
+    #[test]
+    fn predicate_double_negation() {
+        let p = parse_predicate_str("NOT NOT a = 1").expect("parse Ok");
+        let AstPredicate::Not(outer) = p else {
+            panic!("expected outer Not, got {p:?}");
+        };
+        assert!(matches!(*outer, AstPredicate::Not(_)));
+    }
+
+    #[test]
+    fn predicate_precedence_and_binds_tighter_than_or() {
+        // `a = 1 AND b = 2 OR c = 3` parses as `(a AND b) OR c`.
+        let p = parse_predicate_str("a = 1 AND b = 2 OR c = 3").expect("parse Ok");
+        let AstPredicate::Or(children) = p else {
+            panic!("expected top-level Or, got {p:?}");
+        };
+        assert_eq!(children.len(), 2);
+        assert!(
+            matches!(children[0], AstPredicate::And(_)),
+            "left of OR should be the AND group"
+        );
+        assert!(matches!(children[1], AstPredicate::Eq(_, _)));
+    }
+
+    #[test]
+    fn predicate_parens_override_precedence() {
+        // `(a = 1 OR b = 2) AND c = 3` parses as And(Or, Eq).
+        let p = parse_predicate_str("(a = 1 OR b = 2) AND c = 3").expect("parse Ok");
+        let AstPredicate::And(children) = p else {
+            panic!("expected top-level And, got {p:?}");
+        };
+        assert!(matches!(children[0], AstPredicate::Or(_)));
+        assert!(matches!(children[1], AstPredicate::Eq(_, _)));
+    }
+
+    #[test]
+    fn predicate_single_atom_does_not_wrap_in_combinators() {
+        // A bare atom should NOT come out as `And([atom])` or `Or([atom])`.
+        let p = parse_predicate_str("x = 1").expect("parse Ok");
+        assert!(matches!(p, AstPredicate::Eq(_, _)));
+    }
+
+    // ----- Predicates : error paths -----
+
+    #[test]
+    fn rejects_predicate_missing_operator() {
+        assert!(matches!(
+            parse_predicate_str("x"),
+            Err(KovaQueryError::Parse(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_predicate_unbalanced_parens() {
+        assert!(matches!(
+            parse_predicate_str("(x = 1"),
+            Err(KovaQueryError::Parse(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_keyword_as_field_name() {
+        // `AND` is a reserved keyword ; can't be an identifier.
+        assert!(matches!(
+            parse_predicate_str("AND = 1"),
             Err(KovaQueryError::Parse(_))
         ));
     }
