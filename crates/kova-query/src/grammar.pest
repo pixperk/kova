@@ -9,6 +9,7 @@ statement = {
     checkpoint_stmt
   | vacuum_stmt
   | insert_stmt
+  | update_stmt
   | delete_stmt
   | create_index_stmt
   | drop_index_stmt
@@ -47,6 +48,18 @@ drop_index_stmt = { ^"DROP" ~ ^"INDEX" ~ identifier ~ ^"ON" ~ table_ref }
 // can write `DELETE FROM vectors WHERE id IS NOT NULL` and they had
 // to type the predicate, which is sufficient ceremony.
 delete_stmt = { ^"DELETE" ~ ^"FROM" ~ table_ref ~ ^"WHERE" ~ predicate }
+
+// Mandatory WHERE for the same reason. Embedding updates (`SET
+// embedding = ...`) parse here but the binder hard-rejects them :
+// HNSW node positions are immutable.
+update_stmt = {
+    ^"UPDATE" ~ table_ref
+    ~ ^"SET" ~ set_assignment ~ ("," ~ set_assignment)*
+    ~ ^"WHERE" ~ predicate
+}
+
+// `field = value` or `field['key'] = value` for in-place metadata patches.
+set_assignment = { identifier ~ ("[" ~ string_literal ~ "]")? ~ "=" ~ atom_value }
 
 // -------- Predicate subtree --------
 //
@@ -123,7 +136,7 @@ keyword = _{
         ^"CHECKPOINT" | ^"VACUUM" | ^"INSERT" | ^"INTO" | ^"VALUES"
       | ^"CREATE" | ^"INDEX" | ^"DROP" | ^"ON" | ^"USING"
       | ^"HASH" | ^"BTREE" | ^"INVERTED"
-      | ^"DELETE" | ^"FROM" | ^"WHERE"
+      | ^"DELETE" | ^"FROM" | ^"WHERE" | ^"UPDATE" | ^"SET"
       | ^"AND" | ^"OR" | ^"NOT" | ^"IS" | ^"NULL" | ^"IN" | ^"BETWEEN"
       | ^"TRUE" | ^"FALSE"
     ) ~ !(ASCII_ALPHANUMERIC | "_")

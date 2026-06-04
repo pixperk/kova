@@ -160,7 +160,29 @@ pub enum ParamRef {
 
 /// `UPDATE` statement payload.
 #[derive(Debug, Clone)]
-pub struct AstUpdate;
+pub struct AstUpdate {
+    /// Target table.
+    pub table: String,
+    /// One or more `SET field = value` (or `SET field['key'] = value`)
+    /// assignments. Grammar enforces at least one.
+    pub assignments: Vec<AstAssignment>,
+    /// Required WHERE-clause predicate. The grammar rejects UPDATE
+    /// without a WHERE.
+    pub predicate: AstPredicate,
+}
+
+/// One assignment in an `UPDATE ... SET ...` clause.
+#[derive(Debug, Clone)]
+pub struct AstAssignment {
+    /// Target field name.
+    pub field: String,
+    /// Optional string subscript : `Some("key")` for `field['key']
+    /// = value`, `None` for `field = value`. The binder uses this
+    /// to distinguish whole-bag replace from in-place patch.
+    pub subscript: Option<String>,
+    /// Right-hand side value (literal or parameter).
+    pub value: AstExpr,
+}
 
 /// `DELETE` statement payload.
 #[derive(Debug, Clone)]

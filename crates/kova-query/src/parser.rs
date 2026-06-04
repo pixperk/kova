@@ -4,8 +4,9 @@ use pest::Parser;
 use pest::iterators::Pair;
 
 use crate::ast::{
-    AstCreateIndex, AstDelete, AstDistance, AstDropIndex, AstExpr, AstInsert, AstInsertSource,
-    AstLiteral, AstPredicate, AstStatement, AstVacuum, CmpOp, DistanceOp, IndexMethod, ParamRef,
+    AstAssignment, AstCreateIndex, AstDelete, AstDistance, AstDropIndex, AstExpr, AstInsert,
+    AstInsertSource, AstLiteral, AstPredicate, AstStatement, AstUpdate, AstVacuum, CmpOp,
+    DistanceOp, IndexMethod, ParamRef,
 };
 use crate::error::KovaQueryError;
 
@@ -52,10 +53,71 @@ pub fn parse_str(input: &str) -> Result<AstStatement, KovaQueryError> {
         Rule::checkpoint_stmt => Ok(AstStatement::Checkpoint),
         Rule::vacuum_stmt => Ok(AstStatement::Vacuum(parse_vacuum(inner))),
         Rule::insert_stmt => Ok(AstStatement::Insert(parse_insert(inner))),
+        Rule::update_stmt => Ok(AstStatement::Update(parse_update(inner))),
         Rule::delete_stmt => Ok(AstStatement::Delete(parse_delete(inner))),
         Rule::create_index_stmt => Ok(AstStatement::CreateIndex(parse_create_index(inner))),
         Rule::drop_index_stmt => Ok(AstStatement::DropIndex(parse_drop_index(inner))),
         rule => unreachable!("unexpected statement variant: {rule:?}"),
+    }
+}
+
+/// Build an [`AstUpdate`] from an `update_stmt` pair.
+///
+/// Grammar : `update_stmt = { ^"UPDATE" ~ table_ref ~ ^"SET" ~
+/// set_assignment ~ ("," ~ set_assignment)* ~ ^"WHERE" ~ predicate }`.
+/// Visible children : `table_ref`, one or more `set_assignment`s, and
+/// finally `predicate`. We dispatch on each child's rule to collect
+/// the assignment list and pull the predicate out.
+fn parse_update(pair: Pair<Rule>) -> AstUpdate {
+    let mut inner = pair.into_inner();
+    let table = parse_table_ref(inner.next().expect("update_stmt has table_ref"));
+
+    let mut assignments = Vec::new();
+    let mut predicate = None;
+    for child in inner {
+        match child.as_rule() {
+            Rule::set_assignment => assignments.push(parse_set_assignment(child)),
+            Rule::predicate => predicate = Some(parse_predicate(child)),
+            rule => unreachable!("unexpected update_stmt child: {rule:?}"),
+        }
+    }
+
+    AstUpdate {
+        table,
+        assignments,
+        predicate: predicate.expect("update_stmt has predicate by grammar"),
+    }
+}
+
+/// Build an [`AstAssignment`] from a `set_assignment` pair.
+///
+/// Grammar : `set_assignment = { identifier ~ ("[" ~ string_literal
+/// ~ "]")? ~ "=" ~ atom_value }`. The second visible child is either
+/// `string_literal` (subscript form) or `atom_value` (whole-field
+/// form) ; dispatch on rule to tell them apart.
+fn parse_set_assignment(pair: Pair<Rule>) -> AstAssignment {
+    let mut inner = pair.into_inner();
+    let field = inner
+        .next()
+        .expect("set_assignment has identifier")
+        .as_str()
+        .to_string();
+    let next = inner.next().expect("set_assignment has more children");
+
+    let (subscript, value_pair) = if matches!(next.as_rule(), Rule::string_literal) {
+        let sub = parse_string_literal(&next);
+        let val = inner
+            .next()
+            .expect("set_assignment has atom_value after subscript");
+        (Some(sub), val)
+    } else {
+        (None, next)
+    };
+
+    AstAssignment {
+        field,
+        subscript,
+        value: parse_atom_value(value_pair),
     }
 }
 
@@ -1242,6 +1304,95 @@ mod tests {
     fn rejects_delete_without_table() {
         assert!(matches!(
             parse_str("DELETE FROM WHERE id = $1"),
+            Err(KovaQueryError::Parse(_))
+        ));
+    }
+
+    // ----- UPDATE -----
+
+    #[test]
+    fn parses_update_whole_metadata_replace() {
+        let ast = parse_str("UPDATE vectors SET metadata = $1 WHERE id = $2").expect("parse Ok");
+        let AstStatement::Update(AstUpdate {
+            table,
+            assignments,
+            predicate,
+        }) = ast
+        else {
+            panic!("expected Update");
+        };
+        assert_eq!(table, "vectors");
+        assert_eq!(assignments.len(), 1);
+        let AstAssignment {
+            field,
+            subscript,
+            value,
+        } = &assignments[0];
+        assert_eq!(field, "metadata");
+        assert_eq!(subscript.as_deref(), None);
+        assert!(matches!(value, AstExpr::Param(ParamRef::Positional(1))));
+        assert!(matches!(predicate, AstPredicate::Eq(_, _)));
+    }
+
+    #[test]
+    fn parses_update_with_subscript_patch() {
+        let ast = parse_str("UPDATE vectors SET metadata['priority'] = 'high' WHERE id = $1")
+            .expect("parse Ok");
+        let AstStatement::Update(AstUpdate { assignments, .. }) = ast else {
+            panic!("expected Update");
+        };
+        let AstAssignment {
+            field,
+            subscript,
+            value,
+        } = &assignments[0];
+        assert_eq!(field, "metadata");
+        assert_eq!(subscript.as_deref(), Some("priority"));
+        assert!(matches!(
+            value,
+            AstExpr::Literal(AstLiteral::String(s)) if s == "high"
+        ));
+    }
+
+    #[test]
+    fn parses_update_with_multiple_assignments() {
+        let ast =
+            parse_str("UPDATE vectors SET metadata['a'] = 'x', metadata['b'] = 'y' WHERE id = $1")
+                .expect("parse Ok");
+        let AstStatement::Update(AstUpdate { assignments, .. }) = ast else {
+            panic!("expected Update");
+        };
+        assert_eq!(assignments.len(), 2);
+        assert_eq!(assignments[0].subscript.as_deref(), Some("a"));
+        assert_eq!(assignments[1].subscript.as_deref(), Some("b"));
+    }
+
+    #[test]
+    fn parses_update_is_case_insensitive_on_keywords() {
+        let ast = parse_str("update vectors set metadata = $1 where id = $2").expect("parse Ok");
+        assert!(matches!(ast, AstStatement::Update(_)));
+    }
+
+    #[test]
+    fn rejects_update_without_set_clause() {
+        assert!(matches!(
+            parse_str("UPDATE vectors WHERE id = $1"),
+            Err(KovaQueryError::Parse(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_update_without_where_clause() {
+        assert!(matches!(
+            parse_str("UPDATE vectors SET metadata = $1"),
+            Err(KovaQueryError::Parse(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_update_with_empty_set_list() {
+        assert!(matches!(
+            parse_str("UPDATE vectors SET WHERE id = $1"),
             Err(KovaQueryError::Parse(_))
         ));
     }
