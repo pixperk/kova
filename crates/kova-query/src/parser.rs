@@ -4,8 +4,8 @@ use pest::Parser;
 use pest::iterators::Pair;
 
 use crate::ast::{
-    AstCreateIndex, AstDistance, AstDropIndex, AstExpr, AstInsert, AstInsertSource, AstLiteral,
-    AstPredicate, AstStatement, AstVacuum, CmpOp, DistanceOp, IndexMethod, ParamRef,
+    AstCreateIndex, AstDelete, AstDistance, AstDropIndex, AstExpr, AstInsert, AstInsertSource,
+    AstLiteral, AstPredicate, AstStatement, AstVacuum, CmpOp, DistanceOp, IndexMethod, ParamRef,
 };
 use crate::error::KovaQueryError;
 
@@ -52,10 +52,23 @@ pub fn parse_str(input: &str) -> Result<AstStatement, KovaQueryError> {
         Rule::checkpoint_stmt => Ok(AstStatement::Checkpoint),
         Rule::vacuum_stmt => Ok(AstStatement::Vacuum(parse_vacuum(inner))),
         Rule::insert_stmt => Ok(AstStatement::Insert(parse_insert(inner))),
+        Rule::delete_stmt => Ok(AstStatement::Delete(parse_delete(inner))),
         Rule::create_index_stmt => Ok(AstStatement::CreateIndex(parse_create_index(inner))),
         Rule::drop_index_stmt => Ok(AstStatement::DropIndex(parse_drop_index(inner))),
         rule => unreachable!("unexpected statement variant: {rule:?}"),
     }
+}
+
+/// Build an [`AstDelete`] from a `delete_stmt` pair.
+///
+/// Grammar : `delete_stmt = { ^"DELETE" ~ ^"FROM" ~ table_ref ~
+/// ^"WHERE" ~ predicate }`. The keywords are silent literals ;
+/// visible children in order : `table_ref`, `predicate`.
+fn parse_delete(pair: Pair<Rule>) -> AstDelete {
+    let mut inner = pair.into_inner();
+    let table = parse_table_ref(inner.next().expect("delete_stmt has table_ref"));
+    let predicate = parse_predicate(inner.next().expect("delete_stmt has predicate"));
+    AstDelete { table, predicate }
 }
 
 /// Extract the table name from a `table_ref` pair.
@@ -222,14 +235,8 @@ fn parse_drop_index(pair: Pair<Rule>) -> AstDropIndex {
 // (`And`, `Or`) are flattened : a single-child or_expr/and_expr
 // returns its child directly instead of wrapping in a 1-element
 // combinator. This keeps the produced predicate tree canonical.
-//
-// Every helper carries `#[allow(dead_code)]` because they're only
-// reachable from `parse_predicate_str` (cfg(test)) right now. The
-// allows naturally become redundant once DELETE / UPDATE / SELECT
-// land and call `parse_predicate` from the dispatcher.
 
 /// Entry point. `predicate -> or_expr`.
-#[allow(dead_code)]
 fn parse_predicate(pair: Pair<Rule>) -> AstPredicate {
     parse_or_expr(
         pair.into_inner()
@@ -240,7 +247,6 @@ fn parse_predicate(pair: Pair<Rule>) -> AstPredicate {
 
 /// `or_expr = { and_expr ~ (^"OR" ~ and_expr)* }`. Multiple children
 /// produce an [`AstPredicate::Or`] ; a single child collapses through.
-#[allow(dead_code)]
 fn parse_or_expr(pair: Pair<Rule>) -> AstPredicate {
     let children: Vec<AstPredicate> = pair.into_inner().map(parse_and_expr).collect();
     if children.len() == 1 {
@@ -252,7 +258,6 @@ fn parse_or_expr(pair: Pair<Rule>) -> AstPredicate {
 
 /// `and_expr = { not_expr ~ (^"AND" ~ not_expr)* }`. Multiple children
 /// produce an [`AstPredicate::And`] ; a single child collapses through.
-#[allow(dead_code)]
 fn parse_and_expr(pair: Pair<Rule>) -> AstPredicate {
     let children: Vec<AstPredicate> = pair.into_inner().map(parse_not_expr).collect();
     if children.len() == 1 {
@@ -266,7 +271,6 @@ fn parse_and_expr(pair: Pair<Rule>) -> AstPredicate {
 /// literal is silent, so we dispatch on the rule of the (single)
 /// visible child : if it's another `not_expr`, this was the NOT
 /// branch ; otherwise it's an `atom_or_parens`.
-#[allow(dead_code)]
 fn parse_not_expr(pair: Pair<Rule>) -> AstPredicate {
     let inner = pair.into_inner().next().expect("not_expr has a child");
     match inner.as_rule() {
@@ -278,7 +282,6 @@ fn parse_not_expr(pair: Pair<Rule>) -> AstPredicate {
 
 /// `atom_or_parens = { "(" ~ predicate ~ ")" | atom }`. Either
 /// descends back into a parenthesised predicate or dispatches an atom.
-#[allow(dead_code)]
 fn parse_atom_or_parens(pair: Pair<Rule>) -> AstPredicate {
     let inner = pair
         .into_inner()
@@ -293,7 +296,6 @@ fn parse_atom_or_parens(pair: Pair<Rule>) -> AstPredicate {
 
 /// `atom = { distance_threshold | between_atom | in_atom |
 /// is_null_atom | array_contains_atom | comparison_atom }`.
-#[allow(dead_code)]
 fn parse_atom(pair: Pair<Rule>) -> AstPredicate {
     let inner = pair.into_inner().next().expect("atom has a child");
     match inner.as_rule() {
@@ -310,7 +312,6 @@ fn parse_atom(pair: Pair<Rule>) -> AstPredicate {
 /// `comparison_atom = { identifier ~ comparison_op ~ atom_value }`.
 /// Splits `=` into [`AstPredicate::Eq`] ; all other ops go to
 /// [`AstPredicate::Cmp`].
-#[allow(dead_code)]
 fn parse_comparison_atom(pair: Pair<Rule>) -> AstPredicate {
     let mut inner = pair.into_inner();
     let field = inner
@@ -328,7 +329,6 @@ fn parse_comparison_atom(pair: Pair<Rule>) -> AstPredicate {
 }
 
 /// `in_atom = { identifier ~ ^"IN" ~ "(" ~ literal ~ ("," ~ literal)* ~ ")" }`.
-#[allow(dead_code)]
 fn parse_in_atom(pair: Pair<Rule>) -> AstPredicate {
     let mut inner = pair.into_inner();
     let field = inner
@@ -341,7 +341,6 @@ fn parse_in_atom(pair: Pair<Rule>) -> AstPredicate {
 }
 
 /// `between_atom = { identifier ~ ^"BETWEEN" ~ literal ~ ^"AND" ~ literal }`.
-#[allow(dead_code)]
 fn parse_between_atom(pair: Pair<Rule>) -> AstPredicate {
     let mut inner = pair.into_inner();
     let field = inner
@@ -357,7 +356,6 @@ fn parse_between_atom(pair: Pair<Rule>) -> AstPredicate {
 /// `is_null_atom = { identifier ~ ^"IS" ~ is_null_negation? ~ ^"NULL" }`.
 /// The optional `is_null_negation` is the only visible second child ;
 /// presence detects the `IS NOT NULL` form.
-#[allow(dead_code)]
 fn parse_is_null_atom(pair: Pair<Rule>) -> AstPredicate {
     let mut inner = pair.into_inner();
     let field = inner
@@ -370,7 +368,6 @@ fn parse_is_null_atom(pair: Pair<Rule>) -> AstPredicate {
 }
 
 /// `array_contains_atom = { identifier ~ "@>" ~ literal }`.
-#[allow(dead_code)]
 fn parse_array_contains_atom(pair: Pair<Rule>) -> AstPredicate {
     let mut inner = pair.into_inner();
     let field = inner
@@ -385,7 +382,6 @@ fn parse_array_contains_atom(pair: Pair<Rule>) -> AstPredicate {
 /// `distance_threshold = { distance_expr ~ comparison_op ~ number_literal }`.
 /// The right side parses as `f32` directly because the planner
 /// consumes it as a distance bound.
-#[allow(dead_code)]
 fn parse_distance_threshold(pair: Pair<Rule>) -> AstPredicate {
     let mut inner = pair.into_inner();
     let distance = parse_distance_expr(inner.next().expect("distance_threshold has distance_expr"));
@@ -401,7 +397,6 @@ fn parse_distance_threshold(pair: Pair<Rule>) -> AstPredicate {
 /// `distance_expr = { ^"embedding" ~ distance_op ~ param }`. The
 /// `embedding` keyword is silent ; visible children are `distance_op`
 /// and `param`.
-#[allow(dead_code)]
 fn parse_distance_expr(pair: Pair<Rule>) -> AstDistance {
     let mut inner = pair.into_inner();
     let metric = parse_distance_op(&inner.next().expect("distance_expr has distance_op"));
@@ -410,7 +405,6 @@ fn parse_distance_expr(pair: Pair<Rule>) -> AstDistance {
 }
 
 /// Map a `distance_op` pair to the typed enum.
-#[allow(dead_code)]
 fn parse_distance_op(pair: &Pair<Rule>) -> DistanceOp {
     match pair.as_str() {
         "<->" => DistanceOp::L2,
@@ -422,7 +416,6 @@ fn parse_distance_op(pair: &Pair<Rule>) -> DistanceOp {
 
 /// Map a `comparison_op` pair to the typed enum. `!=` and `<>` both
 /// produce [`CmpOp::Ne`].
-#[allow(dead_code)]
 fn parse_cmp_op(pair: &Pair<Rule>) -> CmpOp {
     match pair.as_str() {
         "=" => CmpOp::Eq,
@@ -436,7 +429,6 @@ fn parse_cmp_op(pair: &Pair<Rule>) -> CmpOp {
 }
 
 /// `atom_value = { literal | param }`. Dispatches by rule.
-#[allow(dead_code)]
 fn parse_atom_value(pair: Pair<Rule>) -> AstExpr {
     let inner = pair.into_inner().next().expect("atom_value has a child");
     match inner.as_rule() {
@@ -447,7 +439,6 @@ fn parse_atom_value(pair: Pair<Rule>) -> AstExpr {
 }
 
 /// `literal = { string_literal | number_literal | boolean_literal | null_literal }`.
-#[allow(dead_code)]
 fn parse_literal(pair: Pair<Rule>) -> AstLiteral {
     let inner = pair.into_inner().next().expect("literal has a child");
     match inner.as_rule() {
@@ -461,7 +452,6 @@ fn parse_literal(pair: Pair<Rule>) -> AstLiteral {
 
 /// Strip the surrounding single quotes from a `string_literal` pair.
 /// The grammar guarantees both quotes are present.
-#[allow(dead_code)]
 fn parse_string_literal(pair: &Pair<Rule>) -> String {
     let raw = pair.as_str();
     raw[1..raw.len() - 1].to_string()
@@ -469,7 +459,6 @@ fn parse_string_literal(pair: &Pair<Rule>) -> String {
 
 /// Decide [`AstLiteral::I64`] vs [`AstLiteral::F64`] from the source
 /// shape : presence of a decimal point splits them.
-#[allow(dead_code)]
 fn parse_number_literal(pair: &Pair<Rule>) -> AstLiteral {
     let s = pair.as_str();
     if s.contains('.') {
@@ -480,7 +469,6 @@ fn parse_number_literal(pair: &Pair<Rule>) -> AstLiteral {
 }
 
 /// Case-insensitive boolean from the matched text.
-#[allow(dead_code)]
 fn parse_boolean_literal(pair: &Pair<Rule>) -> bool {
     pair.as_str().eq_ignore_ascii_case("true")
 }
@@ -1164,6 +1152,96 @@ mod tests {
         // `AND` is a reserved keyword ; can't be an identifier.
         assert!(matches!(
             parse_predicate_str("AND = 1"),
+            Err(KovaQueryError::Parse(_))
+        ));
+    }
+
+    // ----- DELETE -----
+
+    #[test]
+    fn parses_delete_by_id_equality() {
+        let ast = parse_str("DELETE FROM vectors WHERE id = $1").expect("parse Ok");
+        let AstStatement::Delete(AstDelete { table, predicate }) = ast else {
+            panic!("expected Delete");
+        };
+        assert_eq!(table, "vectors");
+        let AstPredicate::Eq(field, AstExpr::Param(ParamRef::Positional(1))) = predicate else {
+            panic!("expected Eq(id, $1), got {predicate:?}");
+        };
+        assert_eq!(field, "id");
+    }
+
+    #[test]
+    fn parses_delete_with_compound_predicate() {
+        let ast = parse_str("DELETE FROM vectors WHERE category = 'archived' AND year < 2020")
+            .expect("parse Ok");
+        let AstStatement::Delete(AstDelete { predicate, .. }) = ast else {
+            panic!("expected Delete");
+        };
+        let AstPredicate::And(children) = predicate else {
+            panic!("expected And, got {predicate:?}");
+        };
+        assert_eq!(children.len(), 2);
+    }
+
+    #[test]
+    fn parses_delete_with_in_list() {
+        let ast =
+            parse_str("DELETE FROM vectors WHERE category IN ('old', 'archived', 'deprecated')")
+                .expect("parse Ok");
+        let AstStatement::Delete(AstDelete { predicate, .. }) = ast else {
+            panic!("expected Delete");
+        };
+        let AstPredicate::In(field, values) = predicate else {
+            panic!("expected In, got {predicate:?}");
+        };
+        assert_eq!(field, "category");
+        assert_eq!(values.len(), 3);
+    }
+
+    #[test]
+    fn parses_delete_with_is_not_null() {
+        let ast = parse_str("DELETE FROM vectors WHERE deleted_at IS NOT NULL").expect("parse Ok");
+        let AstStatement::Delete(AstDelete { predicate, .. }) = ast else {
+            panic!("expected Delete");
+        };
+        assert!(matches!(predicate, AstPredicate::IsNull(_, true)));
+    }
+
+    #[test]
+    fn parses_delete_with_trailing_semicolon() {
+        let ast = parse_str("DELETE FROM vectors WHERE id = $1;").expect("parse Ok");
+        assert!(matches!(ast, AstStatement::Delete(_)));
+    }
+
+    #[test]
+    fn parses_delete_is_case_insensitive_on_keywords() {
+        let ast = parse_str("delete from vectors where id = $1").expect("parse Ok");
+        assert!(matches!(ast, AstStatement::Delete(_)));
+    }
+
+    #[test]
+    fn rejects_delete_without_where_clause() {
+        // Mandatory-WHERE is the safety guard against accidental
+        // table-wide deletes.
+        assert!(matches!(
+            parse_str("DELETE FROM vectors"),
+            Err(KovaQueryError::Parse(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_delete_without_from_keyword() {
+        assert!(matches!(
+            parse_str("DELETE vectors WHERE id = $1"),
+            Err(KovaQueryError::Parse(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_delete_without_table() {
+        assert!(matches!(
+            parse_str("DELETE FROM WHERE id = $1"),
             Err(KovaQueryError::Parse(_))
         ));
     }

@@ -9,6 +9,7 @@ statement = {
     checkpoint_stmt
   | vacuum_stmt
   | insert_stmt
+  | delete_stmt
   | create_index_stmt
   | drop_index_stmt
 }
@@ -40,6 +41,12 @@ create_index_stmt = {
 index_method = { ^"HASH" | ^"BTREE" | ^"INVERTED" }
 
 drop_index_stmt = { ^"DROP" ~ ^"INDEX" ~ identifier ~ ^"ON" ~ table_ref }
+
+// Mandatory WHERE clause : `DELETE FROM vectors;` without a predicate
+// is the worst SQL foot-gun. Users who really want to nuke everything
+// can write `DELETE FROM vectors WHERE id IS NOT NULL` and they had
+// to type the predicate, which is sufficient ceremony.
+delete_stmt = { ^"DELETE" ~ ^"FROM" ~ table_ref ~ ^"WHERE" ~ predicate }
 
 // -------- Predicate subtree --------
 //
@@ -116,6 +123,7 @@ keyword = _{
         ^"CHECKPOINT" | ^"VACUUM" | ^"INSERT" | ^"INTO" | ^"VALUES"
       | ^"CREATE" | ^"INDEX" | ^"DROP" | ^"ON" | ^"USING"
       | ^"HASH" | ^"BTREE" | ^"INVERTED"
+      | ^"DELETE" | ^"FROM" | ^"WHERE"
       | ^"AND" | ^"OR" | ^"NOT" | ^"IS" | ^"NULL" | ^"IN" | ^"BETWEEN"
       | ^"TRUE" | ^"FALSE"
     ) ~ !(ASCII_ALPHANUMERIC | "_")

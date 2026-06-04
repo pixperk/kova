@@ -164,7 +164,13 @@ pub struct AstUpdate;
 
 /// `DELETE` statement payload.
 #[derive(Debug, Clone)]
-pub struct AstDelete;
+pub struct AstDelete {
+    /// Target table.
+    pub table: String,
+    /// Required WHERE-clause predicate. The grammar rejects DELETE
+    /// without a WHERE.
+    pub predicate: AstPredicate,
+}
 
 /// `VACUUM` statement payload.
 #[derive(Debug, Clone)]
