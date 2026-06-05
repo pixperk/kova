@@ -5,8 +5,12 @@
 //! when SELECT joins the dispatch and the cost-model picks between
 //! scan / index / post-filter / soft-filtered-ANN.
 
+use kova_core::VectorId;
+
 use crate::error::KovaQueryError;
-use crate::logical::{LogicalInsert, LogicalInsertSource, LogicalStatement, LogicalVacuum};
+use crate::logical::{
+    LogicalDelete, LogicalInsert, LogicalInsertSource, LogicalStatement, LogicalVacuum,
+};
 use crate::physical::PhysicalPlan;
 
 /// Pick the physical plan for a [`LogicalStatement`].
@@ -41,12 +45,32 @@ pub fn plan(stmt: LogicalStatement) -> Result<PhysicalPlan, KovaQueryError> {
                 batch: param,
             }),
         },
+        LogicalStatement::Delete(LogicalDelete {
+            table,
+            single_id_hint,
+            predicate: _,
+        }) => match single_id_hint {
+            // Hint set : binder spotted `WHERE id = <integer-literal>`.
+            // Skip straight to the fast path ; no predicate evaluation
+            // needed.
+            Some(id) => Ok(PhysicalPlan::DeleteById {
+                table,
+                id: VectorId::new(id),
+            }),
+            // Hint missing : predicate is param-bound, compound, or
+            // doesn't match the simple-id shape. Full DELETE-by-predicate
+            // is its own milestone (needs metadata scan + delete_many).
+            None => Err(KovaQueryError::Plan(
+                "DELETE WHERE <predicate> is not yet supported ; v1 supports \
+                 DELETE WHERE id = <integer-literal> only"
+                    .into(),
+            )),
+        },
 
         // Filled in as each statement gains executor support. Explicit
         // arms (rather than `_`) so the compiler errors the moment a
         // new LogicalStatement variant is added without a planner arm.
         LogicalStatement::Update(_) => unimplemented("UPDATE"),
-        LogicalStatement::Delete(_) => unimplemented("DELETE"),
         LogicalStatement::Query(_) => unimplemented("SELECT"),
     }
 }

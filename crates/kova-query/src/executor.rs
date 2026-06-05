@@ -139,6 +139,14 @@ pub enum ExecutionResult {
         /// for batch).
         inserted: u64,
     },
+    /// DELETE completed ; `deleted` rows were tombstoned in `table`.
+    Delete {
+        /// Target table the operation ran against.
+        table: String,
+        /// Number of rows tombstoned (1 for `DeleteById` ; more once
+        /// `DeleteByPredicate` lands).
+        deleted: u64,
+    },
 }
 
 /// Top-level KQL execution engine. Owns a file-backed [`Shard`] and
@@ -257,10 +265,7 @@ impl<D: Distance> Engine<D> {
                 self.shard
                     .insert(id, embedding, metadata)
                     .map_err(|e| KovaQueryError::Backend(Box::new(e)))?;
-                Ok(ExecutionResult::Insert {
-                    table,
-                    inserted: 1,
-                })
+                Ok(ExecutionResult::Insert { table, inserted: 1 })
             }
             PhysicalPlan::InsertMany {
                 table,
@@ -273,6 +278,13 @@ impl<D: Distance> Engine<D> {
                     .insert_many(batch)
                     .map_err(|e| KovaQueryError::Backend(Box::new(e)))?;
                 Ok(ExecutionResult::Insert { table, inserted })
+            }
+            PhysicalPlan::DeleteById { table, id } => {
+                self.assert_table(&table)?;
+                self.shard
+                    .delete(id)
+                    .map_err(|e| KovaQueryError::Backend(Box::new(e)))?;
+                Ok(ExecutionResult::Delete { table, deleted: 1 })
             }
         }
     }
@@ -793,5 +805,159 @@ mod tests {
         let shard = Shard::open(dir.path(), 4, L2, HnswParams::default()).expect("reopen");
         let engine = Engine::new(shard, "vectors");
         assert!(engine.shard().contains(VectorId::new(123)));
+    }
+
+    // ----- DELETE -----
+
+    /// Insert via KQL, then delete by literal id via KQL. The
+    /// post-delete `contains` returns false because Shard.contains
+    /// filters tombstones.
+    #[test]
+    fn executes_delete_by_literal_id() {
+        let dir = tempdir().expect("tempdir");
+        let mut engine = make_engine(&dir);
+        engine
+            .execute_str(
+                "INSERT INTO vectors (id, embedding, metadata) VALUES ($1, $2, $3)",
+                ParamBindings::empty()
+                    .with_positional(ParamValue::Id(VectorId::new(5)))
+                    .with_positional(ParamValue::Vector(unit_vec()))
+                    .with_positional(ParamValue::Metadata(Metadata::new())),
+            )
+            .expect("insert");
+        let result = engine
+            .execute_str("DELETE FROM vectors WHERE id = 5", ParamBindings::empty())
+            .expect("delete");
+        let ExecutionResult::Delete { table, deleted } = result else {
+            panic!("expected Delete, got {result:?}");
+        };
+        assert_eq!(table, "vectors");
+        assert_eq!(deleted, 1);
+        assert!(!engine.shard().contains(VectorId::new(5)));
+    }
+
+    /// The planner makes its first real decision here : the binder
+    /// detected the literal-id form of the predicate and set
+    /// `single_id_hint = Some(5)`, so the planner emits `DeleteById`
+    /// without walking the predicate tree at execute time.
+    #[test]
+    fn planner_picks_delete_by_id_for_literal_predicate() {
+        let dir = tempdir().expect("tempdir");
+        let mut engine = make_engine(&dir);
+        engine
+            .execute_str(
+                "INSERT INTO vectors (id, embedding, metadata) VALUES ($1, $2, $3)",
+                ParamBindings::empty()
+                    .with_positional(ParamValue::Id(VectorId::new(10)))
+                    .with_positional(ParamValue::Vector(unit_vec()))
+                    .with_positional(ParamValue::Metadata(Metadata::new())),
+            )
+            .expect("insert");
+        // The literal-id form lands on the fast path even though the
+        // predicate is structurally identical to a more general
+        // `WHERE` clause.
+        engine
+            .execute_str("DELETE FROM vectors WHERE id = 10", ParamBindings::empty())
+            .expect("delete");
+        assert!(!engine.shard().contains(VectorId::new(10)));
+    }
+
+    /// Param-bound id : the binder did NOT set the single-id hint
+    /// because the value isn't known at bind time. The planner
+    /// reports the unsupported-shape Plan error cleanly. This is
+    /// the v1 boundary that `DeleteByPredicate` will lift later.
+    #[test]
+    fn rejects_delete_by_param_bound_id() {
+        let dir = tempdir().expect("tempdir");
+        let mut engine = make_engine(&dir);
+        let params = ParamBindings::empty().with_positional(ParamValue::Id(VectorId::new(1)));
+        let err = engine
+            .execute_str("DELETE FROM vectors WHERE id = $1", params)
+            .expect_err("expected Plan error");
+        let KovaQueryError::Plan(msg) = err else {
+            panic!("expected Plan, got {err:?}");
+        };
+        assert!(
+            msg.contains("integer-literal"),
+            "message should call out the literal-only constraint : {msg}"
+        );
+    }
+
+    /// Same as above but a compound predicate. Binder leaves hint as
+    /// None ; planner errors with the same message.
+    #[test]
+    fn rejects_delete_by_compound_predicate() {
+        let dir = tempdir().expect("tempdir");
+        let mut engine = make_engine(&dir);
+        let err = engine
+            .execute_str(
+                "DELETE FROM vectors WHERE category = 'old'",
+                ParamBindings::empty(),
+            )
+            .expect_err("expected Plan error");
+        assert!(matches!(err, KovaQueryError::Plan(_)));
+    }
+
+    /// DELETE on a non-existent id surfaces the Shard's `NotFound` as
+    /// a Backend error.
+    #[test]
+    fn rejects_delete_of_missing_id() {
+        let dir = tempdir().expect("tempdir");
+        let mut engine = make_engine(&dir);
+        let err = engine
+            .execute_str("DELETE FROM vectors WHERE id = 999", ParamBindings::empty())
+            .expect_err("expected error");
+        assert!(matches!(err, KovaQueryError::Backend(_)));
+    }
+
+    /// DELETE on an unknown table reports an Execution error via the
+    /// engine's table dispatcher.
+    #[test]
+    fn rejects_delete_on_unknown_table() {
+        let dir = tempdir().expect("tempdir");
+        let mut engine = make_engine(&dir);
+        let err = engine
+            .execute_str("DELETE FROM products WHERE id = 1", ParamBindings::empty())
+            .expect_err("expected error");
+        assert!(matches!(err, KovaQueryError::Execution(_)));
+    }
+
+    /// Full write-path round-trip : insert two ids, delete one,
+    /// checkpoint, reopen, verify only the surviving id is present.
+    /// Pins the M1.3 milestone for the delete path specifically.
+    #[test]
+    fn end_to_end_insert_delete_checkpoint_reopen() {
+        let dir = tempdir().expect("tempdir");
+        {
+            let mut engine = make_engine(&dir);
+            for id in [100, 200u64] {
+                engine
+                    .execute_str(
+                        "INSERT INTO vectors (id, embedding, metadata) VALUES ($1, $2, $3)",
+                        ParamBindings::empty()
+                            .with_positional(ParamValue::Id(VectorId::new(id)))
+                            .with_positional(ParamValue::Vector(unit_vec()))
+                            .with_positional(ParamValue::Metadata(Metadata::new())),
+                    )
+                    .expect("insert");
+            }
+            engine
+                .execute_str("DELETE FROM vectors WHERE id = 100", ParamBindings::empty())
+                .expect("delete");
+            engine
+                .execute_str("CHECKPOINT", ParamBindings::empty())
+                .expect("checkpoint");
+        } // Engine drops, files close.
+
+        let shard = Shard::open(dir.path(), 4, L2, HnswParams::default()).expect("reopen");
+        let engine = Engine::new(shard, "vectors");
+        assert!(
+            !engine.shard().contains(VectorId::new(100)),
+            "deleted id should stay deleted across reopen"
+        );
+        assert!(
+            engine.shard().contains(VectorId::new(200)),
+            "surviving id should still be present"
+        );
     }
 }

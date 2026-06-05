@@ -8,6 +8,8 @@
 //! Operators land incrementally. CHECKPOINT is first ; INSERT /
 //! DELETE / VACUUM / SELECT follow.
 
+use kova_core::VectorId;
+
 use crate::ast::ParamRef;
 
 /// Physical operator. v1 grows this enum as each statement gets its
@@ -48,5 +50,14 @@ pub enum PhysicalPlan {
         table: String,
         /// Parameter slot for the batch array.
         batch: ParamRef,
+    },
+    /// DELETE by literal id : the fast path. Produced when the
+    /// binder's single-id hint was set (predicate of the form
+    /// `WHERE id = <integer-literal>`). Dispatches to `Shard::delete`.
+    DeleteById {
+        /// Target table.
+        table: String,
+        /// Pre-resolved id (no parameter lookup needed at execute time).
+        id: VectorId,
     },
 }
