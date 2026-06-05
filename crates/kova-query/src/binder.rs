@@ -352,12 +352,8 @@ fn bind_select(q: AstQuery) -> Result<LogicalStatement, KovaQueryError> {
 
 /// Validate projection-list-wide rules (wildcard appears alone),
 /// then translate each item individually.
-fn bind_projection_list(
-    items: Vec<AstProjection>,
-) -> Result<ProjectionSpec, KovaQueryError> {
-    let has_wildcard = items
-        .iter()
-        .any(|p| matches!(p, AstProjection::Wildcard));
+fn bind_projection_list(items: Vec<AstProjection>) -> Result<ProjectionSpec, KovaQueryError> {
+    let has_wildcard = items.iter().any(|p| matches!(p, AstProjection::Wildcard));
     if has_wildcard && items.len() > 1 {
         return Err(KovaQueryError::Bind(
             "SELECT * cannot appear alongside other projection items".into(),
@@ -377,9 +373,7 @@ fn bind_projection_item(p: AstProjection) -> Result<BoundProjection, KovaQueryEr
         AstProjection::CountStar => Ok(BoundProjection::CountStar { alias: None }),
         AstProjection::Id => Ok(BoundProjection::Id { alias: None }),
         AstProjection::Metadata => Ok(BoundProjection::Metadata { alias: None }),
-        AstProjection::Field(name) => {
-            Ok(BoundProjection::MetadataField { name, alias: None })
-        }
+        AstProjection::Field(name) => Ok(BoundProjection::MetadataField { name, alias: None }),
         AstProjection::DistanceExpr(_) => Err(KovaQueryError::Bind(
             "distance expression in SELECT requires an alias (AS <name>)".into(),
         )),
@@ -395,9 +389,7 @@ fn bind_aliased_projection(
     alias: String,
 ) -> Result<BoundProjection, KovaQueryError> {
     match inner {
-        AstProjection::Wildcard => Err(KovaQueryError::Bind(
-            "SELECT * cannot be aliased".into(),
-        )),
+        AstProjection::Wildcard => Err(KovaQueryError::Bind("SELECT * cannot be aliased".into())),
         AstProjection::Aliased(_, _) => Err(KovaQueryError::Bind(
             "nested aliases are not allowed (use only one AS)".into(),
         )),
@@ -506,8 +498,7 @@ mod tests {
     /// today (v2-only DDL).
     #[test]
     fn unimplemented_variants_return_bind_error() {
-        let ast = parse_str("CREATE INDEX idx ON vectors USING HASH (category)")
-            .expect("parse Ok");
+        let ast = parse_str("CREATE INDEX idx ON vectors USING HASH (category)").expect("parse Ok");
         let err = bind(ast).expect_err("expected Bind error");
         assert!(
             matches!(err, KovaQueryError::Bind(_)),
@@ -938,8 +929,10 @@ mod tests {
 
     #[test]
     fn binds_select_distance_projection_with_alias() {
-        let ast = parse_str("SELECT embedding <-> $1 AS distance FROM vectors ORDER BY embedding <-> $1 LIMIT 10")
-            .expect("parse Ok");
+        let ast = parse_str(
+            "SELECT embedding <-> $1 AS distance FROM vectors ORDER BY embedding <-> $1 LIMIT 10",
+        )
+        .expect("parse Ok");
         let logical = bind(ast).expect("bind Ok");
         let LogicalStatement::Query(q) = logical else {
             panic!("expected Query");
@@ -1043,9 +1036,18 @@ mod tests {
         };
         assert_eq!(q.from_table, "vectors");
         assert_eq!(q.projection.columns.len(), 3);
-        assert!(matches!(q.projection.columns[0], BoundProjection::Id { .. }));
-        assert!(matches!(q.projection.columns[1], BoundProjection::Distance { .. }));
-        assert!(matches!(q.projection.columns[2], BoundProjection::Metadata { .. }));
+        assert!(matches!(
+            q.projection.columns[0],
+            BoundProjection::Id { .. }
+        ));
+        assert!(matches!(
+            q.projection.columns[1],
+            BoundProjection::Distance { .. }
+        ));
+        assert!(matches!(
+            q.projection.columns[2],
+            BoundProjection::Metadata { .. }
+        ));
         assert!(matches!(q.predicate, Some(PredicateExpr::And(_))));
         assert_eq!(q.ordering.len(), 1);
         assert_eq!(q.limit, Some(10));
@@ -1126,8 +1128,7 @@ mod tests {
 
     #[test]
     fn rejects_knn_query_without_limit() {
-        let ast = parse_str("SELECT id FROM vectors ORDER BY embedding <-> $1")
-            .expect("parse Ok");
+        let ast = parse_str("SELECT id FROM vectors ORDER BY embedding <-> $1").expect("parse Ok");
         let err = bind(ast).expect_err("expected Bind error");
         let KovaQueryError::Bind(msg) = err else {
             panic!("expected Bind, got {err:?}");
