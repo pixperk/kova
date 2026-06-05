@@ -23,10 +23,19 @@ pub enum LogicalStatement {
     Update(LogicalUpdate),
     /// `DELETE FROM vectors WHERE ...`
     Delete(LogicalDelete),
-    /// `VACUUM vectors`
-    Vacuum,
+    /// `VACUUM <table>`
+    Vacuum(LogicalVacuum),
     /// `CHECKPOINT`
     Checkpoint,
+}
+
+/// VACUUM statement after binding. Carries the target table name
+/// through ; the executor matches it against the available Shard(s)
+/// and errors on mismatch.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LogicalVacuum {
+    /// Target table name, preserved from the source (no case folding).
+    pub table: String,
 }
 
 /// SELECT statement after binding.
