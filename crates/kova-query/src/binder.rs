@@ -6,9 +6,9 @@
 //! v2 grows a context carrying the strict-schema registry.
 
 use crate::ast::{
-    AstAssignment, AstDelete, AstExpr, AstInsert, AstInsertSource, AstLiteral, AstOrderBy,
-    AstPredicate, AstProjection, AstQuery, AstStatement, AstUpdate, AstVacuum,
-    OrderDir as AstOrderDir,
+    AstAssignment, AstCreateIndex, AstDelete, AstDropIndex, AstExpr, AstInsert, AstInsertSource,
+    AstLiteral, AstOrderBy, AstPredicate, AstProjection, AstQuery, AstStatement, AstUpdate,
+    AstVacuum, OrderDir as AstOrderDir,
 };
 use crate::error::KovaQueryError;
 use crate::logical::{
@@ -37,12 +37,8 @@ pub fn bind(ast: AstStatement) -> Result<LogicalStatement, KovaQueryError> {
         AstStatement::Update(u) => bind_update(u),
         AstStatement::Delete(d) => bind_delete(d),
         AstStatement::Select(q) => bind_select(q),
-
-        // Filled in as each binder lands. Explicit arms (rather than
-        // a `_` catchall) so the compiler complains the moment a new
-        // AST variant is added without a binder.
-        AstStatement::CreateIndex(_) => unimplemented(StatementKind::CreateIndex),
-        AstStatement::DropIndex(_) => unimplemented(StatementKind::DropIndex),
+        AstStatement::CreateIndex(c) => bind_create_index(c),
+        AstStatement::DropIndex(d) => bind_drop_index(d),
     }
 }
 
@@ -450,23 +446,25 @@ fn bind_order_dir(d: AstOrderDir) -> OrderDir {
 }
 
 // =========================================================================
-// Not-yet-implemented helpers
+// V2-only DDL
 // =========================================================================
 
-/// Shape of the not-yet-implemented stub so the error message stays
-/// consistent across statement variants. Shrinks as each statement
-/// binder lands ; the whole helper goes away when the last variant
-/// is wired up.
-#[derive(Debug, Clone, Copy)]
-enum StatementKind {
-    CreateIndex,
-    DropIndex,
+/// `CREATE INDEX` is a v2 feature ; v1 doesn't ship the index
+/// machinery (`Hash` / `BTree` / `Inverted`) or the executor support
+/// to build them. The parser accepts the syntax so v2 doesn't need a
+/// grammar change ; the binder is where the rejection lives.
+fn bind_create_index(_c: AstCreateIndex) -> Result<LogicalStatement, KovaQueryError> {
+    Err(KovaQueryError::Bind(
+        "CREATE INDEX is a v2 feature ; v1 doesn't support secondary indexes".into(),
+    ))
 }
 
-fn unimplemented(kind: StatementKind) -> Result<LogicalStatement, KovaQueryError> {
-    Err(KovaQueryError::Bind(format!(
-        "bind not yet implemented for {kind:?}"
-    )))
+/// `DROP INDEX` is the symmetric v2-only operation. Same rejection
+/// for the same reason.
+fn bind_drop_index(_d: AstDropIndex) -> Result<LogicalStatement, KovaQueryError> {
+    Err(KovaQueryError::Bind(
+        "DROP INDEX is a v2 feature ; v1 doesn't support secondary indexes".into(),
+    ))
 }
 
 #[cfg(test)]
@@ -493,16 +491,37 @@ mod tests {
         assert_eq!(bind(ast).expect("bind Ok"), LogicalStatement::Checkpoint);
     }
 
-    /// Every statement type without a real binder yet must report a
-    /// clean Bind error, not panic. CREATE INDEX is the chosen probe
-    /// today (v2-only DDL).
+    // ----- CREATE INDEX / DROP INDEX : v2-only -----
+
     #[test]
-    fn unimplemented_variants_return_bind_error() {
+    fn rejects_create_index_in_v1() {
         let ast = parse_str("CREATE INDEX idx ON vectors USING HASH (category)").expect("parse Ok");
         let err = bind(ast).expect_err("expected Bind error");
+        let KovaQueryError::Bind(msg) = err else {
+            panic!("expected Bind, got {err:?}");
+        };
         assert!(
-            matches!(err, KovaQueryError::Bind(_)),
-            "expected Bind, got {err:?}"
+            msg.contains("v2"),
+            "message should call out v2-only : {msg}"
+        );
+    }
+
+    #[test]
+    fn rejects_create_index_without_name_in_v1() {
+        let ast = parse_str("CREATE INDEX ON vectors USING BTREE (year)").expect("parse Ok");
+        assert!(matches!(bind(ast), Err(KovaQueryError::Bind(_))));
+    }
+
+    #[test]
+    fn rejects_drop_index_in_v1() {
+        let ast = parse_str("DROP INDEX idx ON vectors").expect("parse Ok");
+        let err = bind(ast).expect_err("expected Bind error");
+        let KovaQueryError::Bind(msg) = err else {
+            panic!("expected Bind, got {err:?}");
+        };
+        assert!(
+            msg.contains("v2"),
+            "message should call out v2-only : {msg}"
         );
     }
 
