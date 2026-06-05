@@ -60,6 +60,8 @@ pub struct LogicalQuery {
 /// only one v1 accepts, so we can collapse to typed parameter slots.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LogicalInsert {
+    /// Target table name, preserved from the source.
+    pub table: String,
     /// Source of rows.
     pub rows: LogicalInsertSource,
 }
@@ -89,6 +91,8 @@ pub enum LogicalInsertSource {
 /// assignment touches metadata only.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LogicalUpdate {
+    /// Target table name, preserved from the source.
+    pub table: String,
     /// WHERE-clause predicate (required by grammar).
     pub predicate: PredicateExpr,
     /// One or more assignments, in source order.
@@ -113,6 +117,8 @@ pub struct LogicalAssignment {
 /// the predicate tree.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LogicalDelete {
+    /// Target table name, preserved from the source.
+    pub table: String,
     /// WHERE-clause predicate (required by grammar).
     pub predicate: PredicateExpr,
     /// `Some(id)` when `predicate` is exactly `Eq("id", Literal(I64(n)))`.
