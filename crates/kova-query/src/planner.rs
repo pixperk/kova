@@ -6,7 +6,7 @@
 //! scan / index / post-filter / soft-filtered-ANN.
 
 use crate::error::KovaQueryError;
-use crate::logical::LogicalStatement;
+use crate::logical::{LogicalStatement, LogicalVacuum};
 use crate::physical::PhysicalPlan;
 
 /// Pick the physical plan for a [`LogicalStatement`].
@@ -24,11 +24,11 @@ use crate::physical::PhysicalPlan;
 pub fn plan(stmt: LogicalStatement) -> Result<PhysicalPlan, KovaQueryError> {
     match stmt {
         LogicalStatement::Checkpoint => Ok(PhysicalPlan::Checkpoint),
+        LogicalStatement::Vacuum(LogicalVacuum { table }) => Ok(PhysicalPlan::Vacuum { table }),
 
         // Filled in as each statement gains executor support. Explicit
         // arms (rather than `_`) so the compiler errors the moment a
         // new LogicalStatement variant is added without a planner arm.
-        LogicalStatement::Vacuum(_) => unimplemented("VACUUM"),
         LogicalStatement::Insert(_) => unimplemented("INSERT"),
         LogicalStatement::Update(_) => unimplemented("UPDATE"),
         LogicalStatement::Delete(_) => unimplemented("DELETE"),

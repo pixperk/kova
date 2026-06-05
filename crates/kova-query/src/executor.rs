@@ -123,6 +123,14 @@ pub enum ExecutionResult {
         /// LSN of the WAL position that the new snapshot covers.
         lsn: Lsn,
     },
+    /// VACUUM finished on `table` ; `removed` nodes were physically
+    /// reclaimed and their inbound edges repaired in the HNSW graph.
+    Vacuum {
+        /// Target table the operation ran against.
+        table: String,
+        /// Number of tombstoned nodes removed.
+        removed: usize,
+    },
 }
 
 /// Top-level KQL execution engine. Owns a file-backed [`Shard`] and
@@ -133,14 +141,28 @@ pub enum ExecutionResult {
 /// requires a directory ; the in-memory combo can't checkpoint and
 /// CHECKPOINT is a v1 statement. Generic over the distance metric
 /// only, which is the type parameter HNSW actually needs.
+///
+/// The Engine carries the table name its shard answers to. Statements
+/// that name a table (`VACUUM <name>`, `INSERT INTO <name> ...`)
+/// are validated against this at execute time. Case-insensitive,
+/// matching how the binder treats the magic column names.
 pub struct Engine<D: Distance> {
     shard: Shard<D, MmapVectorStore, FileMetadataStore, FileWal>,
+    table_name: String,
 }
 
 impl<D: Distance> Engine<D> {
-    /// Wrap a [`Shard`] in an engine.
-    pub fn new(shard: Shard<D, MmapVectorStore, FileMetadataStore, FileWal>) -> Self {
-        Self { shard }
+    /// Wrap a [`Shard`] in an engine. `table_name` is the name KQL
+    /// statements use to refer to this shard ; statements that name
+    /// a different table error at execute time.
+    pub fn new(
+        shard: Shard<D, MmapVectorStore, FileMetadataStore, FileWal>,
+        table_name: impl Into<String>,
+    ) -> Self {
+        Self {
+            shard,
+            table_name: table_name.into(),
+        }
     }
 
     /// Borrow the underlying shard.
@@ -206,6 +228,28 @@ impl<D: Distance> Engine<D> {
                     .map_err(|e| KovaQueryError::Backend(Box::new(e)))?;
                 Ok(ExecutionResult::Checkpoint { lsn })
             }
+            PhysicalPlan::Vacuum { table } => {
+                self.assert_table(&table)?;
+                let removed = self
+                    .shard
+                    .vacuum()
+                    .map_err(|e| KovaQueryError::Backend(Box::new(e)))?;
+                Ok(ExecutionResult::Vacuum { table, removed })
+            }
+        }
+    }
+
+    /// Validate that a statement-supplied table name matches this
+    /// engine's shard. Case-insensitive, same convention as the
+    /// binder uses for magic column names.
+    fn assert_table(&self, name: &str) -> Result<(), KovaQueryError> {
+        if name.eq_ignore_ascii_case(&self.table_name) {
+            Ok(())
+        } else {
+            Err(KovaQueryError::Execution(format!(
+                "unknown table '{name}' ; this engine is wrapping '{}'",
+                self.table_name
+            )))
         }
     }
 }
@@ -224,11 +268,13 @@ mod tests {
     fn executes_checkpoint_end_to_end() {
         let dir = tempdir().expect("tempdir");
         let shard = Shard::open(dir.path(), 4, L2, HnswParams::default()).expect("Shard::open");
-        let mut engine = Engine::new(shard);
+        let mut engine = Engine::new(shard, "vectors");
         let result = engine
             .execute_str("CHECKPOINT", ParamBindings::empty())
             .expect("execute_str");
-        let ExecutionResult::Checkpoint { lsn } = result;
+        let ExecutionResult::Checkpoint { lsn } = result else {
+            panic!("expected Checkpoint, got {result:?}");
+        };
         // First checkpoint on an empty shard : WAL has no records,
         // so the captured lsn is ZERO. Just check the variant fired.
         assert_eq!(lsn, Lsn::ZERO);
@@ -240,15 +286,19 @@ mod tests {
     fn checkpoint_is_idempotent_when_no_writes_between() {
         let dir = tempdir().expect("tempdir");
         let shard = Shard::open(dir.path(), 4, L2, HnswParams::default()).expect("Shard::open");
-        let mut engine = Engine::new(shard);
+        let mut engine = Engine::new(shard, "vectors");
         let first = engine
             .execute_str("CHECKPOINT", ParamBindings::empty())
             .unwrap();
         let second = engine
             .execute_str("CHECKPOINT", ParamBindings::empty())
             .unwrap();
-        let ExecutionResult::Checkpoint { lsn: l1 } = first;
-        let ExecutionResult::Checkpoint { lsn: l2 } = second;
+        let ExecutionResult::Checkpoint { lsn: l1 } = first else {
+            panic!("expected Checkpoint, got {first:?}");
+        };
+        let ExecutionResult::Checkpoint { lsn: l2 } = second else {
+            panic!("expected Checkpoint, got {second:?}");
+        };
         assert_eq!(l1, l2);
     }
 
@@ -257,7 +307,7 @@ mod tests {
     fn execute_str_propagates_parse_error() {
         let dir = tempdir().expect("tempdir");
         let shard = Shard::open(dir.path(), 4, L2, HnswParams::default()).expect("Shard::open");
-        let mut engine = Engine::new(shard);
+        let mut engine = Engine::new(shard, "vectors");
         let err = engine
             .execute_str("not_a_keyword", ParamBindings::empty())
             .expect_err("expected error");
@@ -270,7 +320,7 @@ mod tests {
     fn execute_str_propagates_bind_error() {
         let dir = tempdir().expect("tempdir");
         let shard = Shard::open(dir.path(), 4, L2, HnswParams::default()).expect("Shard::open");
-        let mut engine = Engine::new(shard);
+        let mut engine = Engine::new(shard, "vectors");
         let err = engine
             .execute_str(
                 "UPDATE vectors SET embedding = $1 WHERE id = $2",
@@ -280,17 +330,115 @@ mod tests {
         assert!(matches!(err, KovaQueryError::Bind(_)));
     }
 
-    /// Statements without an executor arm yet (e.g. VACUUM, INSERT)
+    /// Statements without an executor arm yet (INSERT, UPDATE, etc.)
     /// report a clean Plan error.
     #[test]
     fn execute_str_propagates_plan_error_for_unimplemented() {
         let dir = tempdir().expect("tempdir");
         let shard = Shard::open(dir.path(), 4, L2, HnswParams::default()).expect("Shard::open");
-        let mut engine = Engine::new(shard);
+        let mut engine = Engine::new(shard, "vectors");
         let err = engine
-            .execute_str("VACUUM vectors", ParamBindings::empty())
+            .execute_str(
+                "INSERT INTO vectors (id, embedding, metadata) VALUES ($1, $2, $3)",
+                ParamBindings::empty(),
+            )
             .expect_err("expected error");
         assert!(matches!(err, KovaQueryError::Plan(_)));
+    }
+
+    // ----- VACUUM -----
+
+    /// VACUUM on an empty shard returns 0 removed.
+    #[test]
+    fn executes_vacuum_on_empty_shard() {
+        let dir = tempdir().expect("tempdir");
+        let shard = Shard::open(dir.path(), 4, L2, HnswParams::default()).expect("Shard::open");
+        let mut engine = Engine::new(shard, "vectors");
+        let result = engine
+            .execute_str("VACUUM vectors", ParamBindings::empty())
+            .expect("execute_str");
+        let ExecutionResult::Vacuum { table, removed } = result else {
+            panic!("expected Vacuum, got {result:?}");
+        };
+        assert_eq!(table, "vectors");
+        assert_eq!(removed, 0);
+    }
+
+    /// VACUUM after inserts + deletes physically removes the tombstoned
+    /// nodes. Sets up state via `shard_mut()` because INSERT/DELETE
+    /// aren't wired through the executor yet.
+    #[test]
+    fn executes_vacuum_after_inserts_and_deletes() {
+        use kova_core::Vector;
+
+        let dir = tempdir().expect("tempdir");
+        let shard = Shard::open(dir.path(), 4, L2, HnswParams::default()).expect("Shard::open");
+        let mut engine = Engine::new(shard, "vectors");
+
+        // Insert 3 vectors directly via Shard API. `u16` keeps the
+        // numeric conversions lossless : `u16 -> f32` and `u16 -> u64`
+        // both fit by construction, no cast lints.
+        for i in 1..=3u16 {
+            engine
+                .shard_mut()
+                .insert(
+                    VectorId::new(u64::from(i)),
+                    Vector::try_new(vec![f32::from(i), 0.0, 0.0, 0.0]).unwrap(),
+                    Metadata::new(),
+                )
+                .expect("insert");
+        }
+        // Delete two of them ; deletes are tombstones, vacuum is what
+        // actually reclaims them.
+        engine
+            .shard_mut()
+            .delete(VectorId::new(1))
+            .expect("delete 1");
+        engine
+            .shard_mut()
+            .delete(VectorId::new(2))
+            .expect("delete 2");
+
+        let result = engine
+            .execute_str("VACUUM vectors", ParamBindings::empty())
+            .expect("vacuum");
+        let ExecutionResult::Vacuum { removed, .. } = result else {
+            panic!("expected Vacuum");
+        };
+        assert_eq!(removed, 2, "two tombstoned nodes should be reclaimed");
+    }
+
+    /// Statement-named table that doesn't match the engine's shard
+    /// reports an Execution error from the dispatcher's table check.
+    /// The binder accepts any name ; the executor is the layer that
+    /// knows what shard it has.
+    #[test]
+    fn rejects_vacuum_on_unknown_table() {
+        let dir = tempdir().expect("tempdir");
+        let shard = Shard::open(dir.path(), 4, L2, HnswParams::default()).expect("Shard::open");
+        let mut engine = Engine::new(shard, "vectors");
+        let err = engine
+            .execute_str("VACUUM products", ParamBindings::empty())
+            .expect_err("expected error");
+        let KovaQueryError::Execution(msg) = err else {
+            panic!("expected Execution, got {err:?}");
+        };
+        assert!(
+            msg.contains("'products'") && msg.contains("'vectors'"),
+            "message should mention both names : {msg}"
+        );
+    }
+
+    /// Engine's table-name match is case-insensitive.
+    #[test]
+    fn vacuum_accepts_case_variation_in_table_name() {
+        let dir = tempdir().expect("tempdir");
+        let shard = Shard::open(dir.path(), 4, L2, HnswParams::default()).expect("Shard::open");
+        let mut engine = Engine::new(shard, "vectors");
+        let result = engine
+            .execute_str("VACUUM Vectors", ParamBindings::empty())
+            .expect("execute_str");
+        assert!(matches!(result, ExecutionResult::Vacuum { .. }));
     }
 
     // ----- ParamBindings unit tests -----

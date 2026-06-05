@@ -18,4 +18,11 @@ pub enum PhysicalPlan {
     /// write + manifest commit + WAL truncate. Dispatches directly
     /// to `Shard::checkpoint`. Returns the committed LSN.
     Checkpoint,
+    /// Tombstone reclaim + HNSW graph repair on `table`. Dispatches
+    /// to `Shard::vacuum`. Returns the count of nodes physically
+    /// removed.
+    Vacuum {
+        /// Target table name (validated against the engine's shard).
+        table: String,
+    },
 }
