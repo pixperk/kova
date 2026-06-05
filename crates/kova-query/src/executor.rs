@@ -151,9 +151,7 @@ impl<D: Distance> Engine<D> {
 
     /// Mutably borrow the underlying shard. Useful for tests that
     /// need to peek at state with `shard.contains(id)` etc.
-    pub fn shard_mut(
-        &mut self,
-    ) -> &mut Shard<D, MmapVectorStore, FileMetadataStore, FileWal> {
+    pub fn shard_mut(&mut self) -> &mut Shard<D, MmapVectorStore, FileMetadataStore, FileWal> {
         &mut self.shard
     }
 
@@ -225,8 +223,7 @@ mod tests {
     #[test]
     fn executes_checkpoint_end_to_end() {
         let dir = tempdir().expect("tempdir");
-        let shard =
-            Shard::open(dir.path(), 4, L2, HnswParams::default()).expect("Shard::open");
+        let shard = Shard::open(dir.path(), 4, L2, HnswParams::default()).expect("Shard::open");
         let mut engine = Engine::new(shard);
         let result = engine
             .execute_str("CHECKPOINT", ParamBindings::empty())
@@ -242,11 +239,14 @@ mod tests {
     #[test]
     fn checkpoint_is_idempotent_when_no_writes_between() {
         let dir = tempdir().expect("tempdir");
-        let shard =
-            Shard::open(dir.path(), 4, L2, HnswParams::default()).expect("Shard::open");
+        let shard = Shard::open(dir.path(), 4, L2, HnswParams::default()).expect("Shard::open");
         let mut engine = Engine::new(shard);
-        let first = engine.execute_str("CHECKPOINT", ParamBindings::empty()).unwrap();
-        let second = engine.execute_str("CHECKPOINT", ParamBindings::empty()).unwrap();
+        let first = engine
+            .execute_str("CHECKPOINT", ParamBindings::empty())
+            .unwrap();
+        let second = engine
+            .execute_str("CHECKPOINT", ParamBindings::empty())
+            .unwrap();
         let ExecutionResult::Checkpoint { lsn: l1 } = first;
         let ExecutionResult::Checkpoint { lsn: l2 } = second;
         assert_eq!(l1, l2);
@@ -256,8 +256,7 @@ mod tests {
     #[test]
     fn execute_str_propagates_parse_error() {
         let dir = tempdir().expect("tempdir");
-        let shard =
-            Shard::open(dir.path(), 4, L2, HnswParams::default()).expect("Shard::open");
+        let shard = Shard::open(dir.path(), 4, L2, HnswParams::default()).expect("Shard::open");
         let mut engine = Engine::new(shard);
         let err = engine
             .execute_str("not_a_keyword", ParamBindings::empty())
@@ -270,8 +269,7 @@ mod tests {
     #[test]
     fn execute_str_propagates_bind_error() {
         let dir = tempdir().expect("tempdir");
-        let shard =
-            Shard::open(dir.path(), 4, L2, HnswParams::default()).expect("Shard::open");
+        let shard = Shard::open(dir.path(), 4, L2, HnswParams::default()).expect("Shard::open");
         let mut engine = Engine::new(shard);
         let err = engine
             .execute_str(
@@ -287,8 +285,7 @@ mod tests {
     #[test]
     fn execute_str_propagates_plan_error_for_unimplemented() {
         let dir = tempdir().expect("tempdir");
-        let shard =
-            Shard::open(dir.path(), 4, L2, HnswParams::default()).expect("Shard::open");
+        let shard = Shard::open(dir.path(), 4, L2, HnswParams::default()).expect("Shard::open");
         let mut engine = Engine::new(shard);
         let err = engine
             .execute_str("VACUUM vectors", ParamBindings::empty())
@@ -307,8 +304,7 @@ mod tests {
 
     #[test]
     fn param_bindings_resolve_named() {
-        let b = ParamBindings::default()
-            .with_named("target", ParamValue::Id(VectorId::new(7)));
+        let b = ParamBindings::default().with_named("target", ParamValue::Id(VectorId::new(7)));
         let v = b.resolve(&ParamRef::Named("target".into())).expect("bound");
         assert!(matches!(v, ParamValue::Id(id) if id.get() == 7));
     }
