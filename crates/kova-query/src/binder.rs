@@ -102,9 +102,8 @@ mod tests {
     /// because VACUUM moved out of that bucket in step 3.
     #[test]
     fn unimplemented_variants_return_bind_error() {
-        let ast =
-            parse_str("INSERT INTO vectors (id, embedding, metadata) VALUES ($1, $2, $3)")
-                .expect("parse Ok");
+        let ast = parse_str("INSERT INTO vectors (id, embedding, metadata) VALUES ($1, $2, $3)")
+            .expect("parse Ok");
         let err = bind(ast).expect_err("expected Bind error");
         assert!(
             matches!(err, KovaQueryError::Bind(_)),
