@@ -498,9 +498,11 @@ name = "kova-query"
 version = "0.1.0"
 dependencies = [
  "kova-core",
+ "kova-index",
  "kova-storage",
  "pest",
  "pest_derive",
+ "tempfile",
  "thiserror",
 ]
 
