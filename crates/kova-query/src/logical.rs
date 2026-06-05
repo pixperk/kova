@@ -41,6 +41,8 @@ pub struct LogicalVacuum {
 /// SELECT statement after binding.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LogicalQuery {
+    /// Target table name from the `FROM` clause, preserved unchanged.
+    pub from_table: String,
     /// Projection list. The binder enforces "wildcard cannot appear
     /// alongside other items" ; downstream code can assume that.
     pub projection: ProjectionSpec,

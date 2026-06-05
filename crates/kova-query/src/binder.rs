@@ -6,13 +6,15 @@
 //! v2 grows a context carrying the strict-schema registry.
 
 use crate::ast::{
-    AstAssignment, AstDelete, AstExpr, AstInsert, AstInsertSource, AstLiteral, AstPredicate,
-    AstStatement, AstUpdate, AstVacuum,
+    AstAssignment, AstDelete, AstExpr, AstInsert, AstInsertSource, AstLiteral, AstOrderBy,
+    AstPredicate, AstProjection, AstQuery, AstStatement, AstUpdate, AstVacuum,
+    OrderDir as AstOrderDir,
 };
 use crate::error::KovaQueryError;
 use crate::logical::{
-    BoundExpr, BoundLiteral, LogicalAssignment, LogicalDelete, LogicalInsert, LogicalInsertSource,
-    LogicalStatement, LogicalUpdate, LogicalVacuum, PredAtom, PredicateExpr,
+    BoundExpr, BoundLiteral, BoundProjection, LogicalAssignment, LogicalDelete, LogicalInsert,
+    LogicalInsertSource, LogicalQuery, LogicalStatement, LogicalUpdate, LogicalVacuum, OrderDir,
+    OrderingSpec, PredAtom, PredicateExpr, ProjectionSpec,
 };
 
 /// Canonical INSERT column shape. v1 accepts these three names, in
@@ -34,11 +36,11 @@ pub fn bind(ast: AstStatement) -> Result<LogicalStatement, KovaQueryError> {
         AstStatement::Insert(i) => bind_insert(i),
         AstStatement::Update(u) => bind_update(u),
         AstStatement::Delete(d) => bind_delete(d),
+        AstStatement::Select(q) => bind_select(q),
 
         // Filled in as each binder lands. Explicit arms (rather than
         // a `_` catchall) so the compiler complains the moment a new
         // AST variant is added without a binder.
-        AstStatement::Select(_) => unimplemented(StatementKind::Select),
         AstStatement::CreateIndex(_) => unimplemented(StatementKind::CreateIndex),
         AstStatement::DropIndex(_) => unimplemented(StatementKind::DropIndex),
     }
@@ -308,6 +310,154 @@ fn bind_literal(l: AstLiteral) -> BoundLiteral {
 }
 
 // =========================================================================
+// SELECT
+// =========================================================================
+
+/// Bind an [`AstQuery`] : projection list checks, predicate binding,
+/// ORDER BY direction validation, kNN-requires-LIMIT enforcement.
+fn bind_select(q: AstQuery) -> Result<LogicalStatement, KovaQueryError> {
+    let AstQuery {
+        projection,
+        from_table,
+        predicate,
+        order_by,
+        limit,
+    } = q;
+
+    let projection = bind_projection_list(projection)?;
+    let predicate = predicate.map(bind_predicate).transpose()?;
+    let ordering = bind_ordering(order_by)?;
+
+    // kNN queries (ordered by a distance expression) require LIMIT.
+    // Without it, the user has implicitly asked for the entire shard
+    // sorted by distance, which is rarely what they want and always
+    // expensive. Force them to be explicit.
+    let has_distance_ordering = ordering
+        .iter()
+        .any(|o| matches!(o, OrderingSpec::Distance { .. }));
+    if has_distance_ordering && limit.is_none() {
+        return Err(KovaQueryError::Bind(
+            "kNN queries (ORDER BY embedding <op> $q) require a LIMIT clause".into(),
+        ));
+    }
+
+    Ok(LogicalStatement::Query(LogicalQuery {
+        from_table,
+        projection,
+        predicate,
+        ordering,
+        limit,
+    }))
+}
+
+/// Validate projection-list-wide rules (wildcard appears alone),
+/// then translate each item individually.
+fn bind_projection_list(
+    items: Vec<AstProjection>,
+) -> Result<ProjectionSpec, KovaQueryError> {
+    let has_wildcard = items
+        .iter()
+        .any(|p| matches!(p, AstProjection::Wildcard));
+    if has_wildcard && items.len() > 1 {
+        return Err(KovaQueryError::Bind(
+            "SELECT * cannot appear alongside other projection items".into(),
+        ));
+    }
+    let columns: Result<Vec<_>, _> = items.into_iter().map(bind_projection_item).collect();
+    Ok(ProjectionSpec { columns: columns? })
+}
+
+/// Translate one projection item. Distance expressions without an
+/// alias are rejected here : there's no natural column name for a
+/// distance computation, and downstream code (projection serializer,
+/// gRPC response shape) needs every column to have a name.
+fn bind_projection_item(p: AstProjection) -> Result<BoundProjection, KovaQueryError> {
+    match p {
+        AstProjection::Wildcard => Ok(BoundProjection::Wildcard),
+        AstProjection::CountStar => Ok(BoundProjection::CountStar { alias: None }),
+        AstProjection::Id => Ok(BoundProjection::Id { alias: None }),
+        AstProjection::Metadata => Ok(BoundProjection::Metadata { alias: None }),
+        AstProjection::Field(name) => {
+            Ok(BoundProjection::MetadataField { name, alias: None })
+        }
+        AstProjection::DistanceExpr(_) => Err(KovaQueryError::Bind(
+            "distance expression in SELECT requires an alias (AS <name>)".into(),
+        )),
+        AstProjection::Aliased(inner, alias) => bind_aliased_projection(*inner, alias),
+    }
+}
+
+/// Translate `<projection> AS <alias>` by pushing the alias into the
+/// inner variant. Defensive rejects for shapes the grammar shouldn't
+/// produce (wildcard-with-alias, nested alias).
+fn bind_aliased_projection(
+    inner: AstProjection,
+    alias: String,
+) -> Result<BoundProjection, KovaQueryError> {
+    match inner {
+        AstProjection::Wildcard => Err(KovaQueryError::Bind(
+            "SELECT * cannot be aliased".into(),
+        )),
+        AstProjection::Aliased(_, _) => Err(KovaQueryError::Bind(
+            "nested aliases are not allowed (use only one AS)".into(),
+        )),
+        AstProjection::CountStar => Ok(BoundProjection::CountStar { alias: Some(alias) }),
+        AstProjection::Id => Ok(BoundProjection::Id { alias: Some(alias) }),
+        AstProjection::Metadata => Ok(BoundProjection::Metadata { alias: Some(alias) }),
+        AstProjection::DistanceExpr(d) => Ok(BoundProjection::Distance {
+            metric: d.metric,
+            param: d.param,
+            alias,
+        }),
+        AstProjection::Field(name) => Ok(BoundProjection::MetadataField {
+            name,
+            alias: Some(alias),
+        }),
+    }
+}
+
+/// Translate the ORDER BY list, item-by-item.
+fn bind_ordering(items: Vec<AstOrderBy>) -> Result<Vec<OrderingSpec>, KovaQueryError> {
+    items.into_iter().map(bind_ordering_item).collect()
+}
+
+/// Translate one ORDER BY item, enforcing the "distance is ASC-only"
+/// rule. Sorting by distance descending means "farthest first" which
+/// is almost never what the user actually wants ; the spec rejects
+/// it so a typo doesn't silently become a wrong answer.
+fn bind_ordering_item(item: AstOrderBy) -> Result<OrderingSpec, KovaQueryError> {
+    match item {
+        AstOrderBy::Distance(d, dir) => {
+            if matches!(dir, AstOrderDir::Desc) {
+                return Err(KovaQueryError::Bind(
+                    "ORDER BY <distance> only supports ASC ; \
+                     DESC would mean 'farthest first' which is rarely intentional"
+                        .into(),
+                ));
+            }
+            Ok(OrderingSpec::Distance {
+                metric: d.metric,
+                param: d.param,
+            })
+        }
+        AstOrderBy::Field(name, dir) => Ok(OrderingSpec::Field {
+            name,
+            dir: bind_order_dir(dir),
+        }),
+    }
+}
+
+/// Map the AST direction enum to the logical one. Same shape today ;
+/// two enums so future v2 changes (NULLS FIRST/LAST, etc.) on either
+/// side don't churn the other.
+fn bind_order_dir(d: AstOrderDir) -> OrderDir {
+    match d {
+        AstOrderDir::Asc => OrderDir::Asc,
+        AstOrderDir::Desc => OrderDir::Desc,
+    }
+}
+
+// =========================================================================
 // Not-yet-implemented helpers
 // =========================================================================
 
@@ -317,7 +467,6 @@ fn bind_literal(l: AstLiteral) -> BoundLiteral {
 /// is wired up.
 #[derive(Debug, Clone, Copy)]
 enum StatementKind {
-    Select,
     CreateIndex,
     DropIndex,
 }
@@ -353,10 +502,12 @@ mod tests {
     }
 
     /// Every statement type without a real binder yet must report a
-    /// clean Bind error, not panic. SELECT is the chosen probe today.
+    /// clean Bind error, not panic. CREATE INDEX is the chosen probe
+    /// today (v2-only DDL).
     #[test]
     fn unimplemented_variants_return_bind_error() {
-        let ast = parse_str("SELECT id FROM vectors").expect("parse Ok");
+        let ast = parse_str("CREATE INDEX idx ON vectors USING HASH (category)")
+            .expect("parse Ok");
         let err = bind(ast).expect_err("expected Bind error");
         assert!(
             matches!(err, KovaQueryError::Bind(_)),
@@ -717,5 +868,281 @@ mod tests {
         assert!(matches!(param, ParamRef::Positional(1)));
         assert_eq!(op, CmpOp::Lt);
         assert!((radius - 0.5).abs() < f32::EPSILON);
+    }
+
+    // ----- SELECT -----
+
+    #[test]
+    fn binds_select_star_carries_table() {
+        let ast = parse_str("SELECT * FROM vectors").expect("parse Ok");
+        let logical = bind(ast).expect("bind Ok");
+        let LogicalStatement::Query(q) = logical else {
+            panic!("expected Query");
+        };
+        assert_eq!(q.from_table, "vectors");
+        assert_eq!(q.projection.columns.len(), 1);
+        assert!(matches!(q.projection.columns[0], BoundProjection::Wildcard));
+        assert!(q.predicate.is_none());
+        assert!(q.ordering.is_empty());
+        assert_eq!(q.limit, None);
+    }
+
+    #[test]
+    fn binds_select_id_and_metadata_route_to_typed_variants() {
+        let ast = parse_str("SELECT id, metadata FROM vectors").expect("parse Ok");
+        let logical = bind(ast).expect("bind Ok");
+        let LogicalStatement::Query(q) = logical else {
+            panic!("expected Query");
+        };
+        assert!(matches!(
+            q.projection.columns[0],
+            BoundProjection::Id { alias: None }
+        ));
+        assert!(matches!(
+            q.projection.columns[1],
+            BoundProjection::Metadata { alias: None }
+        ));
+    }
+
+    #[test]
+    fn binds_select_regular_field_uses_metadata_field_variant() {
+        let ast = parse_str("SELECT category, year FROM vectors").expect("parse Ok");
+        let logical = bind(ast).expect("bind Ok");
+        let LogicalStatement::Query(q) = logical else {
+            panic!("expected Query");
+        };
+        let names: Vec<&str> = q
+            .projection
+            .columns
+            .iter()
+            .map(|p| match p {
+                BoundProjection::MetadataField { name, .. } => name.as_str(),
+                other => panic!("expected MetadataField, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(names, ["category", "year"]);
+    }
+
+    #[test]
+    fn binds_select_count_star_with_alias() {
+        let ast = parse_str("SELECT COUNT(*) AS n FROM vectors").expect("parse Ok");
+        let logical = bind(ast).expect("bind Ok");
+        let LogicalStatement::Query(q) = logical else {
+            panic!("expected Query");
+        };
+        let BoundProjection::CountStar { alias } = &q.projection.columns[0] else {
+            panic!("expected CountStar");
+        };
+        assert_eq!(alias.as_deref(), Some("n"));
+    }
+
+    #[test]
+    fn binds_select_distance_projection_with_alias() {
+        let ast = parse_str("SELECT embedding <-> $1 AS distance FROM vectors ORDER BY embedding <-> $1 LIMIT 10")
+            .expect("parse Ok");
+        let logical = bind(ast).expect("bind Ok");
+        let LogicalStatement::Query(q) = logical else {
+            panic!("expected Query");
+        };
+        let BoundProjection::Distance {
+            metric,
+            param,
+            alias,
+        } = &q.projection.columns[0]
+        else {
+            panic!("expected Distance projection");
+        };
+        assert_eq!(*metric, DistanceOp::L2);
+        assert!(matches!(param, ParamRef::Positional(1)));
+        assert_eq!(alias, "distance");
+    }
+
+    #[test]
+    fn binds_select_with_field_alias() {
+        let ast = parse_str("SELECT id AS row_id FROM vectors").expect("parse Ok");
+        let logical = bind(ast).expect("bind Ok");
+        let LogicalStatement::Query(q) = logical else {
+            panic!("expected Query");
+        };
+        let BoundProjection::Id { alias } = &q.projection.columns[0] else {
+            panic!("expected Id");
+        };
+        assert_eq!(alias.as_deref(), Some("row_id"));
+    }
+
+    #[test]
+    fn binds_select_with_where_clause() {
+        let ast = parse_str("SELECT id FROM vectors WHERE id = $1").expect("parse Ok");
+        let logical = bind(ast).expect("bind Ok");
+        let LogicalStatement::Query(q) = logical else {
+            panic!("expected Query");
+        };
+        assert!(matches!(
+            q.predicate,
+            Some(PredicateExpr::Atom(PredAtom::Eq { .. }))
+        ));
+    }
+
+    #[test]
+    fn binds_select_with_order_by_field_desc() {
+        let ast = parse_str("SELECT id FROM vectors ORDER BY year DESC").expect("parse Ok");
+        let logical = bind(ast).expect("bind Ok");
+        let LogicalStatement::Query(q) = logical else {
+            panic!("expected Query");
+        };
+        assert_eq!(q.ordering.len(), 1);
+        let OrderingSpec::Field { name, dir } = &q.ordering[0] else {
+            panic!("expected Field ordering");
+        };
+        assert_eq!(name, "year");
+        assert_eq!(*dir, OrderDir::Desc);
+    }
+
+    #[test]
+    fn binds_select_with_multiple_order_by_keys() {
+        let ast =
+            parse_str("SELECT id FROM vectors ORDER BY year DESC, score ASC").expect("parse Ok");
+        let logical = bind(ast).expect("bind Ok");
+        let LogicalStatement::Query(q) = logical else {
+            panic!("expected Query");
+        };
+        assert_eq!(
+            q.ordering.len(),
+            2,
+            "multi-key ordering survives binding (v1 ships this)"
+        );
+    }
+
+    #[test]
+    fn binds_select_with_distance_ordering_and_limit() {
+        let ast = parse_str("SELECT id FROM vectors ORDER BY embedding <-> $1 LIMIT 10")
+            .expect("parse Ok");
+        let logical = bind(ast).expect("bind Ok");
+        let LogicalStatement::Query(q) = logical else {
+            panic!("expected Query");
+        };
+        let OrderingSpec::Distance { metric, param } = &q.ordering[0] else {
+            panic!("expected Distance ordering");
+        };
+        assert_eq!(*metric, DistanceOp::L2);
+        assert!(matches!(param, ParamRef::Positional(1)));
+        assert_eq!(q.limit, Some(10));
+    }
+
+    #[test]
+    fn binds_select_full_hybrid_query() {
+        let ast = parse_str(
+            "SELECT id, embedding <-> $1 AS distance, metadata FROM vectors \
+             WHERE category = 'docs' AND year >= 2024 \
+             ORDER BY embedding <-> $1 LIMIT 10",
+        )
+        .expect("parse Ok");
+        let logical = bind(ast).expect("bind Ok");
+        let LogicalStatement::Query(q) = logical else {
+            panic!("expected Query");
+        };
+        assert_eq!(q.from_table, "vectors");
+        assert_eq!(q.projection.columns.len(), 3);
+        assert!(matches!(q.projection.columns[0], BoundProjection::Id { .. }));
+        assert!(matches!(q.projection.columns[1], BoundProjection::Distance { .. }));
+        assert!(matches!(q.projection.columns[2], BoundProjection::Metadata { .. }));
+        assert!(matches!(q.predicate, Some(PredicateExpr::And(_))));
+        assert_eq!(q.ordering.len(), 1);
+        assert_eq!(q.limit, Some(10));
+    }
+
+    // ----- SELECT : rejection paths -----
+
+    #[test]
+    fn rejects_select_wildcard_with_other_items() {
+        // Parser allows the shape ; binder rejects.
+        // Constructed by hand because `*, id` parses as wildcard+select_item which
+        // the parser's select_list grammar accepts.
+        let ast = AstStatement::Select(AstQuery {
+            projection: vec![AstProjection::Wildcard, AstProjection::Id],
+            from_table: "vectors".into(),
+            predicate: None,
+            order_by: vec![],
+            limit: None,
+        });
+        let err = bind(ast).expect_err("expected Bind error");
+        let KovaQueryError::Bind(msg) = err else {
+            panic!("expected Bind, got {err:?}");
+        };
+        assert!(
+            msg.contains("cannot appear alongside"),
+            "message should call out wildcard collision : {msg}"
+        );
+    }
+
+    #[test]
+    fn rejects_select_distance_projection_without_alias() {
+        // Construct by hand : the parser's select_item accepts the
+        // distance form without alias, the binder rejects.
+        let ast = AstStatement::Select(AstQuery {
+            projection: vec![AstProjection::DistanceExpr(crate::ast::AstDistance {
+                metric: DistanceOp::L2,
+                param: ParamRef::Positional(1),
+            })],
+            from_table: "vectors".into(),
+            predicate: None,
+            order_by: vec![],
+            limit: Some(10),
+        });
+        let err = bind(ast).expect_err("expected Bind error");
+        let KovaQueryError::Bind(msg) = err else {
+            panic!("expected Bind, got {err:?}");
+        };
+        assert!(
+            msg.contains("requires an alias"),
+            "message should ask for alias : {msg}"
+        );
+    }
+
+    #[test]
+    fn rejects_distance_ordering_with_desc() {
+        let ast = AstStatement::Select(AstQuery {
+            projection: vec![AstProjection::Id],
+            from_table: "vectors".into(),
+            predicate: None,
+            order_by: vec![AstOrderBy::Distance(
+                crate::ast::AstDistance {
+                    metric: DistanceOp::L2,
+                    param: ParamRef::Positional(1),
+                },
+                AstOrderDir::Desc,
+            )],
+            limit: Some(10),
+        });
+        let err = bind(ast).expect_err("expected Bind error");
+        let KovaQueryError::Bind(msg) = err else {
+            panic!("expected Bind, got {err:?}");
+        };
+        assert!(
+            msg.contains("ASC"),
+            "message should call out ASC-only rule : {msg}"
+        );
+    }
+
+    #[test]
+    fn rejects_knn_query_without_limit() {
+        let ast = parse_str("SELECT id FROM vectors ORDER BY embedding <-> $1")
+            .expect("parse Ok");
+        let err = bind(ast).expect_err("expected Bind error");
+        let KovaQueryError::Bind(msg) = err else {
+            panic!("expected Bind, got {err:?}");
+        };
+        assert!(
+            msg.contains("LIMIT"),
+            "message should call out missing LIMIT : {msg}"
+        );
+    }
+
+    #[test]
+    fn binds_select_without_distance_ordering_no_limit_ok() {
+        // A query with field ordering doesn't need LIMIT — only kNN
+        // queries do. `ORDER BY year DESC` (without LIMIT) binds fine.
+        let ast = parse_str("SELECT id FROM vectors ORDER BY year DESC").expect("parse Ok");
+        assert!(bind(ast).is_ok());
     }
 }
