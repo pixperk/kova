@@ -16,11 +16,11 @@ with gRPC between nodes. Every byte, every index, every network call is ours.
 | `kova-core`    | shipped     | `Vector`, `Distance` trait + `Cosine` / `L2` / `InnerProduct` (SIMD)   |
 | `kova-index`   | shipped     | `Index` trait, `FlatIndex` baseline, `HnswIndex` (insert + search + two-pass vacuum + streaming snapshot) |
 | `kova-storage` | shipped     | Segmented WAL, `MmapVectorStore` (free-list slot reuse, crash-mid-init recovery), `FileMetadataStore`, `atomic_write` (+ streaming variant), `Manifest` commit point, `Shard` (log-then-mutate, batched inserts, logical delete, vacuum, checkpoint + WAL truncate, generation-numbered snapshots). SIGKILL-tested across 55,697 acks and 962 checkpoints. |
-| `kova-query`   | not started | KQL parser, planner, executor                                          |
+| `kova-query`   | in progress | KQL parser (Pest grammar for all 8 statements : SELECT / INSERT / UPDATE / DELETE / VACUUM / CHECKPOINT / CREATE / DROP INDEX), pretty-printer with round-trip property tests, binder (AST -> typed LogicalStatement with predicate translation, embedding-immutability rejection, kNN-requires-LIMIT enforcement). Executor next. |
 | `kova-cluster` | not started | Consistent hashing, quorum replication, coordinator                    |
 | `kova-server`  | not started | gRPC node binary                                                       |
 
-234 tests passing across the workspace; `cargo clippy --workspace --all-targets -- -D warnings` clean.
+416 tests passing across the workspace; `cargo clippy --workspace --all-targets -- -D warnings` clean.
 
 ## Build
 
@@ -603,25 +603,81 @@ The test `vector_deserialize_rejects_nan` enforces this : if anyone
 "simplifies" by switching to `#[derive(Deserialize)]`, that test fails
 immediately.
 
-## Coming up : `kova-query`
+### `kova-query` is four IRs, not one
 
-The storage layer is closed out. Next milestone is **KQL**, a
-SQL-inspired query language for hybrid searches that combine vector
-similarity with metadata predicates :
+The query pipeline is `String -> AstStatement -> LogicalStatement ->
+PhysicalPlan -> Rows`, four distinct intermediate representations
+with one transformation between each. Looks like overkill for a v1
+query engine ; it's not.
+
+Each IR has exactly one job. The **AST** captures what the user
+wrote, syntax-faithful and permissive enough to accept semantically-
+wrong shapes (the parser doesn't know what fields exist, so it can't
+type-check). The **LogicalStatement** captures what the user meant,
+after field resolution, type checks, and predicate normalisation
+(`IS NULL` becomes `NOT IsNotNull` so downstream code only handles
+one shape ; embedding-update attempts are rejected here, not at
+runtime). The **PhysicalPlan** is the operator tree the executor
+walks, with the planner's strategy choice baked in. **Rows** are
+what comes out.
+
+Two upsides from the layering :
+
+- Each transformation has its own test surface. Parser tests use
+  source strings ; binder tests construct ASTs by hand and check
+  semantic rejections ; planner tests construct LogicalStatements
+  and assert which physical plan came out. Failures are local to
+  one layer, not smeared across the whole pipeline.
+- The boundaries are stable contracts. Grammar changes don't churn
+  the planner ; planner cost-model changes don't churn the parser.
+  Adding the binder didn't move anything else.
+
+The "carry the table name through" rule is the load-bearing
+discipline. The parser sees `VACUUM my_shard`, parses to
+`AstVacuum { table: "my_shard" }`, the binder produces
+`LogicalVacuum { table: "my_shard" }`, the executor matches against
+its `Shard` catalog. The binder does NOT hardcode `"vectors"` and
+reject anything else, even though v1 only has one table : that
+would freeze a deployment decision into the language layer. Runtime
+data (what tables exist, what indexes are built) belongs at the
+runtime layer. Catching this early saves a multi-week refactor in
+month 6.
+
+## `kova-query` : KQL
+
+KQL is the SQL-shaped language for hybrid vector + metadata workloads.
+Full surface : SELECT (kNN search with predicates), INSERT / UPDATE /
+DELETE (DML), VACUUM / CHECKPOINT (management). Sample shape :
 
 ```sql
-SELECT id, distance FROM vectors
+SELECT id, embedding <-> $query AS distance, metadata
+FROM vectors
 WHERE category = 'docs' AND year >= 2024
 ORDER BY embedding <-> $query LIMIT 10
 ```
 
-Pest grammar, planner that picks pre-filter vs post-filter based on
-estimated selectivity, executor that walks plans against the existing
-`Shard` API. The interesting work is the planner : at low selectivity
-pre-filtering (scan metadata, then exact-distance the matches) beats
-ANN ; at high selectivity post-filtering (run ANN, then drop
-non-matches) wins. The crossover depends on `k`, recall target, and
-metadata index shape.
+What's landed :
+
+- **Parser** : Pest grammar for all 8 statement types, atom-level
+  predicate tree with proper precedence (`OR < AND < NOT < atom`),
+  three distance operators (`<->` L2, `<=>` cosine, `<#>` inner),
+  six comparison ops, parametric values (positional `$1` and named
+  `$query`), and reserved-keyword handling that prevents `SELECT ON
+  FROM vectors`-style collisions.
+- **Pretty-printer** with round-trip property tests :
+  `parse → print → parse → print` is idempotent across every
+  statement and predicate shape.
+- **Binder** : AST -> typed `LogicalStatement` with predicate
+  translation, `IS NULL` normalised to `NOT IsNotNull`, single-id
+  hint detection for DELETE, hard rejects for embedding mutation
+  (`UPDATE SET embedding = ...`), distance ordering with `DESC`,
+  kNN queries without LIMIT, and v2-only DDL (CREATE / DROP INDEX).
+
+What's next : **executor**. Wire the LogicalStatement through to
+`Shard` for the write path first (INSERT / DELETE-by-id / VACUUM /
+CHECKPOINT) so end-to-end KQL works, then add the read planner
+(scan vs index, post-filter vs pre-filter vs soft-filtered ANN) so
+hybrid queries actually run.
 
 ## Longer-term scope
 
