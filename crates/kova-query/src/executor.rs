@@ -131,6 +131,14 @@ pub enum ExecutionResult {
         /// Number of tombstoned nodes removed.
         removed: usize,
     },
+    /// INSERT completed ; `inserted` rows landed in `table`.
+    Insert {
+        /// Target table the operation ran against.
+        table: String,
+        /// Number of rows that landed (1 for single-row, batch length
+        /// for batch).
+        inserted: u64,
+    },
 }
 
 /// Top-level KQL execution engine. Owns a file-backed [`Shard`] and
@@ -211,14 +219,14 @@ impl<D: Distance> Engine<D> {
     //
     // `params` is borrowed (not consumed) so the executor can resolve
     // multiple slots from the same set within a single op. `plan` is
-    // taken by value : today only CHECKPOINT (carries no payload) is
-    // implemented ; future arms move fields out of the operator
-    // payload, which is why the by-value shape is right.
+    // taken by value : every arm that carries payload data moves
+    // fields out of the operator (the `table` strings, the `ParamRef`s,
+    // etc.).
     #[allow(clippy::needless_pass_by_value)]
     fn execute(
         &mut self,
         plan: PhysicalPlan,
-        _params: &ParamBindings,
+        params: &ParamBindings,
     ) -> Result<ExecutionResult, KovaQueryError> {
         match plan {
             PhysicalPlan::Checkpoint => {
@@ -236,6 +244,36 @@ impl<D: Distance> Engine<D> {
                     .map_err(|e| KovaQueryError::Backend(Box::new(e)))?;
                 Ok(ExecutionResult::Vacuum { table, removed })
             }
+            PhysicalPlan::InsertOne {
+                table,
+                id: id_ref,
+                embedding: emb_ref,
+                metadata: meta_ref,
+            } => {
+                self.assert_table(&table)?;
+                let id = expect_id(params.resolve(&id_ref)?, "id")?;
+                let embedding = expect_vector(params.resolve(&emb_ref)?, "embedding")?;
+                let metadata = expect_metadata(params.resolve(&meta_ref)?, "metadata")?;
+                self.shard
+                    .insert(id, embedding, metadata)
+                    .map_err(|e| KovaQueryError::Backend(Box::new(e)))?;
+                Ok(ExecutionResult::Insert {
+                    table,
+                    inserted: 1,
+                })
+            }
+            PhysicalPlan::InsertMany {
+                table,
+                batch: batch_ref,
+            } => {
+                self.assert_table(&table)?;
+                let batch = expect_batch(params.resolve(&batch_ref)?, "batch")?;
+                let inserted = batch.len() as u64;
+                self.shard
+                    .insert_many(batch)
+                    .map_err(|e| KovaQueryError::Backend(Box::new(e)))?;
+                Ok(ExecutionResult::Insert { table, inserted })
+            }
         }
     }
 
@@ -251,6 +289,81 @@ impl<D: Distance> Engine<D> {
                 self.table_name
             )))
         }
+    }
+}
+
+// =========================================================================
+// Param-value extractors
+// =========================================================================
+//
+// Each `expect_<kind>` pulls a specific [`ParamValue`] variant out of
+// a resolved binding and errors cleanly when the caller passed the
+// wrong type. The slot name is threaded through so error messages
+// identify which parameter slot was wrong (e.g., "parameter slot
+// 'embedding' expects Vector, got Id"). Reduces user-facing
+// debugging time by one round-trip.
+
+/// Extract a [`VectorId`] from a resolved [`ParamValue`]. `VectorId`
+/// is `Copy`, so no clone.
+fn expect_id(value: &ParamValue, slot: &str) -> Result<VectorId, KovaQueryError> {
+    match value {
+        ParamValue::Id(id) => Ok(*id),
+        other => Err(KovaQueryError::Execution(format!(
+            "parameter slot '{slot}' expects Id, got {}",
+            param_value_kind(other)
+        ))),
+    }
+}
+
+/// Extract a [`Vector`] from a resolved [`ParamValue`]. Clones the
+/// inner `Vec<f32>` because `Shard::insert` consumes by value.
+/// v2 may take ownership through the binding to skip the clone.
+fn expect_vector(value: &ParamValue, slot: &str) -> Result<Vector, KovaQueryError> {
+    match value {
+        ParamValue::Vector(v) => Ok(v.clone()),
+        other => Err(KovaQueryError::Execution(format!(
+            "parameter slot '{slot}' expects Vector, got {}",
+            param_value_kind(other)
+        ))),
+    }
+}
+
+/// Extract a [`Metadata`] from a resolved [`ParamValue`]. Clones.
+fn expect_metadata(value: &ParamValue, slot: &str) -> Result<Metadata, KovaQueryError> {
+    match value {
+        ParamValue::Metadata(m) => Ok(m.clone()),
+        other => Err(KovaQueryError::Execution(format!(
+            "parameter slot '{slot}' expects Metadata, got {}",
+            param_value_kind(other)
+        ))),
+    }
+}
+
+/// Extract a batch (`Vec<(VectorId, Vector, Metadata)>`) from a
+/// resolved [`ParamValue`]. Clones the entire array — expensive
+/// for large batches but correct ; the v2 optimisation is to
+/// consume `ParamBindings` by value into `execute`.
+fn expect_batch(
+    value: &ParamValue,
+    slot: &str,
+) -> Result<Vec<(VectorId, Vector, Metadata)>, KovaQueryError> {
+    match value {
+        ParamValue::Batch(b) => Ok(b.clone()),
+        other => Err(KovaQueryError::Execution(format!(
+            "parameter slot '{slot}' expects Batch, got {}",
+            param_value_kind(other)
+        ))),
+    }
+}
+
+/// Static label for each [`ParamValue`] variant ; used to build
+/// helpful "got X, expected Y" error messages.
+fn param_value_kind(value: &ParamValue) -> &'static str {
+    match value {
+        ParamValue::Id(_) => "Id",
+        ParamValue::Vector(_) => "Vector",
+        ParamValue::Metadata(_) => "Metadata",
+        ParamValue::Batch(_) => "Batch",
     }
 }
 
@@ -330,8 +443,8 @@ mod tests {
         assert!(matches!(err, KovaQueryError::Bind(_)));
     }
 
-    /// Statements without an executor arm yet (INSERT, UPDATE, etc.)
-    /// report a clean Plan error.
+    /// Statements without an executor arm yet (UPDATE, DELETE,
+    /// SELECT) report a clean Plan error.
     #[test]
     fn execute_str_propagates_plan_error_for_unimplemented() {
         let dir = tempdir().expect("tempdir");
@@ -339,7 +452,7 @@ mod tests {
         let mut engine = Engine::new(shard, "vectors");
         let err = engine
             .execute_str(
-                "INSERT INTO vectors (id, embedding, metadata) VALUES ($1, $2, $3)",
+                "UPDATE vectors SET metadata = $1 WHERE id = $2",
                 ParamBindings::empty(),
             )
             .expect_err("expected error");
@@ -485,5 +598,200 @@ mod tests {
             .resolve(&ParamRef::Positional(0))
             .expect_err("expected error");
         assert!(matches!(err, KovaQueryError::Execution(_)));
+    }
+
+    // ----- INSERT -----
+
+    fn make_engine(dir: &tempfile::TempDir) -> Engine<L2> {
+        let shard = Shard::open(dir.path(), 4, L2, HnswParams::default()).expect("Shard::open");
+        Engine::new(shard, "vectors")
+    }
+
+    fn unit_vec() -> Vector {
+        Vector::try_new(vec![1.0, 0.0, 0.0, 0.0]).expect("non-empty")
+    }
+
+    #[test]
+    fn executes_insert_one_with_positional_params() {
+        let dir = tempdir().expect("tempdir");
+        let mut engine = make_engine(&dir);
+        let params = ParamBindings::empty()
+            .with_positional(ParamValue::Id(VectorId::new(42)))
+            .with_positional(ParamValue::Vector(unit_vec()))
+            .with_positional(ParamValue::Metadata(Metadata::new()));
+        let result = engine
+            .execute_str(
+                "INSERT INTO vectors (id, embedding, metadata) VALUES ($1, $2, $3)",
+                params,
+            )
+            .expect("execute_str");
+        let ExecutionResult::Insert { table, inserted } = result else {
+            panic!("expected Insert, got {result:?}");
+        };
+        assert_eq!(table, "vectors");
+        assert_eq!(inserted, 1);
+        // The shard now holds the id.
+        assert!(engine.shard().contains(VectorId::new(42)));
+    }
+
+    #[test]
+    fn executes_insert_one_with_named_params() {
+        let dir = tempdir().expect("tempdir");
+        let mut engine = make_engine(&dir);
+        let params = ParamBindings::empty()
+            .with_named("id", ParamValue::Id(VectorId::new(7)))
+            .with_named("vec", ParamValue::Vector(unit_vec()))
+            .with_named("meta", ParamValue::Metadata(Metadata::new()));
+        engine
+            .execute_str(
+                "INSERT INTO vectors (id, embedding, metadata) VALUES ($id, $vec, $meta)",
+                params,
+            )
+            .expect("execute_str");
+        assert!(engine.shard().contains(VectorId::new(7)));
+    }
+
+    #[test]
+    fn executes_insert_many_batch() {
+        let dir = tempdir().expect("tempdir");
+        let mut engine = make_engine(&dir);
+        let batch: Vec<(VectorId, Vector, Metadata)> = (1..=5u16)
+            .map(|i| {
+                (
+                    VectorId::new(u64::from(i)),
+                    Vector::try_new(vec![f32::from(i), 0.0, 0.0, 0.0]).unwrap(),
+                    Metadata::new(),
+                )
+            })
+            .collect();
+        let params = ParamBindings::empty().with_positional(ParamValue::Batch(batch));
+        let result = engine
+            .execute_str(
+                "INSERT INTO vectors (id, embedding, metadata) VALUES $1",
+                params,
+            )
+            .expect("execute_str");
+        let ExecutionResult::Insert { inserted, .. } = result else {
+            panic!("expected Insert");
+        };
+        assert_eq!(inserted, 5);
+        for i in 1..=5u64 {
+            assert!(engine.shard().contains(VectorId::new(i)));
+        }
+    }
+
+    #[test]
+    fn rejects_insert_unbound_param() {
+        let dir = tempdir().expect("tempdir");
+        let mut engine = make_engine(&dir);
+        // Only bind $1 ; $2 and $3 are missing.
+        let params = ParamBindings::empty().with_positional(ParamValue::Id(VectorId::new(1)));
+        let err = engine
+            .execute_str(
+                "INSERT INTO vectors (id, embedding, metadata) VALUES ($1, $2, $3)",
+                params,
+            )
+            .expect_err("expected error");
+        let KovaQueryError::Execution(msg) = err else {
+            panic!("expected Execution, got {err:?}");
+        };
+        assert!(msg.contains("not bound"));
+    }
+
+    #[test]
+    fn rejects_insert_with_wrong_param_type() {
+        let dir = tempdir().expect("tempdir");
+        let mut engine = make_engine(&dir);
+        // Bind $1 (the id slot) to a Vector ; type mismatch.
+        let params = ParamBindings::empty()
+            .with_positional(ParamValue::Vector(unit_vec()))
+            .with_positional(ParamValue::Vector(unit_vec()))
+            .with_positional(ParamValue::Metadata(Metadata::new()));
+        let err = engine
+            .execute_str(
+                "INSERT INTO vectors (id, embedding, metadata) VALUES ($1, $2, $3)",
+                params,
+            )
+            .expect_err("expected error");
+        let KovaQueryError::Execution(msg) = err else {
+            panic!("expected Execution, got {err:?}");
+        };
+        assert!(
+            msg.contains("expects Id") && msg.contains("got Vector"),
+            "message should pinpoint the type mismatch : {msg}"
+        );
+    }
+
+    #[test]
+    fn rejects_insert_into_unknown_table() {
+        let dir = tempdir().expect("tempdir");
+        let mut engine = make_engine(&dir);
+        let params = ParamBindings::empty()
+            .with_positional(ParamValue::Id(VectorId::new(1)))
+            .with_positional(ParamValue::Vector(unit_vec()))
+            .with_positional(ParamValue::Metadata(Metadata::new()));
+        let err = engine
+            .execute_str(
+                "INSERT INTO products (id, embedding, metadata) VALUES ($1, $2, $3)",
+                params,
+            )
+            .expect_err("expected error");
+        assert!(matches!(err, KovaQueryError::Execution(_)));
+    }
+
+    #[test]
+    fn rejects_insert_duplicate_id() {
+        let dir = tempdir().expect("tempdir");
+        let mut engine = make_engine(&dir);
+        let bindings = || {
+            ParamBindings::empty()
+                .with_positional(ParamValue::Id(VectorId::new(99)))
+                .with_positional(ParamValue::Vector(unit_vec()))
+                .with_positional(ParamValue::Metadata(Metadata::new()))
+        };
+        engine
+            .execute_str(
+                "INSERT INTO vectors (id, embedding, metadata) VALUES ($1, $2, $3)",
+                bindings(),
+            )
+            .expect("first insert");
+        let err = engine
+            .execute_str(
+                "INSERT INTO vectors (id, embedding, metadata) VALUES ($1, $2, $3)",
+                bindings(),
+            )
+            .expect_err("expected duplicate-id error");
+        // The duplicate comes from the Shard, so it bubbles up as Backend.
+        assert!(matches!(err, KovaQueryError::Backend(_)));
+    }
+
+    /// The end-to-end M1.3 milestone test : INSERT through KQL,
+    /// CHECKPOINT through KQL, drop the engine, reopen the shard
+    /// from disk, verify the insert survived. Writes work through
+    /// the language and survive a process boundary.
+    #[test]
+    fn end_to_end_insert_then_checkpoint_then_reopen_survives() {
+        let dir = tempdir().expect("tempdir");
+        {
+            let mut engine = make_engine(&dir);
+            engine
+                .execute_str(
+                    "INSERT INTO vectors (id, embedding, metadata) VALUES ($1, $2, $3)",
+                    ParamBindings::empty()
+                        .with_positional(ParamValue::Id(VectorId::new(123)))
+                        .with_positional(ParamValue::Vector(unit_vec()))
+                        .with_positional(ParamValue::Metadata(Metadata::new())),
+                )
+                .expect("insert");
+            engine
+                .execute_str("CHECKPOINT", ParamBindings::empty())
+                .expect("checkpoint");
+        } // Engine drops, Shard drops, files close.
+
+        // Reopen the shard from the same directory ; the insert
+        // should be durable.
+        let shard = Shard::open(dir.path(), 4, L2, HnswParams::default()).expect("reopen");
+        let engine = Engine::new(shard, "vectors");
+        assert!(engine.shard().contains(VectorId::new(123)));
     }
 }

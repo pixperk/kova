@@ -8,6 +8,8 @@
 //! Operators land incrementally. CHECKPOINT is first ; INSERT /
 //! DELETE / VACUUM / SELECT follow.
 
+use crate::ast::ParamRef;
+
 /// Physical operator. v1 grows this enum as each statement gets its
 /// executor support. Explicit variants (no catchall) so the executor's
 /// dispatch is exhaustive and the compiler complains when an arm goes
@@ -24,5 +26,27 @@ pub enum PhysicalPlan {
     Vacuum {
         /// Target table name (validated against the engine's shard).
         table: String,
+    },
+    /// Single-row INSERT. Three parameter slots ; the executor
+    /// resolves each one against the caller's [`crate::executor::ParamBindings`]
+    /// and dispatches to `Shard::insert`.
+    InsertOne {
+        /// Target table.
+        table: String,
+        /// Parameter slot for the row's `id`.
+        id: ParamRef,
+        /// Parameter slot for the row's `embedding` vector.
+        embedding: ParamRef,
+        /// Parameter slot for the row's `metadata` bag.
+        metadata: ParamRef,
+    },
+    /// Batch INSERT. One parameter slot bound to an array of
+    /// `(id, embedding, metadata)` tuples ; dispatches to
+    /// `Shard::insert_many` for a single WAL group-commit fsync.
+    InsertMany {
+        /// Target table.
+        table: String,
+        /// Parameter slot for the batch array.
+        batch: ParamRef,
     },
 }
