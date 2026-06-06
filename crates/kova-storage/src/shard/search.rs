@@ -1,6 +1,6 @@
 //! `Shard::search` : k-nearest with metadata attached to each hit.
 
-use kova_core::{MetadataStore, Vector, VectorStore};
+use kova_core::{Metadata, MetadataStore, Vector, VectorId, VectorStore};
 use kova_index::Index;
 
 use crate::Wal;
@@ -39,6 +39,29 @@ where
             })
             .collect();
         Ok(results)
+    }
+
+    /// Scan metadata for live (non-tombstoned) ids whose bag passes
+    /// `predicate`. The predicate borrows each metadata, so the walk
+    /// avoids per-row clones.
+    ///
+    /// This is the v1 plan-B / DELETE-by-predicate primitive : a
+    /// full O(N) scan of the in-memory metadata store, no index.
+    /// v2 swaps to index-driven `RoaringBitmap` composition once
+    /// secondary indexes ship.
+    ///
+    /// Returns ids in implementation-defined order. Tombstoned ids
+    /// (deleted-but-not-vacuumed rows) are filtered out so callers
+    /// never see logically-gone rows.
+    pub fn scan_metadata<F>(&self, predicate: F) -> Vec<VectorId>
+    where
+        F: FnMut(&Metadata) -> bool,
+    {
+        self.metadata
+            .scan_ids(predicate)
+            .into_iter()
+            .filter(|id| !self.index.is_tombstoned(*id))
+            .collect()
     }
 }
 
@@ -212,5 +235,54 @@ mod tests {
         let returned_ids: Vec<_> = hits.iter().map(|h| h.id).collect();
         assert!(!returned_ids.contains(&id(1)), "tombstoned id 1 surfaced");
         assert!(returned_ids.contains(&id(2)) || returned_ids.contains(&id(3)));
+    }
+
+    // ----- scan_metadata -----
+
+    #[test]
+    fn scan_metadata_returns_matching_ids() {
+        let mut shard = fresh_in_memory();
+        for (i, tag) in [(1_u16, "a"), (2_u16, "b"), (3_u16, "a")] {
+            shard
+                .insert(id(u64::from(i)), v(vec![f32::from(i), 0.0]), tag_meta(tag))
+                .unwrap();
+        }
+        let mut got =
+            shard.scan_metadata(|m| matches!(m.get("tag"), Some(Value::String(s)) if s == "a"));
+        got.sort_by_key(|v| v.get());
+        assert_eq!(got, vec![id(1), id(3)]);
+    }
+
+    #[test]
+    fn scan_metadata_skips_tombstoned_ids() {
+        let mut shard = fresh_in_memory();
+        shard
+            .insert(id(1), v(vec![1.0, 0.0]), tag_meta("docs"))
+            .unwrap();
+        shard
+            .insert(id(2), v(vec![0.0, 1.0]), tag_meta("docs"))
+            .unwrap();
+        shard.delete(id(1)).unwrap();
+
+        let got =
+            shard.scan_metadata(|m| matches!(m.get("tag"), Some(Value::String(s)) if s == "docs"));
+        assert_eq!(got, vec![id(2)], "tombstoned id 1 must not appear");
+    }
+
+    #[test]
+    fn scan_metadata_with_no_matches_returns_empty() {
+        let mut shard = fresh_in_memory();
+        shard
+            .insert(id(1), v(vec![1.0, 0.0]), tag_meta("a"))
+            .unwrap();
+        let got =
+            shard.scan_metadata(|m| matches!(m.get("tag"), Some(Value::String(s)) if s == "ghost"));
+        assert!(got.is_empty());
+    }
+
+    #[test]
+    fn scan_metadata_on_empty_shard_returns_empty() {
+        let shard = fresh_in_memory();
+        assert!(shard.scan_metadata(|_| true).is_empty());
     }
 }

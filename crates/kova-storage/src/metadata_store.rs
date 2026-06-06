@@ -165,6 +165,17 @@ impl MetadataStore for FileMetadataStore {
         self.entries.len()
     }
 
+    fn scan_ids<F>(&self, mut pred: F) -> Vec<VectorId>
+    where
+        F: FnMut(&Metadata) -> bool,
+    {
+        self.entries
+            .iter()
+            .filter(|(_, m)| pred(m))
+            .map(|(id, _)| *id)
+            .collect()
+    }
+
     /// Apply many puts as a single flush.
     ///
     /// The default trait impl calls [`Self::put`] N times, which for

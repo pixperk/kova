@@ -105,6 +105,23 @@ pub trait MetadataStore {
         }
         Ok(())
     }
+
+    /// Walk all `(id, metadata)` pairs in the store, returning the
+    /// ids whose metadata satisfies `pred`. The predicate borrows
+    /// each metadata bag (no clones), making this much cheaper than
+    /// calling [`Self::get`] in a loop.
+    ///
+    /// Order is implementation-defined ; callers that need a specific
+    /// order must sort the result.
+    ///
+    /// # Object safety
+    /// The generic closure parameter makes this method callable only
+    /// when `Self: Sized`. Trait-object callers must walk through
+    /// [`Self::get`] explicitly.
+    fn scan_ids<F>(&self, pred: F) -> Vec<VectorId>
+    where
+        F: FnMut(&Metadata) -> bool,
+        Self: Sized;
 }
 
 /// Trivial in-memory [`MetadataStore`] backed by a `HashMap`.
@@ -143,6 +160,17 @@ impl MetadataStore for InMemoryMetadataStore {
 
     fn len(&self) -> usize {
         self.entries.len()
+    }
+
+    fn scan_ids<F>(&self, mut pred: F) -> Vec<VectorId>
+    where
+        F: FnMut(&Metadata) -> bool,
+    {
+        self.entries
+            .iter()
+            .filter(|(_, m)| pred(m))
+            .map(|(id, _)| *id)
+            .collect()
     }
 }
 
@@ -238,5 +266,53 @@ mod tests {
         let bytes = bincode::serialize(&meta).unwrap();
         let back: Metadata = bincode::deserialize(&bytes).unwrap();
         assert_eq!(back, meta);
+    }
+
+    #[test]
+    fn scan_ids_returns_matching_entries() {
+        let mut store = InMemoryMetadataStore::new();
+        for i in 1..=5_u64 {
+            let mut m = Metadata::new();
+            m.insert(
+                "category".into(),
+                Value::String(if i % 2 == 0 {
+                    "even".into()
+                } else {
+                    "odd".into()
+                }),
+            );
+            store.put(id(i), m).unwrap();
+        }
+        let mut matches =
+            store.scan_ids(|m| matches!(m.get("category"), Some(Value::String(s)) if s == "even"));
+        matches.sort_by_key(|v| v.get());
+        assert_eq!(matches, vec![id(2), id(4)]);
+    }
+
+    #[test]
+    fn scan_ids_on_empty_store_returns_empty() {
+        let store = InMemoryMetadataStore::new();
+        let matches = store.scan_ids(|_| true);
+        assert!(matches.is_empty());
+    }
+
+    #[test]
+    fn scan_ids_with_always_false_predicate_returns_empty() {
+        let mut store = InMemoryMetadataStore::new();
+        store.put(id(1), sample_meta()).unwrap();
+        store.put(id(2), sample_meta()).unwrap();
+        let matches = store.scan_ids(|_| false);
+        assert!(matches.is_empty());
+    }
+
+    #[test]
+    fn scan_ids_does_not_clone_metadata() {
+        // The predicate gets `&Metadata`, so it can inspect the bag
+        // without forcing an allocation. The store's `entries` field
+        // still owns the data after the scan.
+        let mut store = InMemoryMetadataStore::new();
+        store.put(id(1), sample_meta()).unwrap();
+        let _ = store.scan_ids(|_| true);
+        assert!(store.contains(id(1)));
     }
 }
