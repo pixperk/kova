@@ -34,6 +34,15 @@ pub enum Record {
         /// replay (each id is applied independently).
         ids: Vec<VectorId>,
     },
+    /// Replace the metadata bag attached to `id`. The vector and
+    /// graph node are untouched ; only the metadata store mutates.
+    /// Replay re-applies the assignment idempotently.
+    UpdateMetadata {
+        /// Target identifier.
+        id: VectorId,
+        /// New metadata bag (replaces the old one in full).
+        metadata: Metadata,
+    },
 }
 
 /// Result of attempting to fill a buffer from a [`Read`] source.

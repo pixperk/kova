@@ -53,6 +53,7 @@ mod delete;
 mod insert;
 mod open;
 mod search;
+mod update;
 
 pub use checkpoint::CheckpointPolicy;
 
@@ -308,6 +309,15 @@ where
                         self.index.tombstone(id)?;
                         self.metadata.delete(id).map_err(ShardError::backend)?;
                     }
+                }
+                Record::UpdateMetadata { id, metadata } => {
+                    // Replace the metadata bag in full. The HNSW graph
+                    // and vector store stay untouched. Idempotent : the
+                    // bag is whatever the last `UpdateMetadata` record
+                    // said it should be.
+                    self.metadata
+                        .put(id, metadata)
+                        .map_err(ShardError::backend)?;
                 }
             }
         }
