@@ -35,6 +35,14 @@ pub enum Value {
     Bool(bool),
     /// Homogeneous-or-heterogeneous list. Used for tag arrays and similar.
     Array(Vec<Value>),
+    /// Nested key-value bag. Same shape as [`Metadata`] itself ;
+    /// enables hierarchical attributes (`location.city`, etc.) and
+    /// subscripted assignment (`SET attrs['key'] = ...`).
+    ///
+    /// Ordering against other `Value` variants is undefined : the
+    /// predicate evaluator surfaces comparisons against `Map` as
+    /// errors rather than silently coercing.
+    Map(HashMap<String, Value>),
 }
 
 /// An attribute bag attached to a single [`VectorId`].

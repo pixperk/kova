@@ -200,13 +200,6 @@ fn plan_update(
                 .into(),
         ));
     }
-    if assignments.iter().any(|a| a.subscript.is_some()) {
-        return Err(KovaQueryError::Plan(
-            "subscripted assignments (`SET field['key'] = ...`) aren't \
-             supported ; metadata values can't hold nested maps"
-                .into(),
-        ));
-    }
     match single_id_hint {
         Some(IdHint::Literal(id)) => {
             return Ok(PhysicalPlan::UpdateById {

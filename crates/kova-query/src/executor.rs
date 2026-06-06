@@ -1083,22 +1083,45 @@ struct RadiusOp<'a> {
 }
 
 /// Mutate `bag` in place by applying each assignment in source order.
-/// Subscript was already rejected at plan time, but defend against a
-/// planner bug by erroring instead of silently dropping. Used by all
-/// three UPDATE arms (single-id, predicate, radius).
+///
+/// Two assignment shapes :
+///
+/// - `SET field = value` : insert `value` at `field` (overwrites
+///   whatever was there, regardless of type).
+/// - `SET field['key'] = value` : look up `field` ; if absent, create
+///   an empty [`Value::Map`] ; if present but not a `Map`, error.
+///   Insert `value` at `key` inside the map.
+///
+/// Used by all UPDATE arms (single-id, predicate, radius).
 fn apply_assignments(
     bag: &mut Metadata,
     assignments: &[LogicalAssignment],
     params: &ParamBindings,
 ) -> Result<(), KovaQueryError> {
     for a in assignments {
-        if a.subscript.is_some() {
-            return Err(KovaQueryError::Execution(
-                "subscripted assignment leaked past the planner".into(),
-            ));
+        let value = resolve_bound_value_for_assignment(&a.value, params)?;
+        match &a.subscript {
+            None => {
+                bag.insert(a.field.clone(), value);
+            }
+            Some(key) => {
+                // Resolve the nested map : create one if the field is
+                // missing, error if it's present but not a Map. We
+                // can't blindly overwrite a non-Map field because that
+                // would silently drop user data.
+                let slot = bag
+                    .entry(a.field.clone())
+                    .or_insert_with(|| Value::Map(std::collections::HashMap::new()));
+                let Value::Map(inner) = slot else {
+                    return Err(KovaQueryError::Execution(format!(
+                        "subscripted assignment to field '{}' : expected a Map value, \
+                         found a different type ; refusing to overwrite",
+                        a.field
+                    )));
+                };
+                inner.insert(key.clone(), value);
+            }
         }
-        let value = resolve_bound_value(&a.value, params)?;
-        bag.insert(a.field.clone(), value);
     }
     Ok(())
 }
@@ -1255,6 +1278,23 @@ fn literal_to_value(l: &BoundLiteral) -> Value {
     }
 }
 
+/// Resolve a [`BoundExpr`] in an assignment-RHS position. Wider than
+/// the predicate version : also accepts `ParamValue::Metadata` by
+/// wrapping it in [`Value::Map`] so callers can write `SET attrs = $1`
+/// where `$1` is a whole metadata bag.
+fn resolve_bound_value_for_assignment(
+    expr: &BoundExpr,
+    params: &ParamBindings,
+) -> Result<Value, KovaQueryError> {
+    match expr {
+        BoundExpr::Literal(l) => Ok(literal_to_value(l)),
+        BoundExpr::Param(p) => match params.resolve(p)? {
+            ParamValue::Metadata(m) => Ok(Value::Map(m.clone())),
+            other => param_value_to_value(other),
+        },
+    }
+}
+
 /// Turn a caller-bound [`ParamValue`] into a [`Value`] for predicate
 /// comparison. Only the literal-shaped variants are valid here ;
 /// vector / id / metadata / batch in a WHERE position is a binder
@@ -1284,6 +1324,10 @@ fn values_eq(a: &Value, b: &Value) -> bool {
         (Value::F64(x), Value::F64(y)) => x == y,
         (Value::Bool(x), Value::Bool(y)) => x == y,
         (Value::Array(x), Value::Array(y)) => x == y,
+        // Structural equality on nested bags. Cross-type comparisons
+        // (Map vs anything else) fall through to false, matching the
+        // policy for every other variant.
+        (Value::Map(x), Value::Map(y)) => x == y,
         // Numeric coercion : 5 == 5.0
         (Value::I64(x), Value::F64(y)) | (Value::F64(y), Value::I64(x)) => {
             #[allow(clippy::cast_precision_loss)]
@@ -1495,18 +1539,19 @@ mod tests {
     }
 
     /// Plan errors propagate cleanly through `execute_str` instead of
-    /// panicking deeper in the pipeline. Uses a subscripted assignment
-    /// (planner-rejected because metadata `Value` has no `Map`
-    /// variant) as the exemplar.
+    /// panicking deeper in the pipeline. Uses `OR` containing a
+    /// distance-threshold (rejected at the planner because the union
+    /// operator hasn't shipped) as the exemplar.
     #[test]
     fn execute_str_propagates_plan_error_for_unimplemented() {
         let dir = tempdir().expect("tempdir");
         let shard = Shard::open(dir.path(), 4, L2, HnswParams::default()).expect("Shard::open");
         let mut engine = Engine::new(shard, "vectors");
+        let q = Vector::try_new(vec![1.0, 0.0, 0.0, 0.0]).unwrap();
         let err = engine
             .execute_str(
-                "UPDATE vectors SET tag['key'] = 'x' WHERE id = 1",
-                ParamBindings::empty(),
+                "DELETE FROM vectors WHERE embedding <-> $1 < 0.5 OR tag = 'docs'",
+                ParamBindings::empty().with_positional(ParamValue::Vector(q)),
             )
             .expect_err("expected error");
         assert!(matches!(err, KovaQueryError::Plan(_)));
@@ -2436,25 +2481,130 @@ mod tests {
         assert!(matches!(err, KovaQueryError::Plan(_)));
     }
 
-    /// Subscripted assignment is rejected at plan time : `Value` has
-    /// no `Map` variant in v1, so nested-map writes can't be stored.
+    /// Subscripted assignment on a field that doesn't exist yet :
+    /// `apply_assignments` creates an empty Map at that field and
+    /// then writes the keyed value into it.
     #[test]
-    fn rejects_update_with_subscript_assignment() {
+    fn update_subscript_creates_map_when_field_missing() {
         let dir = tempdir().expect("tempdir");
         let mut engine = make_engine(&dir);
         seed_engine(&mut engine, &[meta_of(&[])]);
-        let err = engine
+        engine
             .execute_str(
-                "UPDATE vectors SET tag['key'] = 'x' WHERE id = 1",
+                "UPDATE vectors SET attrs['author'] = 'alice' WHERE id = 1",
                 ParamBindings::empty(),
             )
-            .expect_err("expected Plan error");
-        let KovaQueryError::Plan(msg) = err else {
-            panic!("expected Plan, got {err:?}");
+            .expect("execute_str");
+        let bag = engine.shard().get_metadata(VectorId::new(1)).unwrap();
+        let Some(Value::Map(inner)) = bag.get("attrs") else {
+            panic!("expected attrs to be a Map, got {:?}", bag.get("attrs"));
         };
-        assert!(
-            msg.contains("subscripted"),
-            "message should call out subscripts : {msg}"
+        assert_eq!(
+            inner.get("author"),
+            Some(&Value::String("alice".into()))
+        );
+    }
+
+    /// Subscripted assignment on a field that's already a Map merges
+    /// the new key in without dropping existing keys.
+    #[test]
+    fn update_subscript_merges_into_existing_map() {
+        let dir = tempdir().expect("tempdir");
+        let mut engine = make_engine(&dir);
+        let mut inner = Metadata::new();
+        inner.insert("author".into(), Value::String("alice".into()));
+        let mut bag = Metadata::new();
+        bag.insert("attrs".into(), Value::Map(inner));
+        seed_engine(&mut engine, &[bag]);
+
+        engine
+            .execute_str(
+                "UPDATE vectors SET attrs['priority'] = 1 WHERE id = 1",
+                ParamBindings::empty(),
+            )
+            .expect("execute_str");
+        let bag = engine.shard().get_metadata(VectorId::new(1)).unwrap();
+        let Some(Value::Map(map)) = bag.get("attrs") else {
+            panic!("expected attrs to be a Map");
+        };
+        assert_eq!(map.get("author"), Some(&Value::String("alice".into())));
+        assert_eq!(map.get("priority"), Some(&Value::I64(1)));
+    }
+
+    /// Subscripted assignment against a non-Map field errors loudly
+    /// rather than silently overwriting the existing value.
+    #[test]
+    fn update_subscript_on_non_map_field_errors() {
+        let dir = tempdir().expect("tempdir");
+        let mut engine = make_engine(&dir);
+        seed_engine(
+            &mut engine,
+            &[meta_of(&[("attrs", Value::String("flat".into()))])],
+        );
+        let err = engine
+            .execute_str(
+                "UPDATE vectors SET attrs['key'] = 'x' WHERE id = 1",
+                ParamBindings::empty(),
+            )
+            .expect_err("expected Execution error");
+        assert!(matches!(err, KovaQueryError::Execution(_)));
+        // Original value untouched.
+        let bag = engine.shard().get_metadata(VectorId::new(1)).unwrap();
+        assert_eq!(bag.get("attrs"), Some(&Value::String("flat".into())));
+    }
+
+    /// `SET attrs = $1` where `$1` is a `ParamValue::Metadata`
+    /// resolves to a `Value::Map` and replaces the field. The
+    /// roadmap exemplar that earlier required a deferred decision
+    /// now works straight through.
+    #[test]
+    fn update_with_metadata_param_assigns_map() {
+        let dir = tempdir().expect("tempdir");
+        let mut engine = make_engine(&dir);
+        seed_engine(&mut engine, &[meta_of(&[])]);
+        let mut new_attrs = Metadata::new();
+        new_attrs.insert("country".into(), Value::String("IN".into()));
+        new_attrs.insert("verified".into(), Value::Bool(true));
+        let params = ParamBindings::empty()
+            .with_positional(ParamValue::Metadata(new_attrs.clone()));
+        engine
+            .execute_str(
+                "UPDATE vectors SET attrs = $1 WHERE id = 1",
+                params,
+            )
+            .expect("execute_str");
+        let bag = engine.shard().get_metadata(VectorId::new(1)).unwrap();
+        let Some(Value::Map(map)) = bag.get("attrs") else {
+            panic!("expected attrs to be a Map");
+        };
+        assert_eq!(map, &new_attrs);
+    }
+
+    /// Subscripted update survives WAL replay : the
+    /// `Record::UpdateMetadata` round-trip preserves nested Map
+    /// values.
+    #[test]
+    fn update_subscript_persists_across_reopen() {
+        let dir = tempdir().expect("tempdir");
+        {
+            let mut engine = make_engine(&dir);
+            seed_engine(&mut engine, &[meta_of(&[])]);
+            engine
+                .execute_str(
+                    "UPDATE vectors SET attrs['author'] = 'alice' WHERE id = 1",
+                    ParamBindings::empty(),
+                )
+                .expect("execute_str");
+        }
+        let shard =
+            Shard::open(dir.path(), 4, L2, HnswParams::default()).expect("Shard::open");
+        let bag = shard.get_metadata(VectorId::new(1)).unwrap();
+        let Some(Value::Map(map)) = bag.get("attrs") else {
+            panic!("expected attrs to be a Map after replay");
+        };
+        assert_eq!(
+            map.get("author"),
+            Some(&Value::String("alice".into()))
         );
     }
 
