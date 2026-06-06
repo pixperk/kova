@@ -83,6 +83,27 @@ pub enum PhysicalPlan {
         /// rows whose metadata fails the predicate.
         post_filter: Option<PredicateExpr>,
     },
+    /// Filtered kNN search : plan C's entry point. Threads `filter`
+    /// into the HNSW walk so out-of-filter nodes never enter the
+    /// results heap. `k` is the user's LIMIT directly — no overfetch
+    /// needed, because filtering happens during the walk rather than
+    /// after.
+    ///
+    /// Wins over plan A when selectivity is mid-range : low enough
+    /// that plan A's overfetch would starve, high enough that plan B's
+    /// metadata scan would be wasteful.
+    FilteredKnnSearch {
+        /// Target table.
+        table: String,
+        /// Parameter slot for the query vector.
+        query: ParamRef,
+        /// Distance metric requested.
+        metric: DistanceOp,
+        /// Top-k cap (user's LIMIT, not overfetched).
+        k: usize,
+        /// Predicate evaluated against each visited node's metadata.
+        filter: PredicateExpr,
+    },
     /// Truncate the input row stream to at most `limit` rows.
     Limit {
         /// Sub-plan producing the input rows.

@@ -23,11 +23,20 @@ use crate::physical::PhysicalPlan;
 /// without starving the final LIMIT. v2 tunes this from selectivity.
 const KNN_OVERFETCH: usize = 4;
 
-/// Selectivity threshold for plan A vs plan B. If matches/total is
-/// below this fraction, plan B (scan + exact distance) wins ; above,
-/// plan A (overfetched kNN + post-filter) wins. v1 hardcodes 0.5 ;
-/// v2 derives it from measured cost coefficients.
-const PLAN_B_SELECTIVITY_THRESHOLD: f64 = 0.5;
+/// Lower selectivity boundary : below this fraction we pick plan B
+/// (scan metadata + exact distance). The candidate set is small enough
+/// that an O(matches * d) exact distance loop beats running the full
+/// ANN walk.
+const PLAN_B_UPPER: f64 = 0.05;
+
+/// Upper selectivity boundary : at or above this fraction we pick
+/// plan A (overfetched kNN + post-filter). The predicate is loose
+/// enough that the post-filter rarely drops candidates, so the
+/// cheaper overfetch wins over plan C's per-visit predicate eval.
+///
+/// In between (`PLAN_B_UPPER`, `PLAN_A_LOWER`) we pick plan C :
+/// filter threaded into the graph walk.
+const PLAN_A_LOWER: f64 = 0.5;
 
 /// Estimate produced by [`SelectivityEstimator::estimate`].
 #[derive(Debug, Clone, Copy)]
@@ -239,22 +248,25 @@ fn plan_query<E: SelectivityEstimator>(
     let (metric, query_param) = knn;
     let user_k = usize::try_from(user_limit).unwrap_or(usize::MAX);
 
-    // Step 4 : pick plan A or plan B based on selectivity.
+    // Step 4 : pick plan A / B / C based on selectivity.
     //
-    //   selectivity < threshold  -> plan B (few matches, scan + exact
-    //                                       distance ; bounded work)
-    //   selectivity >= threshold -> plan A (most pass, kNN overfetch
-    //                                       still saturates LIMIT)
-    //   no predicate             -> plan A (nothing to filter)
+    //   < PLAN_B_UPPER        -> plan B (tight predicate ; tiny
+    //                                    candidate set, exact distance)
+    //   in [B, A)             -> plan C (mid predicate ; filter threads
+    //                                    into the ANN walk)
+    //   >= PLAN_A_LOWER       -> plan A (loose predicate ; overfetched
+    //                                    kNN + cheap post-filter)
+    //   no predicate          -> plan A (nothing to filter)
     //
-    // v1 uses `PLAN_B_SELECTIVITY_THRESHOLD = 0.5` as a flat cutoff.
-    // v2 (M2.6) replaces this with a measured cost model that
-    // accounts for k, recall target, and shard size.
+    // v2 (M2.6) replaces these flat cutoffs with a measured cost
+    // model that accounts for k, recall target, and shard size.
     let plan = match predicate {
         Some(pred) => {
-            let est = estimator.estimate(&pred, params);
-            if est.fraction() < PLAN_B_SELECTIVITY_THRESHOLD {
+            let fraction = estimator.estimate(&pred, params).fraction();
+            if fraction < PLAN_B_UPPER {
                 build_plan_b(from_table, pred, query_param, metric, user_k, user_limit)
+            } else if fraction < PLAN_A_LOWER {
+                build_plan_c(from_table, pred, query_param, metric, user_k, user_limit)
             } else {
                 build_plan_a(
                     from_table,
@@ -291,6 +303,30 @@ fn build_plan_a(
         metric,
         k: overfetched_k,
         post_filter,
+    };
+    PhysicalPlan::Limit {
+        input: Box::new(knn),
+        limit: user_limit,
+    }
+}
+
+/// Plan C : `Limit(FilteredKnnSearch(filter))`. ANN walk with the
+/// predicate threaded into the traversal. No overfetch (k is the
+/// user's LIMIT) because filtering happens during the walk.
+fn build_plan_c(
+    table: String,
+    filter: PredicateExpr,
+    query: ParamRef,
+    metric: DistanceOp,
+    user_k: usize,
+    user_limit: u64,
+) -> PhysicalPlan {
+    let knn = PhysicalPlan::FilteredKnnSearch {
+        table,
+        query,
+        metric,
+        k: user_k,
+        filter,
     };
     PhysicalPlan::Limit {
         input: Box::new(knn),

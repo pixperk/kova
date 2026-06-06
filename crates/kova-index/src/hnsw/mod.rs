@@ -187,6 +187,26 @@ impl<D: Distance, V: VectorStore> HnswIndex<D, V> {
         self.tombstones.contains(&id)
     }
 
+    /// Filtered kNN : return the top-`k` ids that satisfy `filter`,
+    /// ordered by distance. Filtering happens *during* the graph walk
+    /// (out-of-filter nodes still route traversal but never enter the
+    /// results heap).
+    ///
+    /// # Errors
+    /// - [`KovaIndexError::DimensionMismatch`] if the query dim doesn't
+    ///   match the index's pinned dim.
+    pub fn search_filtered<F>(
+        &self,
+        query: &Vector,
+        k: usize,
+        filter: &F,
+    ) -> Result<Vec<(VectorId, f32)>, KovaIndexError>
+    where
+        F: Fn(VectorId) -> bool,
+    {
+        self.search_filtered_impl(query, k, filter)
+    }
+
     /// Find all live ids whose distance to `query` is within `radius`,
     /// ascending. Inherent (not on the [`Index`] trait) because other
     /// index families (IVF, flat) want different radius semantics ;

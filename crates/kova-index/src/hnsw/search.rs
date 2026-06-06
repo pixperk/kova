@@ -144,6 +144,175 @@ impl<D: Distance, V: VectorStore> HnswIndex<D, V> {
 }
 
 impl<D: Distance, V: VectorStore> HnswIndex<D, V> {
+    /// Bounded best-first walk at `layer` with a predicate filter.
+    ///
+    /// Differs from [`Self::search_layer`] in two ways :
+    ///
+    /// - **What goes into the results heap** : only nodes for which
+    ///   `filter(id)` returns `true`. Out-of-filter nodes are still
+    ///   *visited* (their neighbours can still get expanded), but they
+    ///   never become candidates for the final top-k. This is the
+    ///   "soft filter" of plan C : filtering is woven into the walk,
+    ///   not bolted on as a post-filter.
+    ///
+    /// - **Termination** : we only short-circuit on
+    ///   `c.distance > worst_result.distance` once we've accumulated
+    ///   at least `ef` results. While the results heap is short of
+    ///   `ef`, every popped candidate is worth expanding — the next
+    ///   neighbour might be the first filter-passing node we see.
+    ///
+    /// Worst-case visits every node in `layer` when `filter` is empty
+    /// on the candidate region ; this is the cost of the soft-filter
+    /// strategy and is bounded by graph size.
+    pub(crate) fn search_layer_filtered<F>(
+        &self,
+        query: &Vector,
+        entry_points: &[VectorId],
+        ef: usize,
+        layer: usize,
+        filter: &F,
+    ) -> Vec<(VectorId, f32)>
+    where
+        F: Fn(VectorId) -> bool,
+    {
+        if ef == 0 || entry_points.is_empty() {
+            return Vec::new();
+        }
+
+        let mut visited: HashSet<VectorId> = HashSet::with_capacity(ef * 4);
+        let mut candidates: BinaryHeap<Reverse<ScoredId>> = BinaryHeap::with_capacity(ef);
+        let mut results: BinaryHeap<ScoredId> = BinaryHeap::with_capacity(ef);
+
+        for &ep in entry_points {
+            if !visited.insert(ep) {
+                continue;
+            }
+            let Some(ep_vec) = self.vectors.get(ep) else {
+                continue;
+            };
+            let distance = self.metric.distance(query, &ep_vec);
+            let scored = ScoredId { id: ep, distance };
+            candidates.push(Reverse(scored));
+            if filter(ep) {
+                results.push(scored);
+                if results.len() > ef {
+                    results.pop();
+                }
+            }
+        }
+
+        while let Some(Reverse(c)) = candidates.pop() {
+            // Early termination requires both : results heap is full
+            // (so further candidates can only displace, not seed it)
+            // AND the popped candidate is worse than the worst result.
+            if results.len() >= ef
+                && let Some(worst) = results.peek()
+                && c.distance > worst.distance
+            {
+                break;
+            }
+
+            let Some(c_node) = self.nodes.get(&c.id) else {
+                continue;
+            };
+            let Some(neighbours) = c_node.neighbors.get(layer) else {
+                continue;
+            };
+
+            for &n_id in neighbours {
+                if !visited.insert(n_id) {
+                    continue;
+                }
+                let Some(n_vec) = self.vectors.get(n_id) else {
+                    continue;
+                };
+                let n_dist = self.metric.distance(query, &n_vec);
+                let scored = ScoredId {
+                    id: n_id,
+                    distance: n_dist,
+                };
+                let worst_dist = results.peek().map_or(f32::INFINITY, |w| w.distance);
+                // Worth exploring through if the heap isn't full yet
+                // (no upper bound on usefulness) or this node is
+                // closer than the worst result (could route to a
+                // closer filter-match).
+                if results.len() < ef || n_dist < worst_dist {
+                    candidates.push(Reverse(scored));
+                    if filter(n_id) {
+                        results.push(scored);
+                        if results.len() > ef {
+                            results.pop();
+                        }
+                    }
+                }
+            }
+        }
+
+        results
+            .into_sorted_vec()
+            .into_iter()
+            .map(|s| (s.id, s.distance))
+            .collect()
+    }
+
+    /// Filtered kNN search : returns the top-`k` nodes that satisfy
+    /// `filter`, ordered by distance to `query`. Plan C's primitive :
+    /// the filter threads into the graph walk instead of getting
+    /// applied as a post-filter.
+    ///
+    /// `filter` is called once per visited node. For predicates that
+    /// require a metadata lookup, the caller composes that lookup
+    /// inside the closure.
+    pub(crate) fn search_filtered_impl<F>(
+        &self,
+        query: &Vector,
+        k: usize,
+        filter: &F,
+    ) -> Result<Vec<(VectorId, f32)>, KovaIndexError>
+    where
+        F: Fn(VectorId) -> bool,
+    {
+        if k == 0 {
+            return Ok(Vec::new());
+        }
+
+        let Some(entry_id) = self.entry_point else {
+            return Ok(Vec::new());
+        };
+
+        if let Some(d) = self.dim
+            && query.dim() != d
+        {
+            return Err(KovaIndexError::DimensionMismatch {
+                expected: d,
+                got: query.dim(),
+            });
+        }
+
+        let top_level = self.nodes[&entry_id].top_layer();
+        let ef = self.params.ef_search.max(k);
+
+        // Descent : unfiltered. The upper layers are sparse — we just
+        // want any entry into the dense layer-0 region. Filtering only
+        // there.
+        let mut current_ep = entry_id;
+        for layer in (1..=top_level).rev() {
+            let nearest = self.search_layer(query, &[current_ep], 1, layer);
+            if let Some(&(best_id, _)) = nearest.first() {
+                current_ep = best_id;
+            }
+        }
+
+        let mut results = self.search_layer_filtered(query, &[current_ep], ef, 0, filter);
+
+        if !self.tombstones.is_empty() {
+            results.retain(|(id, _)| !self.tombstones.contains(id));
+        }
+
+        results.truncate(k);
+        Ok(results)
+    }
+
     /// User-facing radius search.
     ///
     /// Strategy : descend the upper layers with kNN-1 to land near
@@ -520,6 +689,95 @@ mod tests {
             h_ids.len(),
             f_ids.len()
         );
+    }
+
+    // ---------- search_filtered_impl ----------
+
+    #[test]
+    fn search_filtered_empty_index_returns_empty() {
+        let idx: HnswIndex<L2, InMemoryVectorStore> = HnswIndex::new(L2);
+        let always = |_id: VectorId| true;
+        let out = idx.search_filtered_impl(&v(vec![0.0]), 5, &always).unwrap();
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn search_filtered_k_zero_returns_empty() {
+        let mut idx = HnswIndex::new(L2);
+        crate::Index::insert(&mut idx, id(1), v(vec![0.0])).unwrap();
+        let always = |_id: VectorId| true;
+        let out = idx.search_filtered_impl(&v(vec![0.0]), 0, &always).unwrap();
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn search_filtered_dim_mismatch_errors() {
+        let mut idx = HnswIndex::new(L2);
+        crate::Index::insert(&mut idx, id(1), v(vec![1.0, 2.0])).unwrap();
+        let always = |_id: VectorId| true;
+        let err = idx
+            .search_filtered_impl(&v(vec![1.0]), 1, &always)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            crate::KovaIndexError::DimensionMismatch {
+                expected: 2,
+                got: 1,
+            }
+        ));
+    }
+
+    #[test]
+    fn search_filtered_drops_filter_rejects_from_results() {
+        let mut idx = HnswIndex::new(L2);
+        for i in 0..10 {
+            #[allow(clippy::cast_precision_loss)]
+            let f = i as f32;
+            crate::Index::insert(&mut idx, id(i), v(vec![f])).unwrap();
+        }
+        // Only even ids pass the filter.
+        let even_only = |i: VectorId| i.get().is_multiple_of(2);
+        let out = idx
+            .search_filtered_impl(&v(vec![0.0]), 5, &even_only)
+            .unwrap();
+        for (i, _) in &out {
+            assert_eq!(i.get() % 2, 0, "filter let odd id {i:?} through");
+        }
+    }
+
+    #[test]
+    #[allow(clippy::cast_precision_loss)]
+    fn search_filtered_finds_filter_match_through_out_of_filter_neighbours() {
+        // Verifies the soft-filter property : even when the entry
+        // point is filtered out, the walk routes through it and
+        // surfaces a filter-passing neighbour.
+        let mut idx = HnswIndex::seeded(L2, super::super::HnswParams::default(), 11);
+        for i in 0..20 {
+            let f = i as f32;
+            crate::Index::insert(&mut idx, id(i), v(vec![f])).unwrap();
+        }
+        // Filter keeps only id 10.
+        let only_ten = |i: VectorId| i.get() == 10;
+        let out = idx
+            .search_filtered_impl(&v(vec![10.0]), 1, &only_ten)
+            .unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].0, id(10));
+    }
+
+    #[test]
+    fn search_filtered_tombstoned_ids_excluded() {
+        let mut idx = HnswIndex::new(L2);
+        for i in 0..5 {
+            #[allow(clippy::cast_precision_loss)]
+            let f = i as f32;
+            crate::Index::insert(&mut idx, id(i), v(vec![f])).unwrap();
+        }
+        idx.tombstone(id(1)).unwrap();
+        let always = |_id: VectorId| true;
+        let out = idx.search_filtered_impl(&v(vec![0.0]), 5, &always).unwrap();
+        let ids: Vec<_> = out.iter().map(|(i, _)| *i).collect();
+        assert!(!ids.contains(&id(1)));
     }
 
     #[allow(clippy::cast_precision_loss)]

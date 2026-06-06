@@ -41,6 +41,50 @@ where
         Ok(results)
     }
 
+    /// Filtered kNN : top-`k` hits whose metadata passes `predicate`,
+    /// ascending by distance. The predicate is consulted *inside* the
+    /// graph walk (plan C semantics) — filtered-out nodes still route
+    /// traversal but never enter the results.
+    ///
+    /// The HNSW layer's filter is `Fn(VectorId) -> bool`, so we wrap
+    /// `predicate` in a [`std::cell::RefCell`] for interior mutability
+    /// and look up each id's metadata inside the closure.
+    ///
+    /// # Errors
+    /// Returns [`ShardError::Index`] if the underlying filtered search
+    /// fails (e.g. dimension mismatch).
+    pub fn search_filtered<F>(
+        &self,
+        query: &Vector,
+        k: usize,
+        predicate: F,
+    ) -> Result<Vec<SearchHit>, ShardError>
+    where
+        F: FnMut(&Metadata) -> bool,
+    {
+        use std::cell::RefCell;
+        let pred_cell = RefCell::new(predicate);
+        let filter = |id: VectorId| -> bool {
+            let Some(meta) = self.metadata.get(id) else {
+                return false;
+            };
+            (pred_cell.borrow_mut())(&meta)
+        };
+        let hits = self.index.search_filtered(query, k, &filter)?;
+        let results = hits
+            .into_iter()
+            .map(|(id, distance)| {
+                let metadata = self.metadata.get(id).unwrap_or_default();
+                SearchHit {
+                    id,
+                    distance,
+                    metadata,
+                }
+            })
+            .collect();
+        Ok(results)
+    }
+
     /// Find every live id within `radius` of `query`, ascending by
     /// distance, each carrying its metadata bag.
     ///
@@ -484,6 +528,62 @@ mod tests {
         shard.delete(id(1)).unwrap();
 
         let hits = shard.search_radius(&v(vec![0.0]), 5.0).unwrap();
+        let ids: Vec<_> = hits.iter().map(|h| h.id).collect();
+        assert!(!ids.contains(&id(1)));
+        assert!(ids.contains(&id(2)));
+    }
+
+    // ---------- search_filtered ----------
+
+    #[test]
+    fn search_filtered_keeps_only_passing_metadata() {
+        let mut shard = fresh_in_memory();
+        shard
+            .insert(id(1), v(vec![0.0, 0.0]), tag_meta("docs"))
+            .unwrap();
+        shard
+            .insert(id(2), v(vec![1.0, 0.0]), tag_meta("other"))
+            .unwrap();
+        shard
+            .insert(id(3), v(vec![0.0, 1.0]), tag_meta("docs"))
+            .unwrap();
+
+        let hits = shard
+            .search_filtered(&v(vec![0.0, 0.0]), 5, |m| {
+                m.get("tag") == Some(&Value::String("docs".into()))
+            })
+            .unwrap();
+        let ids: Vec<_> = hits.iter().map(|h| h.id).collect();
+        assert!(ids.contains(&id(1)));
+        assert!(ids.contains(&id(3)));
+        assert!(!ids.contains(&id(2)));
+    }
+
+    #[test]
+    fn search_filtered_attaches_metadata_to_results() {
+        let mut shard = fresh_in_memory();
+        shard
+            .insert(id(1), v(vec![0.0]), tag_meta("alpha"))
+            .unwrap();
+        let hits = shard
+            .search_filtered(&v(vec![0.0]), 1, |_m| true)
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(
+            hits[0].metadata.get("tag"),
+            Some(&Value::String("alpha".into()))
+        );
+    }
+
+    #[test]
+    fn search_filtered_excludes_tombstoned_ids() {
+        let mut shard = fresh_in_memory();
+        shard.insert(id(1), v(vec![0.0]), tag_meta("a")).unwrap();
+        shard.insert(id(2), v(vec![1.0]), tag_meta("a")).unwrap();
+        shard.delete(id(1)).unwrap();
+        let hits = shard
+            .search_filtered(&v(vec![0.0]), 5, |_m| true)
+            .unwrap();
         let ids: Vec<_> = hits.iter().map(|h| h.id).collect();
         assert!(!ids.contains(&id(1)));
         assert!(ids.contains(&id(2)));

@@ -344,7 +344,8 @@ impl<D: Distance> Engine<D> {
             | PhysicalPlan::KnnSearch { .. }
             | PhysicalPlan::MetadataScan { .. }
             | PhysicalPlan::ExactDistance { .. }
-            | PhysicalPlan::RadiusSearch { .. } => Err(KovaQueryError::Plan(
+            | PhysicalPlan::RadiusSearch { .. }
+            | PhysicalPlan::FilteredKnnSearch { .. } => Err(KovaQueryError::Plan(
                 "read-path operator at top level ; planner must wrap in Projection".into(),
             )),
         }
@@ -410,6 +411,49 @@ impl<D: Distance> Engine<D> {
             columns: vec![column_name],
             rows: vec![row],
         })
+    }
+
+    /// Filtered-kNN read-path arm. Plan C : threads the predicate
+    /// into the HNSW walk via `Shard::search_filtered`. The closure-
+    /// error-capture pattern propagates any predicate-eval failure
+    /// instead of silently dropping rows.
+    fn exec_filtered_knn(
+        &self,
+        table: &str,
+        query: &crate::ast::ParamRef,
+        k: usize,
+        filter: &PredicateExpr,
+        params: &ParamBindings,
+    ) -> Result<Vec<InternalHit>, KovaQueryError> {
+        self.assert_table(table)?;
+        let query_vec = expect_vector(params.resolve(query)?, "query")?;
+        let mut closure_err: Option<KovaQueryError> = None;
+        let hits = self
+            .shard
+            .search_filtered(&query_vec, k, |m| {
+                if closure_err.is_some() {
+                    return false;
+                }
+                match eval_predicate(filter, m, params) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        closure_err = Some(e);
+                        false
+                    }
+                }
+            })
+            .map_err(|e| KovaQueryError::Backend(Box::new(e)))?;
+        if let Some(e) = closure_err {
+            return Err(e);
+        }
+        Ok(hits
+            .into_iter()
+            .map(|h| InternalHit {
+                id: h.id,
+                distance: Some(h.distance),
+                metadata: h.metadata,
+            })
+            .collect())
     }
 
     /// Metadata-scan read-path arm. Walks every live row's metadata,
@@ -567,6 +611,13 @@ impl<D: Distance> Engine<D> {
                 let cap = usize::try_from(limit).unwrap_or(usize::MAX);
                 Ok(hits.into_iter().take(cap).collect())
             }
+            PhysicalPlan::FilteredKnnSearch {
+                table,
+                query,
+                metric: _,
+                k,
+                filter,
+            } => self.exec_filtered_knn(&table, &query, k, &filter, params),
             PhysicalPlan::RadiusSearch {
                 table,
                 query,
@@ -737,6 +788,7 @@ fn physical_kind(plan: &PhysicalPlan) -> &'static str {
         PhysicalPlan::ExactDistance { .. } => "ExactDistance",
         PhysicalPlan::Count { .. } => "Count",
         PhysicalPlan::RadiusSearch { .. } => "RadiusSearch",
+        PhysicalPlan::FilteredKnnSearch { .. } => "FilteredKnnSearch",
     }
 }
 
@@ -2081,9 +2133,9 @@ mod tests {
         use crate::physical::PhysicalPlan;
         let dir = tempdir().expect("tempdir");
         let mut engine = make_engine(&dir);
-        // 1 'docs' + 9 'other' : selectivity = 0.1 < 0.5.
+        // 1 'docs' + 29 'other' : selectivity ≈ 0.033 < 0.05 (plan B band).
         let mut metas: Vec<Metadata> = vec![meta_of(&[("category", Value::String("docs".into()))])];
-        for _ in 0..9 {
+        for _ in 0..29 {
             metas.push(meta_of(&[("category", Value::String("other".into()))]));
         }
         seed_engine(&mut engine, &metas);
@@ -2110,6 +2162,91 @@ mod tests {
             matches!(*input, PhysicalPlan::ExactDistance { .. }),
             "low selectivity should pick plan B (ExactDistance), got {input:?}"
         );
+    }
+
+    /// Mid-range selectivity (in `[PLAN_B_UPPER, PLAN_A_LOWER)`) routes
+    /// to plan C : the filter threads into the kNN walk, no overfetch,
+    /// no metadata scan. Verifies the planner emits
+    /// `FilteredKnnSearch` under the `Limit`.
+    #[test]
+    fn mid_selectivity_picks_plan_c() {
+        use crate::physical::PhysicalPlan;
+        let dir = tempdir().expect("tempdir");
+        let mut engine = make_engine(&dir);
+        // 2 'docs' + 8 'other' : selectivity = 0.2, in the plan C band.
+        let mut metas: Vec<Metadata> = (0..2)
+            .map(|_| meta_of(&[("category", Value::String("docs".into()))]))
+            .collect();
+        for _ in 0..8 {
+            metas.push(meta_of(&[("category", Value::String("other".into()))]));
+        }
+        seed_engine(&mut engine, &metas);
+
+        let ast = parse_str(
+            "SELECT id FROM vectors WHERE category = 'docs' \
+             ORDER BY embedding <-> $1 LIMIT 5",
+        )
+        .expect("parse");
+        let logical = crate::binder::bind(ast).expect("bind");
+        let est = ShardEstimator {
+            shard: engine.shard(),
+        };
+        let physical = crate::planner::plan_with_estimator(logical, &est, &ParamBindings::empty())
+            .expect("plan");
+
+        let PhysicalPlan::Projection { input, .. } = physical else {
+            panic!("expected Projection");
+        };
+        let PhysicalPlan::Limit { input, .. } = *input else {
+            panic!("expected Limit");
+        };
+        assert!(
+            matches!(*input, PhysicalPlan::FilteredKnnSearch { .. }),
+            "mid selectivity should pick plan C (FilteredKnnSearch), got {input:?}"
+        );
+    }
+
+    /// Plan C end-to-end : run a SELECT in the mid-selectivity band
+    /// and check the returned ids actually pass the predicate. This
+    /// hits the filter-threaded HNSW walk via `Shard::search_filtered`.
+    #[test]
+    fn plan_c_end_to_end_returns_only_passing_ids() {
+        let dir = tempdir().expect("tempdir");
+        let mut engine = make_engine(&dir);
+        // 3 'docs' + 7 'other' : selectivity = 0.3, plan C band.
+        let mut metas: Vec<Metadata> = (0..3)
+            .map(|_| meta_of(&[("category", Value::String("docs".into()))]))
+            .collect();
+        for _ in 0..7 {
+            metas.push(meta_of(&[("category", Value::String("other".into()))]));
+        }
+        seed_engine(&mut engine, &metas);
+
+        let q = Vector::try_new(vec![1.0, 0.0, 0.0, 0.0]).unwrap();
+        let result = engine
+            .execute_str(
+                "SELECT id FROM vectors WHERE category = 'docs' \
+                 ORDER BY embedding <-> $1 LIMIT 3",
+                ParamBindings::empty().with_positional(ParamValue::Vector(q)),
+            )
+            .expect("execute");
+        let ExecutionResult::Rows { rows, .. } = result else {
+            panic!("expected Rows");
+        };
+        let ids: Vec<u64> = rows
+            .iter()
+            .map(|r| match r.values[0] {
+                RowValue::Id(id) => id.get(),
+                _ => panic!("expected Id"),
+            })
+            .collect();
+        // First three seeded rows are the 'docs' ones (ids 1, 2, 3).
+        for id in &ids {
+            assert!(
+                *id <= 3,
+                "plan C returned id {id} which doesn't carry 'docs' tag"
+            );
+        }
     }
 
     /// Both plans return the same answer on the same data : at
