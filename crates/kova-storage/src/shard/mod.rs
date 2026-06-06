@@ -298,6 +298,17 @@ where
                     self.index.tombstone(id)?;
                     self.metadata.delete(id).map_err(ShardError::backend)?;
                 }
+                Record::DeleteMany { ids } => {
+                    // Same semantics as a sequence of `Delete{id}` records,
+                    // compacted into one frame at write time. Each id is
+                    // applied independently ; partial failure on one id
+                    // surfaces as a `ShardError` and aborts replay (same
+                    // policy as the singleton path).
+                    for id in ids {
+                        self.index.tombstone(id)?;
+                        self.metadata.delete(id).map_err(ShardError::backend)?;
+                    }
+                }
             }
         }
         Ok(())

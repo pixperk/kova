@@ -318,9 +318,32 @@ impl<D: Distance> Engine<D> {
                     .map_err(|e| KovaQueryError::Backend(Box::new(e)))?;
                 Ok(ExecutionResult::Delete { table, deleted: 1 })
             }
+            PhysicalPlan::DeleteByParamId { table, id_param } => {
+                self.assert_table(&table)?;
+                let id = expect_id(params.resolve(&id_param)?, "id")?;
+                self.shard
+                    .delete(id)
+                    .map_err(|e| KovaQueryError::Backend(Box::new(e)))?;
+                Ok(ExecutionResult::Delete { table, deleted: 1 })
+            }
             PhysicalPlan::DeleteByPredicate { table, predicate } => {
                 self.exec_delete_by_predicate(&table, &predicate, params)
             }
+            PhysicalPlan::DeleteByRadius {
+                table,
+                query,
+                metric: _,
+                radius,
+                inclusive,
+                post_filter,
+            } => self.exec_delete_by_radius(
+                &table,
+                &query,
+                radius,
+                inclusive,
+                post_filter.as_ref(),
+                params,
+            ),
 
             // Read path : the outermost operator must be Projection,
             // because that's the only one that builds user-facing
@@ -457,6 +480,48 @@ impl<D: Distance> Engine<D> {
                 metadata: h.metadata,
             })
             .collect())
+    }
+
+    /// DELETE-by-radius write-path arm. Runs the radius walk to
+    /// produce the in-ball id set, drops boundary hits when the user
+    /// wrote `<` (strict), applies any `post_filter` residue against
+    /// each hit's metadata, then dispatches the survivors to
+    /// `Shard::delete_many` for one WAL group-commit.
+    fn exec_delete_by_radius(
+        &mut self,
+        table: &str,
+        query: &crate::ast::ParamRef,
+        radius: f32,
+        inclusive: bool,
+        post_filter: Option<&PredicateExpr>,
+        params: &ParamBindings,
+    ) -> Result<ExecutionResult, KovaQueryError> {
+        self.assert_table(table)?;
+        let query_vec = expect_vector(params.resolve(query)?, "query")?;
+        let hits = self
+            .shard
+            .search_radius(&query_vec, radius)
+            .map_err(|e| KovaQueryError::Backend(Box::new(e)))?;
+        let mut ids: Vec<VectorId> = Vec::with_capacity(hits.len());
+        for h in hits {
+            if !inclusive && h.distance >= radius {
+                continue;
+            }
+            if let Some(pred) = post_filter
+                && !eval_predicate(pred, &h.metadata, params)?
+            {
+                continue;
+            }
+            ids.push(h.id);
+        }
+        let deleted = self
+            .shard
+            .delete_many(ids)
+            .map_err(|e| KovaQueryError::Backend(Box::new(e)))?;
+        Ok(ExecutionResult::Delete {
+            table: table.to_string(),
+            deleted: deleted as u64,
+        })
     }
 
     /// DELETE-by-predicate write-path arm. Scans the metadata for ids
@@ -822,7 +887,9 @@ fn physical_kind(plan: &PhysicalPlan) -> &'static str {
         PhysicalPlan::InsertOne { .. } => "InsertOne",
         PhysicalPlan::InsertMany { .. } => "InsertMany",
         PhysicalPlan::DeleteById { .. } => "DeleteById",
+        PhysicalPlan::DeleteByParamId { .. } => "DeleteByParamId",
         PhysicalPlan::DeleteByPredicate { .. } => "DeleteByPredicate",
+        PhysicalPlan::DeleteByRadius { .. } => "DeleteByRadius",
         PhysicalPlan::KnnSearch { .. } => "KnnSearch",
         PhysicalPlan::Limit { .. } => "Limit",
         PhysicalPlan::Projection { .. } => "Projection",
@@ -1604,27 +1671,58 @@ mod tests {
         assert!(!engine.shard().contains(VectorId::new(10)));
     }
 
-    /// Param-bound id with an `I64` value : binder leaves the single-id
-    /// hint as `None`, so the planner routes to `DeleteByPredicate`.
-    /// The metadata evaluator finds no `id` field in any metadata bag,
-    /// returns false for every row, and the delete count is 0. Not the
-    /// path you want for "delete by id", but it doesn't error : the
-    /// engineering-honest behavior is to no-op rather than crash.
+    /// Param-bound id : binder sets the `Param` hint, planner emits
+    /// `DeleteByParamId`, executor resolves the param at run time and
+    /// dispatches to `Shard::delete` like the literal path. Same fast
+    /// path semantics : exactly one row tombstoned, no metadata scan.
     #[test]
-    fn delete_by_param_bound_id_routes_to_predicate_path() {
+    fn delete_by_param_bound_id_tombstones_the_resolved_id() {
         let dir = tempdir().expect("tempdir");
         let mut engine = make_engine(&dir);
         seed_engine(&mut engine, &[meta_of(&[]), meta_of(&[])]);
-        let params = ParamBindings::empty().with_positional(ParamValue::I64(1));
+        let params = ParamBindings::empty().with_positional(ParamValue::Id(VectorId::new(1)));
         let result = engine
             .execute_str("DELETE FROM vectors WHERE id = $1", params)
             .expect("execute_str");
         let ExecutionResult::Delete { deleted, .. } = result else {
             panic!("expected Delete, got {result:?}");
         };
-        assert_eq!(deleted, 0);
-        assert!(engine.shard().contains(VectorId::new(1)));
+        assert_eq!(deleted, 1);
+        assert!(!engine.shard().contains(VectorId::new(1)));
         assert!(engine.shard().contains(VectorId::new(2)));
+    }
+
+    /// Named-param variant of the above. Catches a bug where positional
+    /// vs named resolution diverges.
+    #[test]
+    fn delete_by_named_param_id() {
+        let dir = tempdir().expect("tempdir");
+        let mut engine = make_engine(&dir);
+        seed_engine(&mut engine, &[meta_of(&[]), meta_of(&[])]);
+        let params = ParamBindings::empty().with_named("target", ParamValue::Id(VectorId::new(2)));
+        let result = engine
+            .execute_str("DELETE FROM vectors WHERE id = $target", params)
+            .expect("execute_str");
+        let ExecutionResult::Delete { deleted, .. } = result else {
+            panic!("expected Delete");
+        };
+        assert_eq!(deleted, 1);
+        assert!(engine.shard().contains(VectorId::new(1)));
+        assert!(!engine.shard().contains(VectorId::new(2)));
+    }
+
+    /// Param-bound id with a wrong-typed value surfaces a clear
+    /// Execution error from `expect_id`.
+    #[test]
+    fn delete_by_param_bound_id_wrong_type_errors() {
+        let dir = tempdir().expect("tempdir");
+        let mut engine = make_engine(&dir);
+        seed_engine(&mut engine, &[meta_of(&[])]);
+        let params = ParamBindings::empty().with_positional(ParamValue::I64(1));
+        let err = engine
+            .execute_str("DELETE FROM vectors WHERE id = $1", params)
+            .expect_err("expected Execution error");
+        assert!(matches!(err, KovaQueryError::Execution(_)));
     }
 
     /// Compound predicate on a metadata field routes through
@@ -1679,29 +1777,68 @@ mod tests {
         assert!(engine.shard().contains(VectorId::new(1)));
     }
 
-    /// DELETE WHERE distance-threshold is rejected at plan time : the
-    /// metadata evaluator can't score distances, so the executor
-    /// would error mid-scan. Catching it at the planner gives a
-    /// cleaner error.
+    /// `DELETE WHERE embedding <-> $q < r` routes through the radius
+    /// operator : every id within the ball is tombstoned, ids outside
+    /// it survive. Same semantics as `SELECT ... WHERE dist < r`
+    /// applied as a write.
     #[test]
-    fn rejects_delete_by_distance_threshold() {
+    fn delete_by_radius_tombstones_in_ball() {
         let dir = tempdir().expect("tempdir");
         let mut engine = make_engine(&dir);
-        seed_engine(&mut engine, &[Metadata::new()]);
+        // 8 axis-aligned vectors : ids 1,5 → e_0 ; 2,6 → e_1 ; etc.
+        let metas: Vec<Metadata> = (0..8).map(|_| Metadata::new()).collect();
+        seed_engine(&mut engine, &metas);
+
         let q = Vector::try_new(vec![1.0, 0.0, 0.0, 0.0]).unwrap();
-        let err = engine
+        let result = engine
             .execute_str(
                 "DELETE FROM vectors WHERE embedding <-> $1 < 0.5",
                 ParamBindings::empty().with_positional(ParamValue::Vector(q)),
             )
-            .expect_err("expected Plan error");
-        let KovaQueryError::Plan(msg) = err else {
-            panic!("expected Plan, got {err:?}");
+            .expect("execute_str");
+        let ExecutionResult::Delete { deleted, .. } = result else {
+            panic!("expected Delete");
         };
-        assert!(
-            msg.contains("distance"),
-            "message should call out distance limitation : {msg}"
-        );
+        // Only ids 1 and 5 sit on e_0 (distance 0 to the query).
+        assert_eq!(deleted, 2);
+        assert!(!engine.shard().contains(VectorId::new(1)));
+        assert!(!engine.shard().contains(VectorId::new(5)));
+        assert!(engine.shard().contains(VectorId::new(2)));
+        assert!(engine.shard().contains(VectorId::new(6)));
+    }
+
+    /// AND-residue on a radius DELETE peels off as a post-filter.
+    /// Only ids that are both in-ball AND match the residue get
+    /// tombstoned.
+    #[test]
+    fn delete_by_radius_with_and_residue_applies_post_filter() {
+        let dir = tempdir().expect("tempdir");
+        let mut engine = make_engine(&dir);
+        // ids 1, 5 → e_0. Tag id 1 as 'docs', id 5 as 'other'.
+        let metas = vec![
+            meta_of(&[("tag", Value::String("docs".into()))]), // id 1
+            meta_of(&[("tag", Value::String("other".into()))]), // id 2
+            meta_of(&[("tag", Value::String("other".into()))]), // id 3
+            meta_of(&[("tag", Value::String("other".into()))]), // id 4
+            meta_of(&[("tag", Value::String("other".into()))]), // id 5
+        ];
+        seed_engine(&mut engine, &metas);
+
+        let q = Vector::try_new(vec![1.0, 0.0, 0.0, 0.0]).unwrap();
+        let result = engine
+            .execute_str(
+                "DELETE FROM vectors \
+                 WHERE embedding <-> $1 < 0.5 AND tag = 'docs'",
+                ParamBindings::empty().with_positional(ParamValue::Vector(q)),
+            )
+            .expect("execute_str");
+        let ExecutionResult::Delete { deleted, .. } = result else {
+            panic!("expected Delete");
+        };
+        // id 1 is in-ball AND tag='docs'. id 5 is in-ball but tag='other'.
+        assert_eq!(deleted, 1);
+        assert!(!engine.shard().contains(VectorId::new(1)));
+        assert!(engine.shard().contains(VectorId::new(5)));
     }
 
     /// DELETE on a non-existent id surfaces the Shard's `NotFound` as

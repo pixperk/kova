@@ -12,9 +12,9 @@ use crate::ast::{
 };
 use crate::error::KovaQueryError;
 use crate::logical::{
-    BoundExpr, BoundLiteral, BoundProjection, LogicalAssignment, LogicalDelete, LogicalInsert,
-    LogicalInsertSource, LogicalQuery, LogicalStatement, LogicalUpdate, LogicalVacuum, OrderDir,
-    OrderingSpec, PredAtom, PredicateExpr, ProjectionSpec,
+    BoundExpr, BoundLiteral, BoundProjection, DeleteIdHint, LogicalAssignment, LogicalDelete,
+    LogicalInsert, LogicalInsertSource, LogicalQuery, LogicalStatement, LogicalUpdate,
+    LogicalVacuum, OrderDir, OrderingSpec, PredAtom, PredicateExpr, ProjectionSpec,
 };
 
 /// Canonical INSERT column shape. v1 accepts these three names, in
@@ -200,21 +200,23 @@ fn bind_delete(d: AstDelete) -> Result<LogicalStatement, KovaQueryError> {
 }
 
 /// Pattern-match the top-level predicate for the trivial single-id
-/// equality form (`WHERE id = <integer literal>`). Returns the id
-/// for the planner to grab without re-walking the tree. Param-bound
-/// ids (`WHERE id = $1`) don't qualify because the value isn't
-/// known at bind time.
-fn detect_single_id_hint(pred: &PredicateExpr) -> Option<u64> {
+/// equality forms `WHERE id = <integer literal>` and `WHERE id = $param`.
+/// Returns the resolution (literal value or parameter slot) so the
+/// planner can pick the fast path without re-walking the tree.
+fn detect_single_id_hint(pred: &PredicateExpr) -> Option<DeleteIdHint> {
     let PredicateExpr::Atom(PredAtom::Eq { field, value }) = pred else {
         return None;
     };
     if !field.eq_ignore_ascii_case("id") {
         return None;
     }
-    let BoundExpr::Literal(BoundLiteral::I64(n)) = value else {
-        return None;
-    };
-    u64::try_from(*n).ok()
+    match value {
+        BoundExpr::Literal(BoundLiteral::I64(n)) => {
+            u64::try_from(*n).ok().map(DeleteIdHint::Literal)
+        }
+        BoundExpr::Literal(_) => None,
+        BoundExpr::Param(param) => Some(DeleteIdHint::Param(param.clone())),
+    }
 }
 
 // =========================================================================
@@ -767,19 +769,22 @@ mod tests {
         let LogicalStatement::Delete(LogicalDelete { single_id_hint, .. }) = logical else {
             panic!("expected Delete");
         };
-        assert_eq!(single_id_hint, Some(42));
+        assert_eq!(single_id_hint, Some(DeleteIdHint::Literal(42)));
     }
 
     #[test]
-    fn binds_delete_with_param_id_does_not_set_single_id_hint() {
-        // The id value isn't known at bind time when it's a parameter,
-        // so the planner doesn't get a fast path. The hint stays None.
+    fn binds_delete_with_param_id_sets_param_hint() {
+        // Param-bound id qualifies for the fast path : the planner
+        // emits a DeleteByParamId operator, the executor resolves the
+        // slot at run time.
         let ast = parse_str("DELETE FROM vectors WHERE id = $1").expect("parse Ok");
         let logical = bind(ast).expect("bind Ok");
         let LogicalStatement::Delete(LogicalDelete { single_id_hint, .. }) = logical else {
             panic!("expected Delete");
         };
-        assert_eq!(single_id_hint, None);
+        let Some(DeleteIdHint::Param(_)) = single_id_hint else {
+            panic!("expected Param hint, got {single_id_hint:?}");
+        };
     }
 
     #[test]

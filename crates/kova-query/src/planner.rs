@@ -13,7 +13,7 @@ use crate::ast::{CmpOp, DistanceOp, ParamRef};
 use crate::error::KovaQueryError;
 use crate::executor::ParamBindings;
 use crate::logical::{
-    BoundProjection, LogicalDelete, LogicalInsert, LogicalInsertSource, LogicalQuery,
+    BoundProjection, DeleteIdHint, LogicalDelete, LogicalInsert, LogicalInsertSource, LogicalQuery,
     LogicalStatement, LogicalVacuum, OrderingSpec, PredAtom, PredicateExpr, ProjectionSpec,
 };
 use crate::physical::PhysicalPlan;
@@ -118,25 +118,46 @@ pub fn plan_with_estimator<E: SelectivityEstimator>(
             single_id_hint,
             predicate,
         }) => {
-            // Hint set : binder spotted `WHERE id = <integer-literal>`.
-            // Skip straight to the fast path ; no predicate evaluation
-            // needed.
-            if let Some(id) = single_id_hint {
-                return Ok(PhysicalPlan::DeleteById {
+            // Hint set : binder spotted a single-id shape. Either the
+            // value is known at bind time (literal) or carried in a
+            // parameter slot. Both skip the metadata scan.
+            match single_id_hint {
+                Some(DeleteIdHint::Literal(id)) => {
+                    return Ok(PhysicalPlan::DeleteById {
+                        table,
+                        id: VectorId::new(id),
+                    });
+                }
+                Some(DeleteIdHint::Param(id_param)) => {
+                    return Ok(PhysicalPlan::DeleteByParamId { table, id_param });
+                }
+                None => {}
+            }
+            // Hint missing : try the radius shape first (predicate
+            // contains a top-level `embedding <-> $q < r` atom). If
+            // the radius extractor doesn't recognise it, fall through
+            // to the metadata-scan path.
+            reject_or_with_distance_threshold(&predicate)?;
+            if let Some(extracted) = extract_radius_atom(&predicate) {
+                return Ok(PhysicalPlan::DeleteByRadius {
                     table,
-                    id: VectorId::new(id),
+                    query: extracted.query_param,
+                    metric: extracted.metric,
+                    radius: extracted.radius,
+                    inclusive: extracted.inclusive,
+                    post_filter: extracted.residue,
                 });
             }
-            // Hint missing : route to the predicate-driven path. The
-            // executor scans metadata for matching ids and feeds them
-            // to `Shard::delete_many` in one batch. Distance-threshold
-            // predicates are rejected upfront because the metadata
-            // evaluator can't score distances.
+            // No radius atom : if the predicate still hides a distance
+            // threshold (NOT, deeper Or, etc.) reject with a clear
+            // message rather than route to MetadataScan whose evaluator
+            // errors at runtime.
             if predicate_has_distance_threshold(&predicate) {
                 return Err(KovaQueryError::Plan(
-                    "DELETE WHERE <distance-threshold> isn't supported ; \
-                     distance predicates need the radius operator, \
-                     not the metadata scan"
+                    "DELETE WHERE <distance-threshold> in a shape the radius \
+                     planner doesn't recognise (e.g. NOT, nested OR) ; only \
+                     `<distance> < r` or `<distance> <= r` at the top of the \
+                     WHERE is supported"
                         .into(),
                 ));
             }

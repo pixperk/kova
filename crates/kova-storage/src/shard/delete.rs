@@ -121,11 +121,11 @@ where
             }
         }
 
-        // Phase 2 : group-commit. N appends, 1 sync.
-        for &id in &ids {
-            let record = Record::Delete { id };
-            self.wal.append(&record).map_err(ShardError::backend)?;
-        }
+        // Phase 2 : group-commit. One DeleteMany frame for the whole
+        // batch instead of N Delete frames ; replay applies each id
+        // independently so the on-disk effect is identical.
+        let record = Record::DeleteMany { ids: ids.clone() };
+        self.wal.append(&record).map_err(ShardError::backend)?;
         self.wal.sync().map_err(ShardError::backend)?;
 
         // Phase 3 : apply, panic on failure.

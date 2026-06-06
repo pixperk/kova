@@ -61,6 +61,34 @@ pub enum PhysicalPlan {
         /// Pre-resolved id (no parameter lookup needed at execute time).
         id: VectorId,
     },
+    /// DELETE by an id sourced from a parameter slot. Mirror of
+    /// `DeleteById` for `WHERE id = $param` — the executor resolves
+    /// the param at run time, then dispatches to `Shard::delete`.
+    DeleteByParamId {
+        /// Target table.
+        table: String,
+        /// Parameter slot carrying the id.
+        id_param: ParamRef,
+    },
+    /// DELETE by radius : every live id within `radius` of `query`
+    /// is tombstoned. The executor uses `Shard::search_radius` to
+    /// produce the id set, applies any AND-residue against each
+    /// hit's metadata, then dispatches to `Shard::delete_many` for
+    /// one WAL group-commit.
+    DeleteByRadius {
+        /// Target table.
+        table: String,
+        /// Parameter slot for the query vector.
+        query: ParamRef,
+        /// Distance metric requested.
+        metric: DistanceOp,
+        /// Distance bound.
+        radius: f32,
+        /// Whether the comparison was strict (`<`) or inclusive (`<=`).
+        inclusive: bool,
+        /// Optional non-distance predicate residue from the WHERE.
+        post_filter: Option<PredicateExpr>,
+    },
     /// DELETE by predicate : scan metadata for matching ids, then
     /// batch-tombstone the lot in a single WAL group-commit. Produced
     /// when the binder couldn't extract a single-id hint (predicate

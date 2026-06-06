@@ -25,6 +25,15 @@ pub enum Record {
         /// Identifier to remove.
         id: VectorId,
     },
+    /// Delete a batch of ids in one record. Semantically equivalent
+    /// to N `Delete { id }` records on replay ; the compact form
+    /// keeps the WAL smaller and lets a batched DELETE-by-predicate
+    /// land as a single frame.
+    DeleteMany {
+        /// Identifiers to remove. Order isn't preserved through
+        /// replay (each id is applied independently).
+        ids: Vec<VectorId>,
+    },
 }
 
 /// Result of attempting to fill a buffer from a [`Read`] source.

@@ -123,9 +123,19 @@ pub struct LogicalDelete {
     pub table: String,
     /// WHERE-clause predicate (required by grammar).
     pub predicate: PredicateExpr,
-    /// `Some(id)` when `predicate` is exactly `Eq("id", Literal(I64(n)))`.
-    /// The binder sets this so the planner gets the answer for free.
-    pub single_id_hint: Option<u64>,
+    /// `Some(...)` when `predicate` is exactly `id = <literal>` or
+    /// `id = $param`. The binder sets this so the planner gets the
+    /// answer (or the parameter slot) for free.
+    pub single_id_hint: Option<DeleteIdHint>,
+}
+
+/// How the binder resolved the single-id shape of a DELETE predicate.
+#[derive(Debug, Clone, PartialEq)]
+pub enum DeleteIdHint {
+    /// `WHERE id = <integer-literal>` ; planner knows the id directly.
+    Literal(u64),
+    /// `WHERE id = $param` ; executor resolves the param at run time.
+    Param(crate::ast::ParamRef),
 }
 
 /// Canonical predicate tree. Flat (no nested `And`/`Or` of the same
