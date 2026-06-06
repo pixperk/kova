@@ -99,4 +99,34 @@ pub enum PhysicalPlan {
         /// Projection list with wildcards already expanded.
         spec: ProjectionSpec,
     },
+    /// Scan the metadata store for live ids whose bag passes
+    /// `predicate`. Plan B's entry point : the "pre-filter" that
+    /// produces a candidate id set the downstream `ExactDistance`
+    /// can score.
+    ///
+    /// v1 uses `Shard::scan_metadata`, an O(N) walk. v2 dispatches
+    /// to a secondary index when one exists for the predicate.
+    MetadataScan {
+        /// Target table.
+        table: String,
+        /// Predicate evaluated against each row's metadata.
+        predicate: PredicateExpr,
+    },
+    /// Compute exact distance from `query` to each input id under
+    /// the shard's metric, sort ascending, take top `k`. Plan B's
+    /// "rank by distance" step ; replaces plan A's kNN-with-overfetch.
+    ///
+    /// Wins over plan A when the input candidate set is small enough
+    /// that computing exact distances costs less than running the kNN.
+    /// Selectivity-driven planner picks between them in v2.
+    ExactDistance {
+        /// Sub-plan producing the candidate ids (typically `MetadataScan`).
+        input: Box<PhysicalPlan>,
+        /// Parameter slot for the query vector.
+        query: ParamRef,
+        /// Distance metric. Recorded ; v1 uses the shard's native metric.
+        metric: DistanceOp,
+        /// Top-k cap after exact-distance scoring.
+        k: usize,
+    },
 }

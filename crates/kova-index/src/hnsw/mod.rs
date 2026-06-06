@@ -98,6 +98,15 @@ impl<D: Distance, V: VectorStore> HnswIndex<D, V> {
         self.metric.name()
     }
 
+    /// Borrow the configured distance metric. Lets callers compute
+    /// distances against arbitrary vectors using the same metric the
+    /// index was built with (e.g. `Shard::distance_to` for plan B's
+    /// exact-distance step).
+    #[must_use]
+    pub fn metric(&self) -> &D {
+        &self.metric
+    }
+
     /// Read-only view of the tuning parameters.
     #[must_use]
     pub fn params(&self) -> &HnswParams {

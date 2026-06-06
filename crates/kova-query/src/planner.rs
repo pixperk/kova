@@ -133,27 +133,51 @@ fn plan_query(q: LogicalQuery) -> Result<PhysicalPlan, KovaQueryError> {
     // Step 3 : expand wildcards. v1 maps `*` to `[Id, Metadata]`.
     let projection = expand_wildcard(projection);
 
-    // Step 4 : build the operator tree.
-    //   Projection                 (outer : produces user-facing Rows)
-    //     └── Limit                (truncates to user_limit)
-    //           └── KnnSearch      (overfetched, post-filtered)
-    let overfetched_k = usize::try_from(user_limit)
-        .unwrap_or(usize::MAX)
-        .saturating_mul(KNN_OVERFETCH);
     let (metric, query_param) = knn;
-    let knn = PhysicalPlan::KnnSearch {
-        table: from_table,
-        query: query_param,
-        metric,
-        k: overfetched_k,
-        post_filter: predicate,
+    let user_k = usize::try_from(user_limit).unwrap_or(usize::MAX);
+
+    // Step 4 : pick plan A or plan B.
+    //
+    // v1 stopgap rule : if there's a predicate, use plan B (scan + exact
+    // distance). Otherwise plan A (pure kNN overfetch). This is wrong
+    // when the predicate has high selectivity (plan A is faster), but
+    // it's the simplest rule that produces correct answers without a
+    // cost model. v2 (M2.6) replaces this with selectivity-based dispatch
+    // : `estimate_selectivity(pred) < threshold` picks B, otherwise A.
+    let plan = if let Some(pred) = predicate {
+        // Plan B : MetadataScan -> ExactDistance -> Limit -> Projection
+        let scan = PhysicalPlan::MetadataScan {
+            table: from_table,
+            predicate: pred,
+        };
+        let exact = PhysicalPlan::ExactDistance {
+            input: Box::new(scan),
+            query: query_param,
+            metric,
+            k: user_k,
+        };
+        PhysicalPlan::Limit {
+            input: Box::new(exact),
+            limit: user_limit,
+        }
+    } else {
+        // Plan A : KnnSearch(overfetch) -> Limit -> Projection
+        let overfetched_k = user_k.saturating_mul(KNN_OVERFETCH);
+        let knn = PhysicalPlan::KnnSearch {
+            table: from_table,
+            query: query_param,
+            metric,
+            k: overfetched_k,
+            post_filter: None,
+        };
+        PhysicalPlan::Limit {
+            input: Box::new(knn),
+            limit: user_limit,
+        }
     };
-    let limited = PhysicalPlan::Limit {
-        input: Box::new(knn),
-        limit: user_limit,
-    };
+
     Ok(PhysicalPlan::Projection {
-        input: Box::new(limited),
+        input: Box::new(plan),
         spec: projection,
     })
 }

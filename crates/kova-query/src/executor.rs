@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 
 use kova_core::{Distance, Metadata, Value, Vector, VectorId};
-use kova_storage::{FileMetadataStore, FileWal, Lsn, MmapVectorStore, SearchHit, Shard};
+use kova_storage::{FileMetadataStore, FileWal, Lsn, MmapVectorStore, Shard};
 
 use crate::ast::ParamRef;
 use crate::binder::bind;
@@ -338,8 +338,9 @@ impl<D: Distance> Engine<D> {
 
             // Read path : the outermost operator must be Projection,
             // because that's the only one that builds user-facing
-            // `Row` values. Limit / KnnSearch are *internal* — they
-            // flow `Vec<SearchHit>` between themselves via
+            // `Row` values. Internal read operators
+            // (KnnSearch / MetadataScan / ExactDistance / Limit)
+            // flow `Vec<InternalHit>` between themselves via
             // `execute_read` and shouldn't appear at the top level.
             PhysicalPlan::Projection { input, spec } => {
                 let hits = self.execute_read(*input, params)?;
@@ -351,11 +352,12 @@ impl<D: Distance> Engine<D> {
                     rows: rows?,
                 })
             }
-            PhysicalPlan::Limit { .. } | PhysicalPlan::KnnSearch { .. } => {
-                Err(KovaQueryError::Plan(
-                    "read-path operator at top level ; planner must wrap in Projection".into(),
-                ))
-            }
+            PhysicalPlan::Limit { .. }
+            | PhysicalPlan::KnnSearch { .. }
+            | PhysicalPlan::MetadataScan { .. }
+            | PhysicalPlan::ExactDistance { .. } => Err(KovaQueryError::Plan(
+                "read-path operator at top level ; planner must wrap in Projection".into(),
+            )),
         }
     }
 
@@ -366,7 +368,7 @@ impl<D: Distance> Engine<D> {
         &self,
         plan: PhysicalPlan,
         params: &ParamBindings,
-    ) -> Result<Vec<SearchHit>, KovaQueryError> {
+    ) -> Result<Vec<InternalHit>, KovaQueryError> {
         match plan {
             PhysicalPlan::KnnSearch {
                 table,
@@ -381,19 +383,86 @@ impl<D: Distance> Engine<D> {
                     .shard
                     .search(&query_vec, k)
                     .map_err(|e| KovaQueryError::Backend(Box::new(e)))?;
-                let filtered = match post_filter {
-                    None => hits,
-                    Some(pred) => {
-                        let mut kept = Vec::with_capacity(hits.len());
-                        for h in hits {
-                            if eval_predicate(&pred, &h.metadata, params)? {
-                                kept.push(h);
-                            }
-                        }
-                        kept
+                // Apply post-filter (if any), then promote SearchHit to
+                // InternalHit. distance is Some(_) on the kNN path.
+                let mut out = Vec::with_capacity(hits.len());
+                for h in hits {
+                    if let Some(ref pred) = post_filter
+                        && !eval_predicate(pred, &h.metadata, params)?
+                    {
+                        continue;
                     }
-                };
-                Ok(filtered)
+                    out.push(InternalHit {
+                        id: h.id,
+                        distance: Some(h.distance),
+                        metadata: h.metadata,
+                    });
+                }
+                Ok(out)
+            }
+            PhysicalPlan::MetadataScan { table, predicate } => {
+                self.assert_table(&table)?;
+                // The closure must signal eval errors back to the caller
+                // without coercing them into `false` (which would silently
+                // drop rows we couldn't classify). Capture into a mut
+                // optional ; check after the scan returns.
+                let mut closure_err: Option<KovaQueryError> = None;
+                let ids = self.shard.scan_metadata(|m| {
+                    if closure_err.is_some() {
+                        return false;
+                    }
+                    match eval_predicate(&predicate, m, params) {
+                        Ok(b) => b,
+                        Err(e) => {
+                            closure_err = Some(e);
+                            false
+                        }
+                    }
+                });
+                if let Some(e) = closure_err {
+                    return Err(e);
+                }
+                let hits = ids
+                    .into_iter()
+                    .filter_map(|id| {
+                        self.shard.get_metadata(id).map(|metadata| InternalHit {
+                            id,
+                            distance: None,
+                            metadata,
+                        })
+                    })
+                    .collect();
+                Ok(hits)
+            }
+            PhysicalPlan::ExactDistance {
+                input,
+                query,
+                metric: _,
+                k,
+            } => {
+                let candidates = self.execute_read(*input, params)?;
+                let query_vec = expect_vector(params.resolve(&query)?, "query")?;
+                // Compute exact distance for each candidate, drop those
+                // whose vector is gone (tombstoned or absent).
+                let mut scored: Vec<InternalHit> = candidates
+                    .into_iter()
+                    .filter_map(|h| {
+                        self.shard
+                            .distance_to(h.id, &query_vec)
+                            .map(|d| InternalHit {
+                                id: h.id,
+                                distance: Some(d),
+                                metadata: h.metadata,
+                            })
+                    })
+                    .collect();
+                // Sort ascending by distance.
+                scored.sort_by(|a, b| match (a.distance, b.distance) {
+                    (Some(x), Some(y)) => x.partial_cmp(&y).unwrap_or(std::cmp::Ordering::Equal),
+                    _ => std::cmp::Ordering::Equal,
+                });
+                scored.truncate(k);
+                Ok(scored)
             }
             PhysicalPlan::Limit { input, limit } => {
                 let hits = self.execute_read(*input, params)?;
@@ -498,6 +567,8 @@ fn physical_kind(plan: &PhysicalPlan) -> &'static str {
         PhysicalPlan::KnnSearch { .. } => "KnnSearch",
         PhysicalPlan::Limit { .. } => "Limit",
         PhysicalPlan::Projection { .. } => "Projection",
+        PhysicalPlan::MetadataScan { .. } => "MetadataScan",
+        PhysicalPlan::ExactDistance { .. } => "ExactDistance",
     }
 }
 
@@ -725,8 +796,20 @@ fn column_name(col: &BoundProjection) -> String {
     }
 }
 
-/// Convert one [`SearchHit`] to a [`Row`] under the projection spec.
-fn project_hit(hit: &SearchHit, spec: &ProjectionSpec) -> Result<Row, KovaQueryError> {
+/// Internal row carrier between read-path operators. kNN paths
+/// (`KnnSearch`, `ExactDistance`) produce hits with `distance =
+/// Some(_)` ; the pure scan path (`MetadataScan`) produces
+/// `distance = None`, and any downstream Distance projection on such
+/// a hit fails at projection time with a Plan error.
+#[derive(Debug, Clone)]
+struct InternalHit {
+    id: VectorId,
+    distance: Option<f32>,
+    metadata: Metadata,
+}
+
+/// Convert one [`InternalHit`] to a [`Row`] under the projection spec.
+fn project_hit(hit: &InternalHit, spec: &ProjectionSpec) -> Result<Row, KovaQueryError> {
     let values: Result<Vec<RowValue>, _> = spec
         .columns
         .iter()
@@ -736,7 +819,7 @@ fn project_hit(hit: &SearchHit, spec: &ProjectionSpec) -> Result<Row, KovaQueryE
 }
 
 /// Project one column from a hit.
-fn project_column(hit: &SearchHit, col: &BoundProjection) -> Result<RowValue, KovaQueryError> {
+fn project_column(hit: &InternalHit, col: &BoundProjection) -> Result<RowValue, KovaQueryError> {
     match col {
         BoundProjection::Wildcard => Err(KovaQueryError::Plan(
             "wildcard projection should have been expanded by the planner".into(),
@@ -745,7 +828,13 @@ fn project_column(hit: &SearchHit, col: &BoundProjection) -> Result<RowValue, Ko
             "COUNT(*) is not supported in plan A ; lands with aggregates later".into(),
         )),
         BoundProjection::Id { .. } => Ok(RowValue::Id(hit.id)),
-        BoundProjection::Distance { .. } => Ok(RowValue::Distance(hit.distance)),
+        BoundProjection::Distance { .. } => match hit.distance {
+            Some(d) => Ok(RowValue::Distance(d)),
+            None => Err(KovaQueryError::Plan(
+                "distance projection requires a kNN ordering ; this plan didn't compute distances"
+                    .into(),
+            )),
+        },
         BoundProjection::Metadata { .. } => Ok(RowValue::Metadata(hit.metadata.clone())),
         BoundProjection::MetadataField { name, .. } => Ok(hit
             .metadata
@@ -1634,6 +1723,189 @@ mod tests {
             )
             .expect_err("expected error");
         assert!(matches!(err, KovaQueryError::Execution(_)));
+    }
+
+    // ----- SELECT plan B : scan + exact distance -----
+
+    /// Planner-shape check : a SELECT with a predicate emits plan B
+    /// (`Projection` -> `Limit` -> `ExactDistance` -> `MetadataScan`).
+    #[test]
+    fn planner_picks_plan_b_when_predicate_present() {
+        use crate::physical::PhysicalPlan;
+        use crate::planner::plan;
+        let ast = parse_str(
+            "SELECT id FROM vectors WHERE category = 'docs' \
+             ORDER BY embedding <-> $1 LIMIT 10",
+        )
+        .expect("parse");
+        let logical = crate::binder::bind(ast).expect("bind");
+        let physical = plan(logical).expect("plan");
+        let PhysicalPlan::Projection { input, .. } = physical else {
+            panic!("expected Projection root");
+        };
+        let PhysicalPlan::Limit { input, .. } = *input else {
+            panic!("expected Limit");
+        };
+        let PhysicalPlan::ExactDistance { input, .. } = *input else {
+            panic!("expected ExactDistance, got {input:?}");
+        };
+        assert!(
+            matches!(*input, PhysicalPlan::MetadataScan { .. }),
+            "expected MetadataScan, got {input:?}"
+        );
+    }
+
+    /// Planner-shape check : a SELECT without a predicate stays on
+    /// plan A (`KnnSearch` with overfetch).
+    #[test]
+    fn planner_picks_plan_a_when_no_predicate() {
+        use crate::physical::PhysicalPlan;
+        use crate::planner::plan;
+        let ast =
+            parse_str("SELECT id FROM vectors ORDER BY embedding <-> $1 LIMIT 10").expect("parse");
+        let logical = crate::binder::bind(ast).expect("bind");
+        let physical = plan(logical).expect("plan");
+        let PhysicalPlan::Projection { input, .. } = physical else {
+            panic!("expected Projection root");
+        };
+        let PhysicalPlan::Limit { input, .. } = *input else {
+            panic!("expected Limit");
+        };
+        assert!(
+            matches!(*input, PhysicalPlan::KnnSearch { .. }),
+            "expected KnnSearch, got {input:?}"
+        );
+    }
+
+    /// Plan B returns rows sorted ascending by exact distance.
+    /// The scan finds matching rows, `ExactDistance` ranks them.
+    #[test]
+    fn plan_b_orders_results_by_exact_distance() {
+        let dir = tempdir().expect("tempdir");
+        let mut engine = make_engine(&dir);
+        // Three 'docs' rows + one 'specs' (which the predicate excludes).
+        // Vector positions chosen so distance ordering is deterministic.
+        seed_engine(
+            &mut engine,
+            &[
+                meta_of(&[("category", Value::String("docs".into()))]), // id 1, vec [1,0,0,0]
+                meta_of(&[("category", Value::String("docs".into()))]), // id 2, vec [0,1,0,0]
+                meta_of(&[("category", Value::String("docs".into()))]), // id 3, vec [0,0,1,0]
+                meta_of(&[("category", Value::String("specs".into()))]), // id 4, vec [0,0,0,1]
+            ],
+        );
+        // Query at [0.9, 0.1, 0, 0] : closest 'docs' rows in order are 1, 2, 3.
+        let q = Vector::try_new(vec![0.9, 0.1, 0.0, 0.0]).unwrap();
+        let result = engine
+            .execute_str(
+                "SELECT id FROM vectors WHERE category = 'docs' \
+                 ORDER BY embedding <-> $1 LIMIT 3",
+                ParamBindings::empty().with_positional(ParamValue::Vector(q)),
+            )
+            .expect("execute_str");
+        let ExecutionResult::Rows { rows, .. } = result else {
+            panic!("expected Rows");
+        };
+        assert_eq!(rows.len(), 3);
+        // The 'specs' row (id 4) is excluded.
+        let ids: Vec<u64> = rows
+            .iter()
+            .map(|r| match r.values[0] {
+                RowValue::Id(id) => id.get(),
+                _ => unreachable!(),
+            })
+            .collect();
+        assert!(!ids.contains(&4), "specs row leaked through plan B");
+        assert_eq!(ids[0], 1, "nearest 'docs' should be id 1");
+    }
+
+    /// Plan B respects LIMIT : if the scan finds more matches than k,
+    /// only the k nearest are returned.
+    #[test]
+    fn plan_b_caps_result_at_limit() {
+        let dir = tempdir().expect("tempdir");
+        let mut engine = make_engine(&dir);
+        // All 4 rows match the predicate.
+        seed_engine(
+            &mut engine,
+            &[
+                meta_of(&[("tag", Value::String("a".into()))]),
+                meta_of(&[("tag", Value::String("a".into()))]),
+                meta_of(&[("tag", Value::String("a".into()))]),
+                meta_of(&[("tag", Value::String("a".into()))]),
+            ],
+        );
+        let q = Vector::try_new(vec![1.0, 0.0, 0.0, 0.0]).unwrap();
+        let result = engine
+            .execute_str(
+                "SELECT id FROM vectors WHERE tag = 'a' \
+                 ORDER BY embedding <-> $1 LIMIT 2",
+                ParamBindings::empty().with_positional(ParamValue::Vector(q)),
+            )
+            .expect("execute_str");
+        let ExecutionResult::Rows { rows, .. } = result else {
+            panic!("expected Rows");
+        };
+        assert_eq!(rows.len(), 2, "LIMIT 2 should cap to 2 rows");
+    }
+
+    /// Plan B returns zero rows when no metadata row matches the
+    /// predicate, without errors. Plan A would have returned k
+    /// candidates that all failed post-filter ; plan B never even
+    /// runs the kNN.
+    #[test]
+    fn plan_b_handles_empty_match_set() {
+        let dir = tempdir().expect("tempdir");
+        let mut engine = make_engine(&dir);
+        seed_engine(
+            &mut engine,
+            &[meta_of(&[("category", Value::String("specs".into()))])],
+        );
+        let q = Vector::try_new(vec![1.0, 0.0, 0.0, 0.0]).unwrap();
+        let result = engine
+            .execute_str(
+                "SELECT id FROM vectors WHERE category = 'docs' \
+                 ORDER BY embedding <-> $1 LIMIT 10",
+                ParamBindings::empty().with_positional(ParamValue::Vector(q)),
+            )
+            .expect("execute_str");
+        let ExecutionResult::Rows { rows, .. } = result else {
+            panic!("expected Rows");
+        };
+        assert!(
+            rows.is_empty(),
+            "no 'docs' rows present, result should be empty"
+        );
+    }
+
+    /// Plan B fills in real distances via `Shard::distance_to`, so
+    /// `embedding <-> $q AS distance` projections work.
+    #[test]
+    fn plan_b_distance_projection_returns_exact_distance() {
+        let dir = tempdir().expect("tempdir");
+        let mut engine = make_engine(&dir);
+        seed_engine(
+            &mut engine,
+            &[meta_of(&[("category", Value::String("docs".into()))])],
+        );
+        let q = Vector::try_new(vec![1.0, 0.0, 0.0, 0.0]).unwrap();
+        let result = engine
+            .execute_str(
+                "SELECT id, embedding <-> $1 AS dist FROM vectors \
+                 WHERE category = 'docs' \
+                 ORDER BY embedding <-> $1 LIMIT 1",
+                ParamBindings::empty().with_positional(ParamValue::Vector(q)),
+            )
+            .expect("execute_str");
+        let ExecutionResult::Rows { columns, rows } = result else {
+            panic!("expected Rows");
+        };
+        assert_eq!(columns, vec!["id".to_string(), "dist".to_string()]);
+        let RowValue::Distance(d) = rows[0].values[1] else {
+            panic!("expected Distance, got {:?}", rows[0].values[1]);
+        };
+        // axis_vec(1) = [1, 0, 0, 0] equals the query exactly, distance 0.
+        assert!(d.abs() < f32::EPSILON, "expected ~0, got {d}");
     }
 
     /// Full write-path round-trip : insert two ids, delete one,

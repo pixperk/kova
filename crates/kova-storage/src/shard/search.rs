@@ -63,6 +63,31 @@ where
             .filter(|id| !self.index.is_tombstoned(*id))
             .collect()
     }
+
+    /// Fetch the metadata bag for `id` (returns an owned clone).
+    /// `None` if the id isn't present in the metadata store.
+    ///
+    /// This is the executor's "I have ids, now I need their
+    /// metadata" primitive — used by plan B's `ExactDistance` and
+    /// `MetadataScan` to attach metadata to each id.
+    pub fn get_metadata(&self, id: VectorId) -> Option<Metadata> {
+        self.metadata.get(id)
+    }
+
+    /// Distance from the vector at `id` to the `query` vector under
+    /// the shard's configured metric. `None` if the id isn't present
+    /// or has been tombstoned.
+    ///
+    /// This is plan B's `ExactDistance` primitive : given a small
+    /// candidate id set (typically from `scan_metadata`), compute the
+    /// exact distance for each so the executor can sort top-k.
+    pub fn distance_to(&self, id: VectorId, query: &Vector) -> Option<f32> {
+        if self.index.is_tombstoned(id) {
+            return None;
+        }
+        let stored = self.index.get(id)?;
+        Some(self.index.metric().distance(&stored, query))
+    }
 }
 
 #[cfg(test)]
@@ -284,5 +309,52 @@ mod tests {
     fn scan_metadata_on_empty_shard_returns_empty() {
         let shard = fresh_in_memory();
         assert!(shard.scan_metadata(|_| true).is_empty());
+    }
+
+    // ----- get_metadata + distance_to -----
+
+    #[test]
+    fn get_metadata_returns_inserted_bag() {
+        let mut shard = fresh_in_memory();
+        shard
+            .insert(id(1), v(vec![1.0, 0.0]), tag_meta("docs"))
+            .unwrap();
+        let m = shard.get_metadata(id(1)).expect("present");
+        assert_eq!(m.get("tag"), Some(&Value::String("docs".into())));
+    }
+
+    #[test]
+    fn get_metadata_missing_id_returns_none() {
+        let shard = fresh_in_memory();
+        assert!(shard.get_metadata(id(42)).is_none());
+    }
+
+    #[test]
+    fn distance_to_computes_exact_distance() {
+        let mut shard = fresh_in_memory();
+        shard
+            .insert(id(1), v(vec![3.0, 4.0]), Metadata::new())
+            .unwrap();
+        // L2 distance from (3, 4) to (0, 0) is 5.
+        let d = shard
+            .distance_to(id(1), &v(vec![0.0, 0.0]))
+            .expect("present");
+        assert!((d - 5.0).abs() < f32::EPSILON, "got {d}");
+    }
+
+    #[test]
+    fn distance_to_missing_id_returns_none() {
+        let shard = fresh_in_memory();
+        assert!(shard.distance_to(id(99), &v(vec![0.0, 0.0])).is_none());
+    }
+
+    #[test]
+    fn distance_to_tombstoned_id_returns_none() {
+        let mut shard = fresh_in_memory();
+        shard
+            .insert(id(1), v(vec![1.0, 0.0]), Metadata::new())
+            .unwrap();
+        shard.delete(id(1)).unwrap();
+        assert!(shard.distance_to(id(1), &v(vec![0.0, 0.0])).is_none());
     }
 }
