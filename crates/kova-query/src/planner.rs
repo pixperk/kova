@@ -13,8 +13,9 @@ use crate::ast::{CmpOp, DistanceOp, ParamRef};
 use crate::error::KovaQueryError;
 use crate::executor::ParamBindings;
 use crate::logical::{
-    BoundProjection, DeleteIdHint, LogicalDelete, LogicalInsert, LogicalInsertSource, LogicalQuery,
-    LogicalStatement, LogicalVacuum, OrderingSpec, PredAtom, PredicateExpr, ProjectionSpec,
+    BoundProjection, IdHint, LogicalAssignment, LogicalDelete, LogicalInsert, LogicalInsertSource,
+    LogicalQuery, LogicalStatement, LogicalUpdate, LogicalVacuum, OrderingSpec, PredAtom,
+    PredicateExpr, ProjectionSpec,
 };
 use crate::physical::PhysicalPlan;
 
@@ -122,13 +123,13 @@ pub fn plan_with_estimator<E: SelectivityEstimator>(
             // value is known at bind time (literal) or carried in a
             // parameter slot. Both skip the metadata scan.
             match single_id_hint {
-                Some(DeleteIdHint::Literal(id)) => {
+                Some(IdHint::Literal(id)) => {
                     return Ok(PhysicalPlan::DeleteById {
                         table,
                         id: VectorId::new(id),
                     });
                 }
-                Some(DeleteIdHint::Param(id_param)) => {
+                Some(IdHint::Param(id_param)) => {
                     return Ok(PhysicalPlan::DeleteByParamId { table, id_param });
                 }
                 None => {}
@@ -166,10 +167,53 @@ pub fn plan_with_estimator<E: SelectivityEstimator>(
 
         LogicalStatement::Query(q) => plan_query(q, estimator, params),
 
-        // Filled in as each statement gains executor support. Explicit
-        // arms (rather than `_`) so the compiler errors the moment a
-        // new LogicalStatement variant is added without a planner arm.
-        LogicalStatement::Update(_) => unimplemented("UPDATE"),
+        LogicalStatement::Update(LogicalUpdate {
+            table,
+            predicate: _,
+            assignments,
+            single_id_hint,
+        }) => plan_update(table, assignments, single_id_hint),
+    }
+}
+
+/// Plan an UPDATE statement. Phase B ships the two single-id fast
+/// paths ; everything else (radius, predicate scan) is Phase C and is
+/// rejected here with a clear message.
+fn plan_update(
+    table: String,
+    assignments: Vec<LogicalAssignment>,
+    single_id_hint: Option<IdHint>,
+) -> Result<PhysicalPlan, KovaQueryError> {
+    if assignments.is_empty() {
+        return Err(KovaQueryError::Plan(
+            "UPDATE requires at least one assignment ; \
+             the grammar should have caught this earlier"
+                .into(),
+        ));
+    }
+    if assignments.iter().any(|a| a.subscript.is_some()) {
+        return Err(KovaQueryError::Plan(
+            "subscripted assignments (`SET field['key'] = ...`) aren't \
+             supported ; metadata values can't hold nested maps"
+                .into(),
+        ));
+    }
+    match single_id_hint {
+        Some(IdHint::Literal(id)) => Ok(PhysicalPlan::UpdateById {
+            table,
+            id: VectorId::new(id),
+            assignments,
+        }),
+        Some(IdHint::Param(id_param)) => Ok(PhysicalPlan::UpdateByParamId {
+            table,
+            id_param,
+            assignments,
+        }),
+        None => Err(KovaQueryError::Plan(
+            "UPDATE WHERE <predicate> isn't supported yet ; only \
+             `WHERE id = <literal>` and `WHERE id = $param` work"
+                .into(),
+        )),
     }
 }
 
@@ -668,10 +712,4 @@ fn reject_or_with_distance_threshold(pred: &PredicateExpr) -> Result<(), KovaQue
         }
     }
     walk(pred)
-}
-
-fn unimplemented(name: &str) -> Result<PhysicalPlan, KovaQueryError> {
-    Err(KovaQueryError::Plan(format!(
-        "planner not yet implemented for {name}"
-    )))
 }

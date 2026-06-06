@@ -11,7 +11,7 @@
 use kova_core::VectorId;
 
 use crate::ast::{DistanceOp, ParamRef};
-use crate::logical::{PredicateExpr, ProjectionSpec};
+use crate::logical::{LogicalAssignment, PredicateExpr, ProjectionSpec};
 
 /// Physical operator. v1 grows this enum as each statement gets its
 /// executor support. Explicit variants (no catchall) so the executor's
@@ -60,6 +60,28 @@ pub enum PhysicalPlan {
         table: String,
         /// Pre-resolved id (no parameter lookup needed at execute time).
         id: VectorId,
+    },
+    /// UPDATE by literal id. Produced when the binder spotted
+    /// `WHERE id = <integer-literal>` ; the executor fetches the
+    /// current metadata, applies each assignment to a copy, and
+    /// writes the new bag via `Shard::update_metadata`.
+    UpdateById {
+        /// Target table.
+        table: String,
+        /// Pre-resolved id (no parameter lookup needed at execute time).
+        id: VectorId,
+        /// One or more assignments, in source order.
+        assignments: Vec<LogicalAssignment>,
+    },
+    /// UPDATE by an id sourced from a parameter slot. Mirror of
+    /// `UpdateById` for `WHERE id = $param`.
+    UpdateByParamId {
+        /// Target table.
+        table: String,
+        /// Parameter slot carrying the id.
+        id_param: ParamRef,
+        /// One or more assignments, in source order.
+        assignments: Vec<LogicalAssignment>,
     },
     /// DELETE by an id sourced from a parameter slot. Mirror of
     /// `DeleteById` for `WHERE id = $param` — the executor resolves

@@ -12,7 +12,7 @@ use crate::ast::{
 };
 use crate::error::KovaQueryError;
 use crate::logical::{
-    BoundExpr, BoundLiteral, BoundProjection, DeleteIdHint, LogicalAssignment, LogicalDelete,
+    BoundExpr, BoundLiteral, BoundProjection, IdHint, LogicalAssignment, LogicalDelete,
     LogicalInsert, LogicalInsertSource, LogicalQuery, LogicalStatement, LogicalUpdate,
     LogicalVacuum, OrderDir, OrderingSpec, PredAtom, PredicateExpr, ProjectionSpec,
 };
@@ -149,7 +149,8 @@ fn extract_param(e: AstExpr) -> Result<crate::ast::ParamRef, KovaQueryError> {
 }
 
 /// Bind an [`AstUpdate`] : reject embedding assignments (HNSW node
-/// positions are immutable), translate the rest into logical form.
+/// positions are immutable), translate the rest into logical form,
+/// and detect the single-id hint so the planner gets the fast path.
 fn bind_update(u: AstUpdate) -> Result<LogicalStatement, KovaQueryError> {
     let AstUpdate {
         table,
@@ -159,10 +160,12 @@ fn bind_update(u: AstUpdate) -> Result<LogicalStatement, KovaQueryError> {
     let assignments: Result<Vec<_>, _> = assignments.into_iter().map(bind_assignment).collect();
     let assignments = assignments?;
     let predicate = bind_predicate(predicate)?;
+    let single_id_hint = detect_single_id_hint(&predicate);
     Ok(LogicalStatement::Update(LogicalUpdate {
         table,
         predicate,
         assignments,
+        single_id_hint,
     }))
 }
 
@@ -203,7 +206,7 @@ fn bind_delete(d: AstDelete) -> Result<LogicalStatement, KovaQueryError> {
 /// equality forms `WHERE id = <integer literal>` and `WHERE id = $param`.
 /// Returns the resolution (literal value or parameter slot) so the
 /// planner can pick the fast path without re-walking the tree.
-fn detect_single_id_hint(pred: &PredicateExpr) -> Option<DeleteIdHint> {
+fn detect_single_id_hint(pred: &PredicateExpr) -> Option<IdHint> {
     let PredicateExpr::Atom(PredAtom::Eq { field, value }) = pred else {
         return None;
     };
@@ -211,11 +214,9 @@ fn detect_single_id_hint(pred: &PredicateExpr) -> Option<DeleteIdHint> {
         return None;
     }
     match value {
-        BoundExpr::Literal(BoundLiteral::I64(n)) => {
-            u64::try_from(*n).ok().map(DeleteIdHint::Literal)
-        }
+        BoundExpr::Literal(BoundLiteral::I64(n)) => u64::try_from(*n).ok().map(IdHint::Literal),
         BoundExpr::Literal(_) => None,
-        BoundExpr::Param(param) => Some(DeleteIdHint::Param(param.clone())),
+        BoundExpr::Param(param) => Some(IdHint::Param(param.clone())),
     }
 }
 
@@ -670,6 +671,7 @@ mod tests {
             table,
             assignments,
             predicate,
+            ..
         }) = logical
         else {
             panic!("expected Update");
@@ -769,7 +771,7 @@ mod tests {
         let LogicalStatement::Delete(LogicalDelete { single_id_hint, .. }) = logical else {
             panic!("expected Delete");
         };
-        assert_eq!(single_id_hint, Some(DeleteIdHint::Literal(42)));
+        assert_eq!(single_id_hint, Some(IdHint::Literal(42)));
     }
 
     #[test]
@@ -782,7 +784,7 @@ mod tests {
         let LogicalStatement::Delete(LogicalDelete { single_id_hint, .. }) = logical else {
             panic!("expected Delete");
         };
-        let Some(DeleteIdHint::Param(_)) = single_id_hint else {
+        let Some(IdHint::Param(_)) = single_id_hint else {
             panic!("expected Param hint, got {single_id_hint:?}");
         };
     }

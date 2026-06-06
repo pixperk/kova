@@ -99,6 +99,9 @@ pub struct LogicalUpdate {
     pub predicate: PredicateExpr,
     /// One or more assignments, in source order.
     pub assignments: Vec<LogicalAssignment>,
+    /// `Some(...)` when `predicate` is exactly `id = <literal>` or
+    /// `id = $param` ; same fast-path semantics as [`LogicalDelete`].
+    pub single_id_hint: Option<IdHint>,
 }
 
 /// One `field = value` (or `field['key'] = value`) assignment after
@@ -126,12 +129,14 @@ pub struct LogicalDelete {
     /// `Some(...)` when `predicate` is exactly `id = <literal>` or
     /// `id = $param`. The binder sets this so the planner gets the
     /// answer (or the parameter slot) for free.
-    pub single_id_hint: Option<DeleteIdHint>,
+    pub single_id_hint: Option<IdHint>,
 }
 
-/// How the binder resolved the single-id shape of a DELETE predicate.
+/// How the binder resolved the single-id shape of a WHERE predicate.
+/// Shared between DELETE and UPDATE since both have the same fast-path
+/// shape.
 #[derive(Debug, Clone, PartialEq)]
-pub enum DeleteIdHint {
+pub enum IdHint {
     /// `WHERE id = <integer-literal>` ; planner knows the id directly.
     Literal(u64),
     /// `WHERE id = $param` ; executor resolves the param at run time.
