@@ -129,4 +129,16 @@ pub enum PhysicalPlan {
         /// Top-k cap after exact-distance scoring.
         k: usize,
     },
+    /// `SELECT COUNT(*) FROM <table> [WHERE pred]`. The only aggregate
+    /// v1 supports. Bypasses the kNN-only check because there's no
+    /// ordering to perform : just a single scalar result. Returns one
+    /// row with one column.
+    Count {
+        /// Target table.
+        table: String,
+        /// Optional WHERE predicate. `None` means count all live rows.
+        predicate: Option<PredicateExpr>,
+        /// Output column name (alias or `"count"`).
+        column_name: String,
+    },
 }

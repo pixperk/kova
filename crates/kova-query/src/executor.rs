@@ -304,30 +304,12 @@ impl<D: Distance> Engine<D> {
             }
             PhysicalPlan::InsertOne {
                 table,
-                id: id_ref,
-                embedding: emb_ref,
-                metadata: meta_ref,
-            } => {
-                self.assert_table(&table)?;
-                let id = expect_id(params.resolve(&id_ref)?, "id")?;
-                let embedding = expect_vector(params.resolve(&emb_ref)?, "embedding")?;
-                let metadata = expect_metadata(params.resolve(&meta_ref)?, "metadata")?;
-                self.shard
-                    .insert(id, embedding, metadata)
-                    .map_err(|e| KovaQueryError::Backend(Box::new(e)))?;
-                Ok(ExecutionResult::Insert { table, inserted: 1 })
-            }
-            PhysicalPlan::InsertMany {
-                table,
-                batch: batch_ref,
-            } => {
-                self.assert_table(&table)?;
-                let batch = expect_batch(params.resolve(&batch_ref)?, "batch")?;
-                let inserted = batch.len() as u64;
-                self.shard
-                    .insert_many(batch)
-                    .map_err(|e| KovaQueryError::Backend(Box::new(e)))?;
-                Ok(ExecutionResult::Insert { table, inserted })
+                id,
+                embedding,
+                metadata,
+            } => self.exec_insert_one(table, &id, &embedding, &metadata, params),
+            PhysicalPlan::InsertMany { table, batch } => {
+                self.exec_insert_many(table, &batch, params)
             }
             PhysicalPlan::DeleteById { table, id } => {
                 self.assert_table(&table)?;
@@ -353,6 +335,11 @@ impl<D: Distance> Engine<D> {
                     rows: rows?,
                 })
             }
+            PhysicalPlan::Count {
+                table,
+                predicate,
+                column_name,
+            } => self.exec_count(&table, predicate, column_name, params),
             PhysicalPlan::Limit { .. }
             | PhysicalPlan::KnnSearch { .. }
             | PhysicalPlan::MetadataScan { .. }
@@ -360,6 +347,68 @@ impl<D: Distance> Engine<D> {
                 "read-path operator at top level ; planner must wrap in Projection".into(),
             )),
         }
+    }
+
+    /// Single-row INSERT : resolve the three parameter slots into
+    /// concrete values and dispatch to `Shard::insert`.
+    fn exec_insert_one(
+        &mut self,
+        table: String,
+        id_ref: &crate::ast::ParamRef,
+        emb_ref: &crate::ast::ParamRef,
+        meta_ref: &crate::ast::ParamRef,
+        params: &ParamBindings,
+    ) -> Result<ExecutionResult, KovaQueryError> {
+        self.assert_table(&table)?;
+        let id = expect_id(params.resolve(id_ref)?, "id")?;
+        let embedding = expect_vector(params.resolve(emb_ref)?, "embedding")?;
+        let metadata = expect_metadata(params.resolve(meta_ref)?, "metadata")?;
+        self.shard
+            .insert(id, embedding, metadata)
+            .map_err(|e| KovaQueryError::Backend(Box::new(e)))?;
+        Ok(ExecutionResult::Insert { table, inserted: 1 })
+    }
+
+    /// Batch INSERT : resolve the single batch param into a Vec of
+    /// tuples and dispatch to `Shard::insert_many`.
+    fn exec_insert_many(
+        &mut self,
+        table: String,
+        batch_ref: &crate::ast::ParamRef,
+        params: &ParamBindings,
+    ) -> Result<ExecutionResult, KovaQueryError> {
+        self.assert_table(&table)?;
+        let batch = expect_batch(params.resolve(batch_ref)?, "batch")?;
+        let inserted = batch.len() as u64;
+        self.shard
+            .insert_many(batch)
+            .map_err(|e| KovaQueryError::Backend(Box::new(e)))?;
+        Ok(ExecutionResult::Insert { table, inserted })
+    }
+
+    /// COUNT(*) : either `Shard::len()` (no predicate, fast path) or
+    /// `Shard::count_matching` with an evaluated predicate. Returns a
+    /// one-row, one-column `Rows` result.
+    fn exec_count(
+        &self,
+        table: &str,
+        predicate: Option<PredicateExpr>,
+        column_name: String,
+        params: &ParamBindings,
+    ) -> Result<ExecutionResult, KovaQueryError> {
+        self.assert_table(table)?;
+        let count = match predicate {
+            None => self.shard.len(),
+            Some(pred) => count_matching_with_predicate(&self.shard, &pred, params)?,
+        };
+        let count_i64 = i64::try_from(count).unwrap_or(i64::MAX);
+        let row = Row {
+            values: vec![RowValue::Field(Value::I64(count_i64))],
+        };
+        Ok(ExecutionResult::Rows {
+            columns: vec![column_name],
+            rows: vec![row],
+        })
     }
 
     /// Internal read-path executor. Returns the typed hits that flow
@@ -582,6 +631,33 @@ impl<D: Distance> SelectivityEstimator for ShardEstimator<'_, D> {
     }
 }
 
+/// Helper for `Count` and `MetadataScan` arms : count live rows
+/// matching a predicate, propagating any predicate-evaluation error
+/// instead of silently dropping rows.
+fn count_matching_with_predicate<D: Distance>(
+    shard: &Shard<D, MmapVectorStore, FileMetadataStore, FileWal>,
+    pred: &PredicateExpr,
+    params: &ParamBindings,
+) -> Result<usize, KovaQueryError> {
+    let mut closure_err: Option<KovaQueryError> = None;
+    let count = shard.count_matching(|m| {
+        if closure_err.is_some() {
+            return false;
+        }
+        match eval_predicate(pred, m, params) {
+            Ok(b) => b,
+            Err(e) => {
+                closure_err = Some(e);
+                false
+            }
+        }
+    });
+    if let Some(e) = closure_err {
+        return Err(e);
+    }
+    Ok(count)
+}
+
 /// Static label for a [`PhysicalPlan`] variant ; used in error
 /// messages when a read-path operator shows up at the wrong place.
 fn physical_kind(plan: &PhysicalPlan) -> &'static str {
@@ -596,6 +672,7 @@ fn physical_kind(plan: &PhysicalPlan) -> &'static str {
         PhysicalPlan::Projection { .. } => "Projection",
         PhysicalPlan::MetadataScan { .. } => "MetadataScan",
         PhysicalPlan::ExactDistance { .. } => "ExactDistance",
+        PhysicalPlan::Count { .. } => "Count",
     }
 }
 
@@ -1754,44 +1831,23 @@ mod tests {
 
     // ----- SELECT plan B : scan + exact distance -----
 
-    /// Planner-shape check : a SELECT with a predicate emits plan B
-    /// (`Projection` -> `Limit` -> `ExactDistance` -> `MetadataScan`).
-    #[test]
-    fn planner_picks_plan_b_when_predicate_present() {
-        use crate::physical::PhysicalPlan;
-        use crate::planner::plan;
-        let ast = parse_str(
-            "SELECT id FROM vectors WHERE category = 'docs' \
-             ORDER BY embedding <-> $1 LIMIT 10",
-        )
-        .expect("parse");
-        let logical = crate::binder::bind(ast).expect("bind");
-        let physical = plan(logical).expect("plan");
-        let PhysicalPlan::Projection { input, .. } = physical else {
-            panic!("expected Projection root");
-        };
-        let PhysicalPlan::Limit { input, .. } = *input else {
-            panic!("expected Limit");
-        };
-        let PhysicalPlan::ExactDistance { input, .. } = *input else {
-            panic!("expected ExactDistance, got {input:?}");
-        };
-        assert!(
-            matches!(*input, PhysicalPlan::MetadataScan { .. }),
-            "expected MetadataScan, got {input:?}"
-        );
-    }
-
     /// Planner-shape check : a SELECT without a predicate stays on
-    /// plan A (`KnnSearch` with overfetch).
+    /// plan A (`KnnSearch` with overfetch). The estimator is never
+    /// consulted in the no-predicate branch, so this test only needs
+    /// any estimator that compiles.
     #[test]
     fn planner_picks_plan_a_when_no_predicate() {
         use crate::physical::PhysicalPlan;
-        use crate::planner::plan;
+        use crate::planner::plan_with_estimator;
+        let dir = tempdir().expect("tempdir");
+        let engine = make_engine(&dir);
+        let est = ShardEstimator {
+            shard: engine.shard(),
+        };
         let ast =
             parse_str("SELECT id FROM vectors ORDER BY embedding <-> $1 LIMIT 10").expect("parse");
         let logical = crate::binder::bind(ast).expect("bind");
-        let physical = plan(logical).expect("plan");
+        let physical = plan_with_estimator(logical, &est, &ParamBindings::empty()).expect("plan");
         let PhysicalPlan::Projection { input, .. } = physical else {
             panic!("expected Projection root");
         };
@@ -2051,6 +2107,109 @@ mod tests {
         let ids_a = extract_ids(res_a);
         let ids_b = extract_ids(res_b);
         assert_eq!(ids_a, ids_b, "plan A and plan B disagree on the result set");
+    }
+
+    // ----- COUNT(*) -----
+
+    #[test]
+    fn count_star_on_empty_shard_returns_zero() {
+        let dir = tempdir().expect("tempdir");
+        let mut engine = make_engine(&dir);
+        let result = engine
+            .execute_str("SELECT COUNT(*) FROM vectors", ParamBindings::empty())
+            .expect("execute_str");
+        let ExecutionResult::Rows { columns, rows } = result else {
+            panic!("expected Rows");
+        };
+        assert_eq!(columns, vec!["count".to_string()]);
+        assert_eq!(rows.len(), 1);
+        let RowValue::Field(Value::I64(n)) = &rows[0].values[0] else {
+            panic!("expected I64 Field, got {:?}", rows[0].values[0]);
+        };
+        assert_eq!(*n, 0);
+    }
+
+    #[test]
+    fn count_star_returns_total_live_rows() {
+        let dir = tempdir().expect("tempdir");
+        let mut engine = make_engine(&dir);
+        seed_engine(
+            &mut engine,
+            &[Metadata::new(), Metadata::new(), Metadata::new()],
+        );
+        let result = engine
+            .execute_str("SELECT COUNT(*) FROM vectors", ParamBindings::empty())
+            .expect("execute_str");
+        let ExecutionResult::Rows { rows, .. } = result else {
+            panic!("expected Rows");
+        };
+        let RowValue::Field(Value::I64(n)) = rows[0].values[0] else {
+            panic!("expected I64");
+        };
+        assert_eq!(n, 3);
+    }
+
+    #[test]
+    fn count_star_with_predicate_counts_only_matching() {
+        let dir = tempdir().expect("tempdir");
+        let mut engine = make_engine(&dir);
+        seed_engine(
+            &mut engine,
+            &[
+                meta_of(&[("category", Value::String("docs".into()))]),
+                meta_of(&[("category", Value::String("specs".into()))]),
+                meta_of(&[("category", Value::String("docs".into()))]),
+                meta_of(&[("category", Value::String("docs".into()))]),
+            ],
+        );
+        let result = engine
+            .execute_str(
+                "SELECT COUNT(*) FROM vectors WHERE category = 'docs'",
+                ParamBindings::empty(),
+            )
+            .expect("execute_str");
+        let ExecutionResult::Rows { rows, .. } = result else {
+            panic!("expected Rows");
+        };
+        let RowValue::Field(Value::I64(n)) = rows[0].values[0] else {
+            panic!("expected I64");
+        };
+        assert_eq!(n, 3, "three 'docs' rows match");
+    }
+
+    #[test]
+    fn count_star_with_alias_uses_alias_as_column_name() {
+        let dir = tempdir().expect("tempdir");
+        let mut engine = make_engine(&dir);
+        seed_engine(&mut engine, &[Metadata::new(), Metadata::new()]);
+        let result = engine
+            .execute_str("SELECT COUNT(*) AS n FROM vectors", ParamBindings::empty())
+            .expect("execute_str");
+        let ExecutionResult::Rows { columns, .. } = result else {
+            panic!("expected Rows");
+        };
+        assert_eq!(columns, vec!["n".to_string()]);
+    }
+
+    #[test]
+    fn count_star_after_delete_excludes_tombstones() {
+        let dir = tempdir().expect("tempdir");
+        let mut engine = make_engine(&dir);
+        seed_engine(
+            &mut engine,
+            &[Metadata::new(), Metadata::new(), Metadata::new()],
+        );
+        engine.shard_mut().delete(VectorId::new(2)).expect("delete");
+        let result = engine
+            .execute_str("SELECT COUNT(*) FROM vectors", ParamBindings::empty())
+            .expect("execute_str");
+        let ExecutionResult::Rows { rows, .. } = result else {
+            panic!("expected Rows");
+        };
+        let RowValue::Field(Value::I64(n)) = rows[0].values[0] else {
+            panic!("expected I64");
+        };
+        assert_eq!(n, 2, "tombstoned id 2 should not count");
     }
 
     /// Plan B fills in real distances via `Shard::distance_to`, so

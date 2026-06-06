@@ -21,5 +21,5 @@ pub use executor::{Engine, ExecutionResult, ParamBindings, ParamValue};
 pub use logical::LogicalStatement;
 pub use parser::parse_str;
 pub use physical::PhysicalPlan;
-pub use planner::plan;
+pub use planner::plan_with_estimator;
 pub use printer::print;

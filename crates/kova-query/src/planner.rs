@@ -69,45 +69,6 @@ pub trait SelectivityEstimator {
     fn estimate(&self, pred: &PredicateExpr, params: &ParamBindings) -> SelectivityEstimate;
 }
 
-/// Trivial estimator that always reports zero selectivity. Useful
-/// for tests that don't care about the plan choice, and for the
-/// bare `plan()` entry point (kept for backwards-compat with code
-/// that doesn't have a shard handle).
-#[derive(Debug, Default, Clone, Copy)]
-pub struct NoopEstimator;
-
-impl SelectivityEstimator for NoopEstimator {
-    fn estimate(&self, _: &PredicateExpr, _: &ParamBindings) -> SelectivityEstimate {
-        // Zero selectivity reports "very few matches" : the planner
-        // always picks plan B with this estimator, matching the
-        // previous v1 stopgap behaviour.
-        SelectivityEstimate {
-            matches: 0,
-            total: 1,
-        }
-    }
-}
-
-/// Pick the physical plan for a [`LogicalStatement`].
-///
-/// Convenience wrapper around [`plan_with_estimator`] that uses the
-/// [`NoopEstimator`]. For SELECT queries with predicates, this always
-/// picks plan B (matches the previous v1 stopgap behaviour). For
-/// real cost-driven dispatch, use [`plan_with_estimator`] with a
-/// `ShardEstimator` that has access to the shard.
-///
-/// # Errors
-///
-/// Returns [`KovaQueryError::Plan`] for any statement the planner
-/// doesn't yet know how to handle.
-//
-// By-value : real arms move fields out of LogicalStatement payloads
-// when they land (same shape as the binder dispatch).
-#[allow(clippy::needless_pass_by_value)]
-pub fn plan(stmt: LogicalStatement) -> Result<PhysicalPlan, KovaQueryError> {
-    plan_with_estimator(stmt, &NoopEstimator, &ParamBindings::empty())
-}
-
 /// Pick the physical plan for a [`LogicalStatement`], driving SELECT
 /// plan-choice with a [`SelectivityEstimator`].
 ///
@@ -200,6 +161,19 @@ fn plan_query<E: SelectivityEstimator>(
         ordering,
         limit,
     } = q;
+
+    // Step 0 : COUNT(*) bypass. A solo `COUNT(*)` projection short-
+    // circuits the rest of plan_query : there's no ordering, no kNN,
+    // no projection rows to build — just a scalar count of matching
+    // rows. Treat it independently from kNN SELECTs.
+    if let Some(column_name) = solo_count_star_name(&projection) {
+        // COUNT(*) ignores ordering and LIMIT (one row is all you get).
+        return Ok(PhysicalPlan::Count {
+            table: from_table,
+            predicate,
+            column_name,
+        });
+    }
 
     // Step 1 : check the shape. v1 needs a distance ordering as the
     // first (and only, for now) ordering key. Field ordering and
@@ -309,6 +283,24 @@ fn build_plan_b(
     PhysicalPlan::Limit {
         input: Box::new(exact),
         limit: user_limit,
+    }
+}
+
+/// If the projection is exactly `[CountStar { alias }]`, return the
+/// output column name (`alias` or `"count"`). Otherwise return None,
+/// signalling that this isn't a COUNT-only query.
+///
+/// `SELECT COUNT(*), id FROM ...` returns None : COUNT(*) mixed with
+/// other columns would require GROUP BY semantics v1 doesn't ship.
+fn solo_count_star_name(spec: &ProjectionSpec) -> Option<String> {
+    if spec.columns.len() != 1 {
+        return None;
+    }
+    match spec.columns.first()? {
+        BoundProjection::CountStar { alias } => {
+            Some(alias.clone().unwrap_or_else(|| "count".into()))
+        }
+        _ => None,
     }
 }
 
