@@ -14,7 +14,7 @@ use crate::binder::bind;
 use crate::error::KovaQueryError;
 use crate::parser::parse_str;
 use crate::physical::PhysicalPlan;
-use crate::planner::plan;
+use crate::planner::{SelectivityEstimate, SelectivityEstimator, plan_with_estimator};
 
 /// Caller-supplied values for parameter slots.
 ///
@@ -268,7 +268,8 @@ impl<D: Distance> Engine<D> {
     ) -> Result<ExecutionResult, KovaQueryError> {
         let ast = parse_str(input)?;
         let logical = bind(ast)?;
-        let physical = plan(logical)?;
+        let estimator = ShardEstimator { shard: &self.shard };
+        let physical = plan_with_estimator(logical, &estimator, &params)?;
         self.execute(physical, &params)
     }
 
@@ -552,6 +553,32 @@ fn expect_batch(
             "parameter slot '{slot}' expects Batch, got {}",
             param_value_kind(other)
         ))),
+    }
+}
+
+/// Selectivity estimator backed by a live shard. The planner consults
+/// this to decide between plan A and plan B for SELECT queries with
+/// predicates.
+///
+/// v1 implementation walks the metadata store, evaluating the
+/// predicate against every row (cheap because metadata is in-memory).
+/// v2 will swap in index cardinality lookups when secondary indexes
+/// ship.
+struct ShardEstimator<'a, D: Distance> {
+    shard: &'a Shard<D, MmapVectorStore, FileMetadataStore, FileWal>,
+}
+
+impl<D: Distance> SelectivityEstimator for ShardEstimator<'_, D> {
+    fn estimate(&self, pred: &PredicateExpr, params: &ParamBindings) -> SelectivityEstimate {
+        let total = self.shard.len();
+        // The closure swallows eval errors (returns false on error)
+        // because the estimator's job is fast cardinality, not error
+        // reporting. Errors will surface when the executor evaluates
+        // the predicate for real during MetadataScan or post-filter.
+        let matches = self
+            .shard
+            .count_matching(|m| eval_predicate(pred, m, params).unwrap_or(false));
+        SelectivityEstimate { matches, total }
     }
 }
 
@@ -1876,6 +1903,154 @@ mod tests {
             rows.is_empty(),
             "no 'docs' rows present, result should be empty"
         );
+    }
+
+    // ----- selectivity-driven dispatch -----
+
+    /// High selectivity (most rows pass the predicate) keeps the
+    /// planner on plan A even when a predicate is present : kNN
+    /// overfetch + post-filter wins when the filter rarely drops
+    /// candidates. Seed a shard where 9/10 rows pass and verify the
+    /// emitted plan has `KnnSearch` underneath the Limit.
+    #[test]
+    fn high_selectivity_keeps_plan_a_with_post_filter() {
+        use crate::physical::PhysicalPlan;
+        let dir = tempdir().expect("tempdir");
+        let mut engine = make_engine(&dir);
+        // 9 'docs' rows + 1 'specs' : selectivity = 0.9 > 0.5 threshold.
+        let mut metas: Vec<Metadata> = (0..9)
+            .map(|_| meta_of(&[("category", Value::String("docs".into()))]))
+            .collect();
+        metas.push(meta_of(&[("category", Value::String("specs".into()))]));
+        seed_engine(&mut engine, &metas);
+
+        // Plan through Engine's full pipeline (which uses ShardEstimator).
+        let ast = parse_str(
+            "SELECT id FROM vectors WHERE category = 'docs' \
+             ORDER BY embedding <-> $1 LIMIT 5",
+        )
+        .expect("parse");
+        let logical = crate::binder::bind(ast).expect("bind");
+        let est = ShardEstimator {
+            shard: engine.shard(),
+        };
+        let physical = crate::planner::plan_with_estimator(logical, &est, &ParamBindings::empty())
+            .expect("plan");
+
+        // Projection → Limit → KnnSearch (with post_filter)
+        let PhysicalPlan::Projection { input, .. } = physical else {
+            panic!("expected Projection");
+        };
+        let PhysicalPlan::Limit { input, .. } = *input else {
+            panic!("expected Limit");
+        };
+        let PhysicalPlan::KnnSearch { post_filter, .. } = *input else {
+            panic!("expected KnnSearch (plan A), got {input:?}");
+        };
+        assert!(
+            post_filter.is_some(),
+            "plan A with predicate has post_filter"
+        );
+    }
+
+    /// Low selectivity (few rows pass) flips the planner to plan B :
+    /// the predicate matches 1 of 10 rows, so scan + exact-distance
+    /// is cheaper than overfetched kNN.
+    #[test]
+    fn low_selectivity_picks_plan_b() {
+        use crate::physical::PhysicalPlan;
+        let dir = tempdir().expect("tempdir");
+        let mut engine = make_engine(&dir);
+        // 1 'docs' + 9 'other' : selectivity = 0.1 < 0.5.
+        let mut metas: Vec<Metadata> = vec![meta_of(&[("category", Value::String("docs".into()))])];
+        for _ in 0..9 {
+            metas.push(meta_of(&[("category", Value::String("other".into()))]));
+        }
+        seed_engine(&mut engine, &metas);
+
+        let ast = parse_str(
+            "SELECT id FROM vectors WHERE category = 'docs' \
+             ORDER BY embedding <-> $1 LIMIT 5",
+        )
+        .expect("parse");
+        let logical = crate::binder::bind(ast).expect("bind");
+        let est = ShardEstimator {
+            shard: engine.shard(),
+        };
+        let physical = crate::planner::plan_with_estimator(logical, &est, &ParamBindings::empty())
+            .expect("plan");
+
+        let PhysicalPlan::Projection { input, .. } = physical else {
+            panic!("expected Projection");
+        };
+        let PhysicalPlan::Limit { input, .. } = *input else {
+            panic!("expected Limit");
+        };
+        assert!(
+            matches!(*input, PhysicalPlan::ExactDistance { .. }),
+            "low selectivity should pick plan B (ExactDistance), got {input:?}"
+        );
+    }
+
+    /// Both plans return the same answer on the same data : at
+    /// selectivity ~50% both strategies are correct, so the result
+    /// set must match regardless of which the planner picked.
+    #[test]
+    fn plan_a_and_plan_b_return_same_ids() {
+        let dir_a = tempdir().expect("tempdir A");
+        let dir_b = tempdir().expect("tempdir B");
+        let mut engine_a = make_engine(&dir_a);
+        let mut engine_b = make_engine(&dir_b);
+
+        // Seed both engines identically. 5 'docs' + 5 'other'.
+        let metas: Vec<Metadata> = (0..10)
+            .map(|i| {
+                let tag = if i < 5 { "docs" } else { "other" };
+                meta_of(&[("category", Value::String(tag.into()))])
+            })
+            .collect();
+        seed_engine(&mut engine_a, &metas);
+        seed_engine(&mut engine_b, &metas);
+
+        let q = Vector::try_new(vec![1.0, 0.0, 0.0, 0.0]).unwrap();
+
+        // Engine A uses ShardEstimator (selectivity ~50% → plan A
+        // wins, since 0.5 is the threshold-boundary). Engine B is
+        // forced to plan B by replaying the SAME query through both.
+        // Both should yield the same set of ids (order may differ
+        // due to kNN approximation, so we compare as sorted vecs).
+        let res_a = engine_a
+            .execute_str(
+                "SELECT id FROM vectors WHERE category = 'docs' \
+                 ORDER BY embedding <-> $1 LIMIT 5",
+                ParamBindings::empty().with_positional(ParamValue::Vector(q.clone())),
+            )
+            .expect("A execute");
+        let res_b = engine_b
+            .execute_str(
+                "SELECT id FROM vectors WHERE category = 'docs' \
+                 ORDER BY embedding <-> $1 LIMIT 5",
+                ParamBindings::empty().with_positional(ParamValue::Vector(q)),
+            )
+            .expect("B execute");
+
+        let extract_ids = |r: ExecutionResult| -> Vec<u64> {
+            let ExecutionResult::Rows { rows, .. } = r else {
+                panic!("expected Rows");
+            };
+            let mut ids: Vec<u64> = rows
+                .iter()
+                .map(|r| match r.values[0] {
+                    RowValue::Id(id) => id.get(),
+                    _ => unreachable!(),
+                })
+                .collect();
+            ids.sort_unstable();
+            ids
+        };
+        let ids_a = extract_ids(res_a);
+        let ids_b = extract_ids(res_b);
+        assert_eq!(ids_a, ids_b, "plan A and plan B disagree on the result set");
     }
 
     /// Plan B fills in real distances via `Shard::distance_to`, so

@@ -88,6 +88,24 @@ where
         let stored = self.index.get(id)?;
         Some(self.index.metric().distance(&stored, query))
     }
+
+    /// Count live (non-tombstoned) ids whose metadata satisfies
+    /// `predicate`. Same walk as [`Self::scan_metadata`] but skips
+    /// the Vec allocation : the planner uses this for selectivity
+    /// estimation where only the count matters.
+    pub fn count_matching<F>(&self, mut predicate: F) -> usize
+    where
+        F: FnMut(&Metadata) -> bool,
+    {
+        // Walk all matched ids the trait gives us, then filter out
+        // tombstones. Counting via fold avoids materialising the
+        // intermediate Vec for the live ids.
+        self.metadata
+            .scan_ids(|m| predicate(m))
+            .into_iter()
+            .filter(|id| !self.index.is_tombstoned(*id))
+            .count()
+    }
 }
 
 #[cfg(test)]
@@ -356,5 +374,41 @@ mod tests {
             .unwrap();
         shard.delete(id(1)).unwrap();
         assert!(shard.distance_to(id(1), &v(vec![0.0, 0.0])).is_none());
+    }
+
+    // ----- count_matching -----
+
+    #[test]
+    fn count_matching_returns_count_of_live_matches() {
+        let mut shard = fresh_in_memory();
+        for (i, tag) in [(1_u16, "a"), (2_u16, "b"), (3_u16, "a"), (4_u16, "a")] {
+            shard
+                .insert(id(u64::from(i)), v(vec![f32::from(i), 0.0]), tag_meta(tag))
+                .unwrap();
+        }
+        let count =
+            shard.count_matching(|m| matches!(m.get("tag"), Some(Value::String(s)) if s == "a"));
+        assert_eq!(count, 3);
+    }
+
+    #[test]
+    fn count_matching_skips_tombstoned_ids() {
+        let mut shard = fresh_in_memory();
+        shard
+            .insert(id(1), v(vec![1.0, 0.0]), tag_meta("docs"))
+            .unwrap();
+        shard
+            .insert(id(2), v(vec![0.0, 1.0]), tag_meta("docs"))
+            .unwrap();
+        shard.delete(id(1)).unwrap();
+        let count =
+            shard.count_matching(|m| matches!(m.get("tag"), Some(Value::String(s)) if s == "docs"));
+        assert_eq!(count, 1, "tombstoned id 1 should not be counted");
+    }
+
+    #[test]
+    fn count_matching_on_empty_shard_returns_zero() {
+        let shard = fresh_in_memory();
+        assert_eq!(shard.count_matching(|_| true), 0);
     }
 }
