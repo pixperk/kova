@@ -17,6 +17,7 @@ pest_derive = "2"
 [dev-dependencies]
 kova-index = { path = "../kova-index" }
 tempfile = "3"
+rand = "0.10"
 
 [lints]
 workspace = true

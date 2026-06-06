@@ -502,6 +502,7 @@ dependencies = [
  "kova-storage",
  "pest",
  "pest_derive",
+ "rand 0.10.1",
  "tempfile",
  "thiserror",
 ]
