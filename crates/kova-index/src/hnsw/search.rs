@@ -158,7 +158,7 @@ impl<D: Distance, V: VectorStore> HnswIndex<D, V> {
     /// - **Termination** : we only short-circuit on
     ///   `c.distance > worst_result.distance` once we've accumulated
     ///   at least `ef` results. While the results heap is short of
-    ///   `ef`, every popped candidate is worth expanding — the next
+    ///   `ef`, every popped candidate is worth expanding , the next
     ///   neighbour might be the first filter-passing node we see.
     ///
     /// Worst-case visits every node in `layer` when `filter` is empty
@@ -292,7 +292,7 @@ impl<D: Distance, V: VectorStore> HnswIndex<D, V> {
         let top_level = self.nodes[&entry_id].top_layer();
         let ef = self.params.ef_search.max(k);
 
-        // Descent : unfiltered. The upper layers are sparse — we just
+        // Descent : unfiltered. The upper layers are sparse , we just
         // want any entry into the dense layer-0 region. Filtering only
         // there.
         let mut current_ep = entry_id;
@@ -318,9 +318,9 @@ impl<D: Distance, V: VectorStore> HnswIndex<D, V> {
     /// Strategy : descend the upper layers with kNN-1 to land near
     /// `query`, then run a kNN-style `search_layer` at layer 0 with
     /// doubling `ef`. We stop expanding once the result set contains
-    /// *any* node outside the radius — that proves the radius ball is
+    /// *any* node outside the radius , that proves the radius ball is
     /// fully enclosed within the returned set (HNSW's locality property)
-    /// — or once `ef` reaches the index size. Then filter by radius.
+    /// , or once `ef` reaches the index size. Then filter by radius.
     ///
     /// Why doubling instead of a true radius walk : a naive "expand
     /// while in-radius" walk can't escape a local minimum where the
@@ -643,51 +643,81 @@ mod tests {
         }
     }
 
-    #[test]
-    #[allow(clippy::cast_precision_loss)]
-    fn search_radius_matches_flat_on_random_data() {
+    /// Radius parity harness : compare `HnswIndex::search_radius`
+    /// against a flat-scan ground truth. Mirrors `measure_recall` for
+    /// the kNN side. Skips queries whose ground-truth ball is empty
+    /// (they contribute nothing to the recall numerator/denominator).
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss
+    )]
+    fn measure_radius_recall(
+        n: u64,
+        dim: usize,
+        radius: f32,
+        queries: usize,
+        data_seed: u64,
+    ) -> f32 {
         use crate::{FlatIndex, Index};
         use rand::{RngExt, SeedableRng, rngs::StdRng};
         use std::collections::HashSet;
 
-        let mut rng = StdRng::seed_from_u64(42);
-        let mut hnsw = HnswIndex::seeded(L2, super::super::HnswParams::default(), 7);
+        let mut rng = StdRng::seed_from_u64(data_seed);
+        let mut hnsw = HnswIndex::seeded(L2, super::super::HnswParams::default(), 13);
         let mut flat: FlatIndex<L2> = FlatIndex::new(L2);
 
-        for i in 0..500 {
-            let data: Vec<f32> = (0..4).map(|_| rng.random::<f32>()).collect();
+        for i in 0..n {
+            let data: Vec<f32> = (0..dim).map(|_| rng.random::<f32>()).collect();
             let vec = Vector::try_new(data).unwrap();
             hnsw.insert(id(i), vec.clone()).unwrap();
             flat.insert(id(i), vec).unwrap();
         }
 
-        let qdata: Vec<f32> = (0..4).map(|_| rng.random::<f32>()).collect();
-        let q = Vector::try_new(qdata).unwrap();
-        let radius = 0.3;
+        let mut sum = 0.0_f32;
+        let mut counted = 0_usize;
+        for _ in 0..queries {
+            let qdata: Vec<f32> = (0..dim).map(|_| rng.random::<f32>()).collect();
+            let q = Vector::try_new(qdata).unwrap();
 
-        let h_ids: HashSet<VectorId> = hnsw
-            .search_radius(&q, radius)
-            .unwrap()
-            .into_iter()
-            .map(|(id, _)| id)
-            .collect();
-        let f_ids: HashSet<VectorId> = flat
-            .search(&q, 500)
-            .unwrap()
-            .into_iter()
-            .filter(|(_, d)| *d <= radius)
-            .map(|(id, _)| id)
-            .collect();
+            let h_ids: HashSet<VectorId> = hnsw
+                .search_radius(&q, radius)
+                .unwrap()
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect();
+            let f_ids: HashSet<VectorId> = flat
+                .search(&q, n as usize)
+                .unwrap()
+                .into_iter()
+                .filter(|(_, d)| *d <= radius)
+                .map(|(id, _)| id)
+                .collect();
 
-        if f_ids.is_empty() {
-            return;
+            if f_ids.is_empty() {
+                continue;
+            }
+            sum += h_ids.intersection(&f_ids).count() as f32 / f_ids.len() as f32;
+            counted += 1;
         }
-        let recall = h_ids.intersection(&f_ids).count() as f32 / f_ids.len() as f32;
+        if counted == 0 { 1.0 } else { sum / counted as f32 }
+    }
+
+    #[test]
+    fn radius_recall_on_500_dim4() {
+        let r = measure_radius_recall(500, 4, 0.3, 30, 42);
         assert!(
-            recall >= 0.9,
-            "radius recall was {recall:.3} (hnsw={}, flat={})",
-            h_ids.len(),
-            f_ids.len()
+            r >= 0.9,
+            "radius recall (n=500, dim=4, r=0.3) was {r:.3}, expected >= 0.9"
+        );
+    }
+
+    #[test]
+    fn radius_recall_on_2k_dim16() {
+        let r = measure_radius_recall(2_000, 16, 0.6, 20, 43);
+        assert!(
+            r >= 0.9,
+            "radius recall (n=2k, dim=16, r=0.6) was {r:.3}, expected >= 0.9"
         );
     }
 
@@ -832,6 +862,97 @@ mod tests {
         assert!(
             r > 0.9,
             "recall@10 at n=10k dim=32 was {r:.3}, expected > 0.9"
+        );
+    }
+
+    /// Recall harness for filtered search : compare
+    /// `HnswIndex::search_filtered` against a flat-scan-then-filter
+    /// ground truth. Filter keeps `keep_fraction` of the dataset by
+    /// id, so we can dial selectivity directly without metadata.
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss
+    )]
+    fn measure_filtered_recall(
+        n: u64,
+        dim: usize,
+        k: usize,
+        queries: usize,
+        keep_fraction: f32,
+        data_seed: u64,
+    ) -> f32 {
+        use crate::{FlatIndex, Index};
+        use rand::{RngExt, SeedableRng, rngs::StdRng};
+        use std::collections::HashSet;
+
+        let mut rng = StdRng::seed_from_u64(data_seed);
+        let mut hnsw = HnswIndex::seeded(L2, super::super::HnswParams::default(), 13);
+        let mut flat: FlatIndex<L2> = FlatIndex::new(L2);
+
+        for i in 0..n {
+            let data: Vec<f32> = (0..dim).map(|_| rng.random::<f32>()).collect();
+            let vec = Vector::try_new(data).unwrap();
+            hnsw.insert(id(i), vec.clone()).unwrap();
+            flat.insert(id(i), vec).unwrap();
+        }
+
+        // Keep ids in `[0, n * keep_fraction)`. Simple, deterministic,
+        // and independent of vector content , proves the filter
+        // mechanism rather than some metadata coincidence.
+        let cutoff = (f64::from(n as u32) * f64::from(keep_fraction)) as u64;
+        let in_filter = |i: VectorId| i.get() < cutoff;
+
+        let mut total = 0.0_f32;
+        for _ in 0..queries {
+            let qdata: Vec<f32> = (0..dim).map(|_| rng.random::<f32>()).collect();
+            let q = Vector::try_new(qdata).unwrap();
+
+            let h_ids: HashSet<VectorId> = hnsw
+                .search_filtered(&q, k, &in_filter)
+                .unwrap()
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect();
+
+            // Ground truth : every vector that passes the filter,
+            // ranked by distance, take top-k.
+            let mut f_all: Vec<_> = flat
+                .search(&q, n as usize)
+                .unwrap()
+                .into_iter()
+                .filter(|(i, _)| in_filter(*i))
+                .collect();
+            f_all.truncate(k);
+            let f_ids: HashSet<VectorId> = f_all.into_iter().map(|(i, _)| i).collect();
+
+            if f_ids.is_empty() {
+                continue;
+            }
+            total += h_ids.intersection(&f_ids).count() as f32 / f_ids.len() as f32;
+        }
+        total / queries as f32
+    }
+
+    #[test]
+    fn filtered_recall_at_10_on_500_dim8_half_filter() {
+        // Mid-selectivity (50% kept) is plan C's hot spot.
+        let r = measure_filtered_recall(500, 8, 10, 30, 0.5, 77);
+        assert!(
+            r > 0.9,
+            "filtered recall@10 (n=500, dim=8, 50% kept) was {r:.3}, expected > 0.9"
+        );
+    }
+
+    #[test]
+    fn filtered_recall_at_10_on_2k_dim16_tight_filter() {
+        // Tighter filter (20% kept) is the harder case : the filter
+        // disqualifies most neighbours, so the walk has to traverse
+        // farther to assemble the top-10.
+        let r = measure_filtered_recall(2_000, 16, 10, 20, 0.2, 78);
+        assert!(
+            r > 0.9,
+            "filtered recall@10 (n=2k, dim=16, 20% kept) was {r:.3}, expected > 0.9"
         );
     }
 

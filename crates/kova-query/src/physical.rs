@@ -85,7 +85,7 @@ pub enum PhysicalPlan {
     },
     /// Filtered kNN search : plan C's entry point. Threads `filter`
     /// into the HNSW walk so out-of-filter nodes never enter the
-    /// results heap. `k` is the user's LIMIT directly — no overfetch
+    /// results heap. `k` is the user's LIMIT directly , no overfetch
     /// needed, because filtering happens during the walk rather than
     /// after.
     ///

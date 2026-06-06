@@ -226,7 +226,7 @@ impl<D: Distance, V: VectorStore> HnswIndex<D, V> {
     /// Number of tombstoned ids.
     ///
     /// `self.len() - self.tombstone_count()` gives the count of live ids
-    /// — what a user-facing layer typically wants to report.
+    /// , what a user-facing layer typically wants to report.
     #[must_use]
     pub fn tombstone_count(&self) -> usize {
         self.tombstones.len()

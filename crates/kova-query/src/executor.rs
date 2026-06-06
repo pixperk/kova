@@ -703,7 +703,7 @@ fn expect_metadata(value: &ParamValue, slot: &str) -> Result<Metadata, KovaQuery
 }
 
 /// Extract a batch (`Vec<(VectorId, Vector, Metadata)>`) from a
-/// resolved [`ParamValue`]. Clones the entire array — expensive
+/// resolved [`ParamValue`]. Clones the entire array , expensive
 /// for large batches but correct ; the v2 optimisation is to
 /// consume `ParamBindings` by value into `execute`.
 fn expect_batch(
@@ -1910,15 +1910,98 @@ mod tests {
 
     // ----- SELECT plan A : rejection paths -----
 
+    /// `SELECT WHERE pred LIMIT k` (no ORDER BY) goes through the
+    /// scan-and-limit bypass : MetadataScan(pred) wrapped in a Limit.
+    /// Order isn't promised but the predicate must be honoured.
     #[test]
-    fn rejects_non_knn_select() {
-        // Non-kNN SELECT (no distance ordering) is plan B / C
-        // territory ; plan A errors here cleanly.
+    fn scan_and_limit_returns_predicate_matches() {
+        let dir = tempdir().expect("tempdir");
+        let mut engine = make_engine(&dir);
+        // 3 'docs' + 7 'other'.
+        let mut metas: Vec<Metadata> = (0..3)
+            .map(|_| meta_of(&[("category", Value::String("docs".into()))]))
+            .collect();
+        for _ in 0..7 {
+            metas.push(meta_of(&[("category", Value::String("other".into()))]));
+        }
+        seed_engine(&mut engine, &metas);
+
+        let result = engine
+            .execute_str(
+                "SELECT id FROM vectors WHERE category = 'docs' LIMIT 10",
+                ParamBindings::empty(),
+            )
+            .expect("execute_str");
+        let ExecutionResult::Rows { rows, .. } = result else {
+            panic!("expected Rows");
+        };
+        // First 3 seeded rows are the 'docs' ones (ids 1, 2, 3).
+        assert!(!rows.is_empty(), "should return at least one match");
+        for r in &rows {
+            let RowValue::Id(id) = r.values[0] else {
+                panic!("expected Id");
+            };
+            assert!(
+                id.get() <= 3,
+                "row {} doesn't carry the 'docs' tag",
+                id.get()
+            );
+        }
+    }
+
+    /// `LIMIT` truncates the scan output to at most the requested
+    /// count, regardless of how many rows match the predicate.
+    #[test]
+    fn scan_and_limit_caps_result_size() {
+        let dir = tempdir().expect("tempdir");
+        let mut engine = make_engine(&dir);
+        // 8 'docs' ; LIMIT 3 should cap.
+        let metas: Vec<Metadata> = (0..8)
+            .map(|_| meta_of(&[("category", Value::String("docs".into()))]))
+            .collect();
+        seed_engine(&mut engine, &metas);
+
+        let result = engine
+            .execute_str(
+                "SELECT id FROM vectors WHERE category = 'docs' LIMIT 3",
+                ParamBindings::empty(),
+            )
+            .expect("execute_str");
+        let ExecutionResult::Rows { rows, .. } = result else {
+            panic!("expected Rows");
+        };
+        assert_eq!(rows.len(), 3, "LIMIT 3 should cap result size");
+    }
+
+    /// `LIMIT` without WHERE is rejected : an unbounded slice-scan of
+    /// arbitrary rows is a foot-gun the planner refuses to serve.
+    #[test]
+    fn rejects_limit_without_where() {
+        let dir = tempdir().expect("tempdir");
+        let mut engine = make_engine(&dir);
+        seed_engine(&mut engine, &[Metadata::new(), Metadata::new()]);
+        let err = engine
+            .execute_str("SELECT id FROM vectors LIMIT 5", ParamBindings::empty())
+            .expect_err("expected Plan error");
+        let KovaQueryError::Plan(msg) = err else {
+            panic!("expected Plan, got {err:?}");
+        };
+        assert!(
+            msg.contains("WHERE"),
+            "message should mention WHERE requirement : {msg}"
+        );
+    }
+
+    /// `SELECT` with no ORDER BY and no LIMIT and no WHERE still
+    /// errors : the kNN-shape path catches this case, since there's
+    /// nothing for the scan-and-limit bypass to grab.
+    #[test]
+    fn rejects_select_without_ordering_or_limit() {
         let dir = tempdir().expect("tempdir");
         let mut engine = make_engine(&dir);
         let err = engine
             .execute_str(
-                "SELECT id FROM vectors WHERE category = 'docs' LIMIT 10",
+                "SELECT id FROM vectors WHERE category = 'docs'",
                 ParamBindings::empty(),
             )
             .expect_err("expected Plan error");
@@ -1927,7 +2010,7 @@ mod tests {
         };
         assert!(
             msg.contains("kNN"),
-            "message should call out kNN-only constraint : {msg}"
+            "message should call out the kNN-only constraint : {msg}"
         );
     }
 
@@ -2207,6 +2290,79 @@ mod tests {
     }
 
     /// Plan C end-to-end : run a SELECT in the mid-selectivity band
+    /// Decision-grid sweep : drive the planner with a deterministic
+    /// estimator across the full selectivity range and assert each
+    /// fraction maps to the expected inner operator. Uses a fake
+    /// estimator so we don't pay seeding cost per cell.
+    #[test]
+    fn planner_decision_grid_across_selectivity() {
+        use crate::physical::PhysicalPlan;
+        use crate::planner::{SelectivityEstimate, SelectivityEstimator};
+
+        struct Const(f64);
+        impl SelectivityEstimator for Const {
+            fn estimate(
+                &self,
+                _pred: &crate::logical::PredicateExpr,
+                _params: &ParamBindings,
+            ) -> SelectivityEstimate {
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                let matches = (self.0 * 1000.0) as usize;
+                SelectivityEstimate {
+                    matches,
+                    total: 1000,
+                }
+            }
+        }
+
+        #[derive(Debug)]
+        enum Expect {
+            PlanA,
+            PlanB,
+            PlanC,
+        }
+
+        let cases: &[(f64, Expect)] = &[
+            (0.001, Expect::PlanB),
+            (0.04, Expect::PlanB),
+            (0.05, Expect::PlanC), // PLAN_B_UPPER boundary : at threshold = plan C
+            (0.10, Expect::PlanC),
+            (0.30, Expect::PlanC),
+            (0.49, Expect::PlanC),
+            (0.50, Expect::PlanA), // PLAN_A_LOWER boundary : at threshold = plan A
+            (0.80, Expect::PlanA),
+            (1.00, Expect::PlanA),
+        ];
+
+        for (sel, expected) in cases {
+            let ast = parse_str(
+                "SELECT id FROM vectors WHERE category = 'docs' \
+                 ORDER BY embedding <-> $1 LIMIT 5",
+            )
+            .expect("parse");
+            let logical = crate::binder::bind(ast).expect("bind");
+            let plan =
+                crate::planner::plan_with_estimator(logical, &Const(*sel), &ParamBindings::empty())
+                    .expect("plan");
+            let PhysicalPlan::Projection { input, .. } = plan else {
+                panic!("expected Projection at sel={sel}");
+            };
+            let PhysicalPlan::Limit { input, .. } = *input else {
+                panic!("expected Limit at sel={sel}");
+            };
+            let matches = matches!(
+                (expected, input.as_ref()),
+                (Expect::PlanA, PhysicalPlan::KnnSearch { .. })
+                    | (Expect::PlanB, PhysicalPlan::ExactDistance { .. })
+                    | (Expect::PlanC, PhysicalPlan::FilteredKnnSearch { .. })
+            );
+            assert!(
+                matches,
+                "selectivity {sel} expected {expected:?}, got operator {input:?}"
+            );
+        }
+    }
+
     /// and check the returned ids actually pass the predicate. This
     /// hits the filter-threaded HNSW walk via `Shard::search_filtered`.
     #[test]
@@ -2575,8 +2731,8 @@ mod tests {
             )
             .expect_err("OR-with-distance should not plan");
         assert!(
-            matches!(err, KovaQueryError::Plan(ref m) if m.contains("Union")),
-            "expected Plan error mentioning Union, got {err:?}"
+            matches!(err, KovaQueryError::Plan(ref m) if m.contains("Union") || m.contains("distance-threshold")),
+            "expected Plan error mentioning the rejected radius-OR shape, got {err:?}"
         );
     }
 

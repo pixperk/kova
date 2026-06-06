@@ -174,7 +174,7 @@ fn plan_query<E: SelectivityEstimator>(
 
     // Step 0 : COUNT(*) bypass. A solo `COUNT(*)` projection short-
     // circuits the rest of plan_query : there's no ordering, no kNN,
-    // no projection rows to build — just a scalar count of matching
+    // no projection rows to build , just a scalar count of matching
     // rows. Treat it independently from kNN SELECTs.
     if let Some(column_name) = solo_count_star_name(&projection) {
         // COUNT(*) ignores ordering and LIMIT (one row is all you get).
@@ -185,19 +185,21 @@ fn plan_query<E: SelectivityEstimator>(
         });
     }
 
-    // Step 0.5 : radius bypass. A SELECT with no ORDER BY, no LIMIT,
-    // and a WHERE that contains a `DistanceThreshold` atom with `<`
-    // or `<=` becomes a RadiusSearch. Mixed AND-residue stays on as
+    // Step 0.5 : radius bypass. A SELECT with no ORDER BY and a WHERE
+    // that contains a `DistanceThreshold` atom with `<` or `<=`
+    // becomes a RadiusSearch. Mixed AND-residue stays on as a
     // post_filter. OR-with-DistanceThreshold and `>`/`>=` radii are
     // rejected explicitly (defer to the union / inverse-ball
     // milestones).
+    //
+    // LIMIT is allowed and wraps the radius operator : `WHERE dist <
+    // r LIMIT 10` returns up to 10 in-ball hits.
     //
     // Skipped when ordering is present : a query that says both
     // "within radius r" *and* "order by distance, take k" is really
     // a kNN with a distance post-filter, so we fall through into
     // the kNN-shape path and let `pred` become a post_filter on plan A.
     if ordering.is_empty()
-        && limit.is_none()
         && let Some(p) = &predicate
     {
         reject_or_with_distance_threshold(p)?;
@@ -211,11 +213,25 @@ fn plan_query<E: SelectivityEstimator>(
                 inclusive: extracted.inclusive,
                 post_filter: extracted.residue,
             };
+            let capped = match limit {
+                Some(user_limit) => PhysicalPlan::Limit {
+                    input: Box::new(radius_plan),
+                    limit: user_limit,
+                },
+                None => radius_plan,
+            };
             return Ok(PhysicalPlan::Projection {
-                input: Box::new(radius_plan),
+                input: Box::new(capped),
                 spec: projection,
             });
         }
+    }
+
+    // Step 0.75 : scan-and-limit bypass. See `build_scan_and_limit`.
+    if ordering.is_empty()
+        && let Some(user_limit) = limit
+    {
+        return build_scan_and_limit(from_table, predicate, projection, user_limit);
     }
 
     // Step 1 : check the shape. v1 needs a distance ordering as the
@@ -248,19 +264,61 @@ fn plan_query<E: SelectivityEstimator>(
     let (metric, query_param) = knn;
     let user_k = usize::try_from(user_limit).unwrap_or(usize::MAX);
 
-    // Step 4 : pick plan A / B / C based on selectivity.
-    //
-    //   < PLAN_B_UPPER        -> plan B (tight predicate ; tiny
-    //                                    candidate set, exact distance)
-    //   in [B, A)             -> plan C (mid predicate ; filter threads
-    //                                    into the ANN walk)
-    //   >= PLAN_A_LOWER       -> plan A (loose predicate ; overfetched
-    //                                    kNN + cheap post-filter)
-    //   no predicate          -> plan A (nothing to filter)
-    //
-    // v2 (M2.6) replaces these flat cutoffs with a measured cost
-    // model that accounts for k, recall target, and shard size.
-    let plan = match predicate {
+    let plan = dispatch_knn_plan(
+        KnnPlanInputs {
+            from_table,
+            predicate,
+            query_param,
+            metric,
+            user_k,
+            user_limit,
+        },
+        estimator,
+        params,
+    );
+
+    Ok(PhysicalPlan::Projection {
+        input: Box::new(plan),
+        spec: projection,
+    })
+}
+
+/// Inputs to the kNN plan dispatcher. Bundled so the arity stays
+/// manageable when a cost model grows extra knobs.
+struct KnnPlanInputs {
+    from_table: String,
+    predicate: Option<PredicateExpr>,
+    query_param: ParamRef,
+    metric: DistanceOp,
+    user_k: usize,
+    user_limit: u64,
+}
+
+/// Pick plan A / B / C for a kNN SELECT based on selectivity.
+///
+/// Bands :
+///
+/// - `< PLAN_B_UPPER` : plan B (tight predicate ; tiny candidate set,
+///   exact distance).
+/// - `[PLAN_B_UPPER, PLAN_A_LOWER)` : plan C (mid predicate ; filter
+///   threads into the ANN walk).
+/// - `>= PLAN_A_LOWER` : plan A (loose predicate ; overfetched kNN
+///   plus cheap post-filter).
+/// - No predicate : plan A (nothing to filter).
+fn dispatch_knn_plan<E: SelectivityEstimator>(
+    inputs: KnnPlanInputs,
+    estimator: &E,
+    params: &ParamBindings,
+) -> PhysicalPlan {
+    let KnnPlanInputs {
+        from_table,
+        predicate,
+        query_param,
+        metric,
+        user_k,
+        user_limit,
+    } = inputs;
+    match predicate {
         Some(pred) => {
             let fraction = estimator.estimate(&pred, params).fraction();
             if fraction < PLAN_B_UPPER {
@@ -279,12 +337,7 @@ fn plan_query<E: SelectivityEstimator>(
             }
         }
         None => build_plan_a(from_table, query_param, metric, user_k, None, user_limit),
-    };
-
-    Ok(PhysicalPlan::Projection {
-        input: Box::new(plan),
-        spec: projection,
-    })
+    }
 }
 
 /// Plan A : `Limit(KnnSearch(overfetched, optional post_filter))`.
@@ -308,6 +361,51 @@ fn build_plan_a(
         input: Box::new(knn),
         limit: user_limit,
     }
+}
+
+/// Build the scan-and-limit plan for `SELECT ... WHERE pred LIMIT k`
+/// with no ORDER BY. Order of returned rows is implementation-defined
+/// and not stable across releases. Requires a predicate ; an
+/// unbounded "give me N arbitrary rows" without WHERE is rejected
+/// to avoid the foot-gun of returning random slices of large shards.
+/// Predicate shapes that hide a `DistanceThreshold` (under NOT,
+/// nested OR, etc.) are also rejected so we don't route them to
+/// `MetadataScan` whose evaluator errors at runtime.
+fn build_scan_and_limit(
+    from_table: String,
+    predicate: Option<PredicateExpr>,
+    projection: ProjectionSpec,
+    user_limit: u64,
+) -> Result<PhysicalPlan, KovaQueryError> {
+    let Some(pred) = predicate else {
+        return Err(KovaQueryError::Plan(
+            "LIMIT without ORDER BY requires a WHERE clause ; \
+             unbounded slice-scans aren't supported"
+                .into(),
+        ));
+    };
+    if predicate_has_distance_threshold(&pred) {
+        return Err(KovaQueryError::Plan(
+            "distance-threshold predicate in a shape the radius \
+             planner doesn't recognise (e.g. NOT, nested OR) ; only \
+             `<distance> < r` / `<distance> <= r` at the top of the \
+             WHERE is supported"
+                .into(),
+        ));
+    }
+    let projection = expand_wildcard(projection);
+    let scan = PhysicalPlan::MetadataScan {
+        table: from_table,
+        predicate: pred,
+    };
+    let limited = PhysicalPlan::Limit {
+        input: Box::new(scan),
+        limit: user_limit,
+    };
+    Ok(PhysicalPlan::Projection {
+        input: Box::new(limited),
+        spec: projection,
+    })
 }
 
 /// Plan C : `Limit(FilteredKnnSearch(filter))`. ANN walk with the
@@ -485,26 +583,51 @@ fn cmp_to_inclusive(op: CmpOp) -> Option<bool> {
     }
 }
 
-/// Reject `OR`s that contain a `DistanceThreshold` atom anywhere in
-/// their subtree. v1 doesn't ship `Union { RadiusSearch, ... }` ;
-/// rather than silently fall through to a confusing kNN error, fail
-/// loudly so the user knows it's a planned future feature.
-fn reject_or_with_distance_threshold(pred: &PredicateExpr) -> Result<(), KovaQueryError> {
-    fn has_distance(p: &PredicateExpr) -> bool {
-        match p {
-            PredicateExpr::Atom(PredAtom::DistanceThreshold { .. }) => true,
-            PredicateExpr::And(cs) | PredicateExpr::Or(cs) => cs.iter().any(has_distance),
-            PredicateExpr::Not(inner) => has_distance(inner),
-            PredicateExpr::Atom(_) | PredicateExpr::True | PredicateExpr::False => false,
+/// True if `pred` contains a `DistanceThreshold` atom anywhere in
+/// its subtree. Used by the scan-and-limit bypass to refuse predicate
+/// shapes the radius extractor didn't recognise , otherwise we'd
+/// route them to `MetadataScan` whose predicate evaluator errors out
+/// on distance atoms at runtime.
+fn predicate_has_distance_threshold(p: &PredicateExpr) -> bool {
+    match p {
+        PredicateExpr::Atom(PredAtom::DistanceThreshold { .. }) => true,
+        PredicateExpr::And(cs) | PredicateExpr::Or(cs) => {
+            cs.iter().any(predicate_has_distance_threshold)
         }
+        PredicateExpr::Not(inner) => predicate_has_distance_threshold(inner),
+        PredicateExpr::Atom(_) | PredicateExpr::True | PredicateExpr::False => false,
     }
+}
+
+/// Reject `OR`s that contain a `DistanceThreshold` atom anywhere in
+/// their subtree.
+///
+/// We reject these unconditionally rather than attempting either of
+/// the two paths a more capable planner might take :
+///
+/// - Per-branch selectivity (`union when every branch is selective,
+///   fall through to plan A otherwise`) needs a decomposable
+///   estimator. Today's `ShardEstimator` walks every row and can't
+///   decompose an `Or` cheaply, and the "selective" threshold itself
+///   would need measurement nobody has done.
+/// - A `Union` operator (the implementation half of the union path)
+///   would need multi-radius dedup, distance-merge, and tombstone
+///   composition across branches. None of that exists.
+/// - Silent fallback to plan A is a recall trap : "OR of two radii"
+///   becomes "unfiltered kNN with overfetch and a complex post-filter"
+///   which can starve the LIMIT.
+///
+/// Loud rejection is the honest answer until either an index-driven
+/// estimator or a Union operator lands.
+fn reject_or_with_distance_threshold(pred: &PredicateExpr) -> Result<(), KovaQueryError> {
     fn walk(p: &PredicateExpr) -> Result<(), KovaQueryError> {
         match p {
             PredicateExpr::Or(cs) => {
-                if cs.iter().any(has_distance) {
+                if cs.iter().any(predicate_has_distance_threshold) {
                     return Err(KovaQueryError::Plan(
-                        "OR with a distance-threshold atom is not supported in v1 ; \
-                         this needs the Union operator (planned milestone)"
+                        "OR containing a distance-threshold atom isn't supported ; \
+                         needs per-branch selectivity plus a Union operator that \
+                         merges radius balls, neither of which ships yet"
                             .into(),
                     ));
                 }

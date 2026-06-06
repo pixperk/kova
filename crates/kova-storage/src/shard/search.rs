@@ -43,7 +43,7 @@ where
 
     /// Filtered kNN : top-`k` hits whose metadata passes `predicate`,
     /// ascending by distance. The predicate is consulted *inside* the
-    /// graph walk (plan C semantics) — filtered-out nodes still route
+    /// graph walk (plan C semantics) , filtered-out nodes still route
     /// traversal but never enter the results.
     ///
     /// The HNSW layer's filter is `Fn(VectorId) -> bool`, so we wrap
@@ -139,7 +139,7 @@ where
     /// `None` if the id isn't present in the metadata store.
     ///
     /// This is the executor's "I have ids, now I need their
-    /// metadata" primitive — used by plan B's `ExactDistance` and
+    /// metadata" primitive , used by plan B's `ExactDistance` and
     /// `MetadataScan` to attach metadata to each id.
     pub fn get_metadata(&self, id: VectorId) -> Option<Metadata> {
         self.metadata.get(id)
