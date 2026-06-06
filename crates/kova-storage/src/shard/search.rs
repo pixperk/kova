@@ -565,9 +565,7 @@ mod tests {
         shard
             .insert(id(1), v(vec![0.0]), tag_meta("alpha"))
             .unwrap();
-        let hits = shard
-            .search_filtered(&v(vec![0.0]), 1, |_m| true)
-            .unwrap();
+        let hits = shard.search_filtered(&v(vec![0.0]), 1, |_m| true).unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(
             hits[0].metadata.get("tag"),
@@ -581,9 +579,7 @@ mod tests {
         shard.insert(id(1), v(vec![0.0]), tag_meta("a")).unwrap();
         shard.insert(id(2), v(vec![1.0]), tag_meta("a")).unwrap();
         shard.delete(id(1)).unwrap();
-        let hits = shard
-            .search_filtered(&v(vec![0.0]), 5, |_m| true)
-            .unwrap();
+        let hits = shard.search_filtered(&v(vec![0.0]), 5, |_m| true).unwrap();
         let ids: Vec<_> = hits.iter().map(|h| h.id).collect();
         assert!(!ids.contains(&id(1)));
         assert!(ids.contains(&id(2)));
