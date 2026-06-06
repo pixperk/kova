@@ -969,4 +969,77 @@ mod tests {
             "recall@10 at n=50k dim=32 was {r:.3}, expected > 0.9"
         );
     }
+
+    /// Parametrised sweep over (recall variant) x (size, dim, selectivity).
+    /// Prints a compact table so regressions are visible at a glance.
+    /// Asserts every cell clears 0.9 ; if any one drops, the test fails
+    /// with the specific cell named.
+    #[test]
+    #[ignore = "slow ; run with --ignored"]
+    fn recall_sweep_baseline() {
+        let mut report: Vec<(String, f32, bool)> = Vec::new();
+
+        // ---- kNN recall : (n, dim) sweep at k=10 ----
+        for &(n, dim) in &[
+            (500u64, 4usize),
+            (500, 16),
+            (2_000, 8),
+            (2_000, 32),
+            (10_000, 16),
+        ] {
+            let r = measure_recall(n, dim, 10, 20, 99);
+            let pass = r >= 0.9;
+            report.push((format!("kNN @10  n={n:>5} dim={dim:>2}"), r, pass));
+        }
+
+        // ---- Filtered recall : (n, dim, keep_fraction) ----
+        for &(n, dim, keep) in &[
+            (500u64, 8usize, 0.5f32),
+            (2_000, 16, 0.2),
+            (2_000, 16, 0.5),
+            (2_000, 16, 0.8),
+            (5_000, 16, 0.3),
+        ] {
+            let r = measure_filtered_recall(n, dim, 10, 20, keep, 77);
+            let pass = r >= 0.9;
+            report.push((
+                format!("flt @10  n={n:>5} dim={dim:>2} keep={keep:.2}"),
+                r,
+                pass,
+            ));
+        }
+
+        // ---- Radius recall : (n, dim, r) ----
+        for &(n, dim, radius) in &[
+            (500u64, 4usize, 0.3f32),
+            (2_000, 16, 0.6),
+            (5_000, 16, 0.5),
+            (5_000, 32, 1.0),
+        ] {
+            let recall = measure_radius_recall(n, dim, radius, 20, 43);
+            let pass = recall >= 0.9;
+            report.push((
+                format!("rad      n={n:>5} dim={dim:>2} r={radius:.2}"),
+                recall,
+                pass,
+            ));
+        }
+
+        // Print the report regardless of pass/fail so a maintainer can
+        // see the full landscape, not just the first regression.
+        eprintln!("\n=== HNSW recall sweep ===");
+        for (label, r, pass) in &report {
+            let marker = if *pass { "  " } else { "!!" };
+            eprintln!("  {marker}  {label}  recall = {r:.3}");
+        }
+
+        // Now fail the test if any cell missed.
+        let failures: Vec<_> = report.iter().filter(|(_, _, pass)| !*pass).collect();
+        assert!(
+            failures.is_empty(),
+            "{} of {} recall cells dropped below 0.9 ; see report above",
+            failures.len(),
+            report.len(),
+        );
+    }
 }
