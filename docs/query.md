@@ -6,9 +6,43 @@ crate. Everything user-visible goes through the same parse -> bind ->
 plan -> execute pipeline, including DDL, DML, management ops, and
 reads.
 
-This document is the reference. The README has the highlights and
-sample shapes ; here is the full architecture, the design choices,
-how Phase 1 stands, and what Phase 2 changes.
+This document is the reference. The README has the highlights ; here
+is the full architecture, the design choices, how Phase 1 stands,
+and what Phase 2 changes.
+
+If you are new to KQL, read top-to-bottom. The first few sections
+are a guided tour : a 30-second taste, then a quick start you can
+copy, then the queries you will actually write day to day. Once you
+have a feel for the language, the middle of the doc opens up the
+pipeline and the algorithms underneath. The reference material
+(types, full statement coverage, result shapes) lives near the end,
+and the closing sections cover how we know it works and what
+Phase 2 changes.
+
+---
+
+## A 30-second taste
+
+KQL lets you write one query that does kNN search and metadata
+filtering together, and have the database figure out the right
+strategy :
+
+```sql
+SELECT id, embedding <-> $q AS dist
+FROM vectors
+WHERE category = 'docs' AND year >= 2024
+ORDER BY embedding <-> $q LIMIT 10
+```
+
+That one statement finds the 10 vectors closest to `$q`, restricted
+to rows where `category = 'docs' AND year >= 2024`. Without KQL you
+would do the ANN search and the metadata filter in two separate
+calls, glue the results together in application code, and hope you
+got the order right. With KQL, the planner picks one of three
+execution strategies based on how selective your predicate is, and
+hands you back the answer.
+
+That is the elevator pitch. The rest of this doc unpacks it.
 
 ---
 
@@ -100,6 +134,115 @@ the same call. Every public KQL example in this doc is one
 `execute_str` call away from running.
 
 ---
+
+## The queries you will actually write
+
+If you only learn five query shapes, learn these. They cover most of
+what real workloads look like.
+
+### kNN with a metadata filter
+
+The bread and butter. "Find me the 10 most similar `$q`, but only
+among `docs` from 2024 onward."
+
+```sql
+SELECT id, embedding <-> $q AS dist
+FROM vectors
+WHERE category = 'docs' AND year >= 2024
+ORDER BY embedding <-> $q LIMIT 10
+```
+
+The planner picks plan A, B, or C automatically depending on how
+many rows match the WHERE clause. You do not need to think about it.
+
+### Radius search
+
+"Everything within distance 0.5, no top-k cap."
+
+```sql
+SELECT id FROM vectors
+WHERE embedding <-> $q < 0.5 AND tag = 'archived'
+```
+
+Note that this has no `ORDER BY` and no `LIMIT`. The radius operator
+is its own thing : it returns every match, no ranking required. The
+`AND tag = 'archived'` is a post-filter inside the operator.
+
+### Counting
+
+"How many rows match this predicate?"
+
+```sql
+SELECT COUNT(*) FROM vectors WHERE attrs['country'] = 'IN'
+```
+
+COUNT(*) bypasses the kNN path entirely. Comes back as a single row
+with a single I64 cell. Note also the subscripted predicate :
+`attrs['country']` looks into a nested map field.
+
+### Targeted DML
+
+Delete one row by id (this gets a fast path) :
+
+```sql
+DELETE FROM vectors WHERE id = 42
+```
+
+Patch a nested attribute on a known row :
+
+```sql
+UPDATE vectors SET attrs['priority'] = 5 WHERE id = $1
+```
+
+Tombstone everything matching a predicate :
+
+```sql
+DELETE FROM vectors WHERE category = 'old' AND year < 2020
+```
+
+DML by id is O(1) (single get + single put). DML by predicate scans
+metadata and batches the mutations under one WAL group-commit.
+
+### Batch insert
+
+For ingestion, you pass the whole batch as one param :
+
+```sql
+INSERT INTO vectors VALUES $batch
+```
+
+```rust
+let batch = vec![
+    (VectorId::new(1), v1, m1),
+    (VectorId::new(2), v2, m2),
+    /* ... */
+];
+engine.execute_str(
+    "INSERT INTO vectors VALUES $batch",
+    ParamBindings::empty().with_positional(ParamValue::Batch(batch)),
+)?;
+```
+
+Batched inserts share one WAL fsync and one metadata flush across
+the whole batch, so the per-row cost drops sharply at any reasonable
+batch size.
+
+---
+
+If those five shapes feel comfortable, you already know 80% of KQL.
+The rest of this doc explains how that 80% is built, why the
+planner picks what it picks, and how you can be sure it works.
+
+---
+
+You have seen the queries. The rest of the doc is for the curious :
+**how the engine actually answers them.** Skip ahead to "Type system
+and reference" if you only need the API. Stay with us if you want to
+understand what changed when KQL shipped, and why Phase 2 will be
+fast without anyone having to rewrite their queries.
+
+The next handful of sections walk through the pipeline as a whole,
+then each layer in turn, then the algorithms inside the operators.
 
 ## The pipeline at a glance
 
@@ -715,6 +858,12 @@ output ; the variant is the answer.
 
 ---
 
+The pipeline and the algorithms cover how KQL answers a query. The
+next several sections are **reference material** : the value types,
+the parameter binding, the statement coverage matrix, and the result
+shapes. These are the things you look up when you are actually
+writing a query and need to remember the exact rules.
+
 ## Type system
 
 The value universe is `kova_core::Value` :
@@ -837,6 +986,10 @@ What is **not** in Phase 1 :
 | Transactions across statements | Each statement is its own commit |
 
 ---
+
+Reference covered. The next section is the case for trusting any of
+this : what the test surface looks like, what numbers it produces,
+and how the fuzzer that produces them actually works.
 
 ## What Phase 1 ships strong
 
@@ -1038,6 +1191,11 @@ shape. The harness is in [`tests/fuzz_query.rs`](../crates/kova-query/tests/fuzz
 if you want to read the actual generators.
 
 ---
+
+The case for trust covered. The last substantive section is the
+case for staying : what Phase 2 changes, and how it manages to do so
+without breaking anything Phase 1 already ships. If you are picking
+up KQL now, this is what tomorrow looks like.
 
 ## What Phase 2 builds on top
 

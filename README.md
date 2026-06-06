@@ -668,37 +668,73 @@ month 6.
 ## `kova-query` : KQL (Phase 1 shipped)
 
 KQL is the SQL-shaped query language Kova uses for hybrid vector +
-metadata workloads. Everything user-visible goes through the same
-parse -> bind -> plan -> execute pipeline.
+metadata workloads. **One query expresses both an ANN search and a
+metadata predicate ; the planner picks the right execution strategy
+based on the predicate's selectivity, so you don't have to.** That
+is the whole pitch ; the rest of this section unpacks it.
 
-This is the **highlights** view. Full reference, architecture, plan
-dispatch, type system, and the Phase 2 plan live in
+This is the README view. Full architecture, plan dispatch, type
+system, algorithms, and the Phase 2 plan live in
 [`docs/query.md`](docs/query.md).
 
-### Sample shapes
+### What a real KQL query looks like
+
+The bread-and-butter shape, kNN combined with a metadata filter :
 
 ```sql
--- kNN with metadata filter
 SELECT id, embedding <-> $query AS distance, metadata
 FROM vectors
 WHERE category = 'docs' AND year >= 2024
 ORDER BY embedding <-> $query LIMIT 10
+```
 
--- Radius search with AND-residue
+That one statement returns the 10 vectors closest to `$query`,
+restricted to rows where `category = 'docs' AND year >= 2024`. Before
+KQL you would issue two calls (an ANN, a metadata scan) and glue them
+together in application code. With KQL the engine does it.
+
+A handful more shapes that all just work :
+
+```sql
+-- Radius search with an AND-residue post-filter
 SELECT id FROM vectors
 WHERE embedding <-> $q < 0.5 AND tag = 'archived'
 
--- Count with subscripted predicate
+-- COUNT with a subscripted predicate (nested attribute access)
 SELECT COUNT(*) FROM vectors WHERE attrs['country'] = 'IN'
 
--- Update a nested attribute, by id
+-- Patch a nested attribute, by id
 UPDATE vectors SET attrs['priority'] = 5 WHERE id = $1
 
--- Predicate-driven delete
+-- Predicate-driven delete, batched into one WAL commit
 DELETE FROM vectors WHERE category = 'old' AND year < 2020
 ```
 
-### Coverage
+If those five shapes feel reasonable, you already know most of KQL.
+[`docs/query.md`](docs/query.md) walks the rest.
+
+### Why three plans, not one
+
+The hard problem with hybrid queries is that the right strategy
+depends on how selective the WHERE clause is. The planner picks
+between three plans automatically :
+
+| Selectivity | Plan | What it does |
+|-------------|------|--------------|
+| `< 0.05`    | B    | Walk metadata for matching ids, compute exact distance, top-k. **Bypasses ANN entirely.** Wins when very few rows match. |
+| `[0.05, 0.5)` | C | Filtered ANN : the predicate is consulted **during** the HNSW walk. Out-of-filter nodes still route traversal but never enter the results heap. |
+| `>= 0.5`    | A    | Overfetched kNN (k × 4), then post-filter the candidates. Wins when most rows match, so the post-filter rarely drops anything. |
+
+Plan A is the obvious one. Plan B is the small-selectivity bypass.
+Plan C is the contribution that makes the middle band fast : neither
+overfetch nor pre-scan can win there, but threading the predicate
+into the graph walk does. The selectivity bands are constants today ;
+Phase 2 swaps in a histogram-backed estimator and a cost model behind
+the same `SelectivityEstimator` trait, no planner change required.
+
+### Coverage at a glance
+
+Everything the language accepts today, by pipeline layer :
 
 | Layer | What lands in Phase 1 |
 |-------|------------------------|
@@ -708,36 +744,28 @@ DELETE FROM vectors WHERE category = 'old' AND year < 2020
 | Executor | Full DML : single + batch INSERT, DELETE-by-id / by-param / by-predicate / by-radius, UPDATE-by-id / by-param / by-predicate / by-radius with flat or subscripted SET clauses. VACUUM + CHECKPOINT bridge to `Shard`. |
 | Types | `Value` covers `String`, `I64`, `F64`, `Bool`, `Array`, `Map` (nested bags). Numeric coercion (`5 == 5.0`) ; everything else is type-strict. |
 
-### The three SELECT plans
+### Why you can trust it
 
-The planner picks A / B / C from an estimated selectivity :
-
-| Selectivity | Plan | What it does |
-|-------------|------|--------------|
-| `< 0.05`    | B    | Walk metadata for matching ids, compute exact distance, top-k. Bypasses ANN. |
-| `[0.05, 0.5)` | C  | Filtered ANN : predicate is consulted **during** the HNSW walk. |
-| `>= 0.5`    | A    | Overfetched kNN (k × 4), post-filter the candidates. |
-
-The bands are constants today ; Phase 2 swaps in a cost model. The
-decision-grid test pins the boundary behaviour.
-
-### Robustness
+KQL ships with two layers of mechanical verification beyond the
+unit-test suite :
 
 | Test | Iterations | What it asserts |
 |------|------------|-----------------|
 | `fuzz_smoke_*` | 1,500+ per run | No panics across grammar-conformant random queries on a random shard |
-| `correctness_fuzz_*` | 1,000 per run | Engine result matches a reference-impl for COUNT, scan-and-limit, DELETE, UPDATE |
+| `correctness_fuzz_*` | 1,000 per run | Engine result matches a reference impl for COUNT, scan-and-limit, DELETE, UPDATE |
 | `fuzz_long_run` (ignored) | 32k+ | Long-run no-panic over 16 seeds |
 | `correctness_fuzz_long_run` (ignored) | 12k+ | Long-run correctness over 8 seeds |
 
-The harness is deterministic given a seed : every failing iteration
+The harness is deterministic given a seed. Any failing iteration
 prints the seed + query verbatim ; rerunning with the same seed
-reproduces the bug.
+reproduces the bug. Across the full long-run sweep, every single
+COUNT, scan, DELETE, and UPDATE that the reference picked up agreed
+with the engine.
 
-### KQL design notes
+### The engineering decisions worth knowing
 
-A few decisions worth calling out, both for future-me and for anyone
-following the code.
+If you are reading the code, these are the calls that shape what you
+see. Each one paid off enough to be worth keeping.
 
 **Four IRs, not one.** AST -> LogicalStatement -> PhysicalPlan ->
 ExecutionResult. Each IR has exactly one job, each transformation
