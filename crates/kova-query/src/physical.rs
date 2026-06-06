@@ -129,6 +129,34 @@ pub enum PhysicalPlan {
         /// Top-k cap after exact-distance scoring.
         k: usize,
     },
+    /// Radius search : `WHERE embedding <-> $q < $r`. Returns every
+    /// live row whose distance to `query` is below `radius`, ascending
+    /// by distance. No top-k cap : result size is whatever falls inside
+    /// the ball.
+    ///
+    /// `post_filter` carries any non-distance atoms peeled off the
+    /// WHERE clause by the planner (e.g. `embedding <-> $q < $r AND
+    /// category = 'a'` keeps `category = 'a'` here). Applied after the
+    /// radius walk against each hit's metadata.
+    RadiusSearch {
+        /// Target table.
+        table: String,
+        /// Parameter slot for the query vector.
+        query: ParamRef,
+        /// Distance metric requested. Recorded ; executor uses the
+        /// shard's native metric in v1.
+        metric: DistanceOp,
+        /// Distance bound. Baked in at bind time : the grammar requires
+        /// a literal here (param-bound radii are rejected at the
+        /// binder), so the planner doesn't need a [`ParamRef`] slot.
+        radius: f32,
+        /// Whether the comparison was strict (`<`) or inclusive (`<=`).
+        /// The executor uses this to decide whether boundary hits keep
+        /// the hit or drop it.
+        inclusive: bool,
+        /// Optional non-distance predicate residue from the WHERE.
+        post_filter: Option<PredicateExpr>,
+    },
     /// `SELECT COUNT(*) FROM <table> [WHERE pred]`. The only aggregate
     /// v1 supports. Bypasses the kNN-only check because there's no
     /// ordering to perform : just a single scalar result. Returns one

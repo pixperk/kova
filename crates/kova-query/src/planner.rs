@@ -9,11 +9,12 @@
 
 use kova_core::VectorId;
 
+use crate::ast::{CmpOp, DistanceOp, ParamRef};
 use crate::error::KovaQueryError;
 use crate::executor::ParamBindings;
 use crate::logical::{
     BoundProjection, LogicalDelete, LogicalInsert, LogicalInsertSource, LogicalQuery,
-    LogicalStatement, LogicalVacuum, OrderingSpec, PredicateExpr, ProjectionSpec,
+    LogicalStatement, LogicalVacuum, OrderingSpec, PredAtom, PredicateExpr, ProjectionSpec,
 };
 use crate::physical::PhysicalPlan;
 
@@ -175,6 +176,39 @@ fn plan_query<E: SelectivityEstimator>(
         });
     }
 
+    // Step 0.5 : radius bypass. A SELECT with no ORDER BY, no LIMIT,
+    // and a WHERE that contains a `DistanceThreshold` atom with `<`
+    // or `<=` becomes a RadiusSearch. Mixed AND-residue stays on as
+    // post_filter. OR-with-DistanceThreshold and `>`/`>=` radii are
+    // rejected explicitly (defer to the union / inverse-ball
+    // milestones).
+    //
+    // Skipped when ordering is present : a query that says both
+    // "within radius r" *and* "order by distance, take k" is really
+    // a kNN with a distance post-filter, so we fall through into
+    // the kNN-shape path and let `pred` become a post_filter on plan A.
+    if ordering.is_empty()
+        && limit.is_none()
+        && let Some(p) = &predicate
+    {
+        reject_or_with_distance_threshold(p)?;
+        if let Some(extracted) = extract_radius_atom(p) {
+            let projection = expand_wildcard(projection);
+            let radius_plan = PhysicalPlan::RadiusSearch {
+                table: from_table,
+                query: extracted.query_param,
+                metric: extracted.metric,
+                radius: extracted.radius,
+                inclusive: extracted.inclusive,
+                post_filter: extracted.residue,
+            };
+            return Ok(PhysicalPlan::Projection {
+                input: Box::new(radius_plan),
+                spec: projection,
+            });
+        }
+    }
+
     // Step 1 : check the shape. v1 needs a distance ordering as the
     // first (and only, for now) ordering key. Field ordering and
     // missing ordering are plan B territory.
@@ -321,6 +355,131 @@ fn expand_wildcard(spec: ProjectionSpec) -> ProjectionSpec {
     } else {
         spec
     }
+}
+
+/// Payload returned by [`extract_radius_atom`].
+struct ExtractedRadius {
+    query_param: ParamRef,
+    metric: DistanceOp,
+    radius: f32,
+    inclusive: bool,
+    residue: Option<PredicateExpr>,
+}
+
+/// Pull a top-level `DistanceThreshold` atom out of `pred` if one
+/// exists, returning its parts plus whatever predicate is left after
+/// removing it. Recognised shapes :
+///
+/// - Bare atom : `DistanceThreshold` → consumed, residue is `None`
+/// - `And([..., DistanceThreshold, ...])` → atom consumed, residue is
+///   the rest (single child unwrapped, multiple children re-wrapped
+///   in `And`)
+///
+/// Returns `None` for any other shape (no distance threshold, threshold
+/// is `>`/`>=`, threshold buried under `Or` or `Not`, etc.). Callers
+/// fall through to the kNN-shape check.
+fn extract_radius_atom(pred: &PredicateExpr) -> Option<ExtractedRadius> {
+    match pred {
+        PredicateExpr::Atom(PredAtom::DistanceThreshold {
+            metric,
+            param,
+            op,
+            radius,
+        }) => {
+            let inclusive = cmp_to_inclusive(*op)?;
+            Some(ExtractedRadius {
+                query_param: param.clone(),
+                metric: *metric,
+                radius: *radius,
+                inclusive,
+                residue: None,
+            })
+        }
+        PredicateExpr::And(children) => {
+            let pos = children.iter().position(|c| {
+                matches!(
+                    c,
+                    PredicateExpr::Atom(PredAtom::DistanceThreshold {
+                        op: CmpOp::Lt | CmpOp::Le,
+                        ..
+                    })
+                )
+            })?;
+            let PredicateExpr::Atom(PredAtom::DistanceThreshold {
+                metric,
+                param,
+                op,
+                radius,
+            }) = &children[pos]
+            else {
+                return None;
+            };
+            let inclusive = cmp_to_inclusive(*op)?;
+            let mut rest: Vec<PredicateExpr> = children
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| *i != pos)
+                .map(|(_, c)| c.clone())
+                .collect();
+            let residue = match rest.len() {
+                0 => None,
+                1 => Some(rest.pop().unwrap()),
+                _ => Some(PredicateExpr::And(rest)),
+            };
+            Some(ExtractedRadius {
+                query_param: param.clone(),
+                metric: *metric,
+                radius: *radius,
+                inclusive,
+                residue,
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Map `CmpOp` to `inclusive: bool` for radius semantics. Only `<` and
+/// `<=` make sense ; `>`/`>=` would be "outside the ball" (full-scan
+/// territory) and `=` / `!=` are nonsense for a distance bound.
+fn cmp_to_inclusive(op: CmpOp) -> Option<bool> {
+    match op {
+        CmpOp::Lt => Some(false),
+        CmpOp::Le => Some(true),
+        _ => None,
+    }
+}
+
+/// Reject `OR`s that contain a `DistanceThreshold` atom anywhere in
+/// their subtree. v1 doesn't ship `Union { RadiusSearch, ... }` ;
+/// rather than silently fall through to a confusing kNN error, fail
+/// loudly so the user knows it's a planned future feature.
+fn reject_or_with_distance_threshold(pred: &PredicateExpr) -> Result<(), KovaQueryError> {
+    fn has_distance(p: &PredicateExpr) -> bool {
+        match p {
+            PredicateExpr::Atom(PredAtom::DistanceThreshold { .. }) => true,
+            PredicateExpr::And(cs) | PredicateExpr::Or(cs) => cs.iter().any(has_distance),
+            PredicateExpr::Not(inner) => has_distance(inner),
+            PredicateExpr::Atom(_) | PredicateExpr::True | PredicateExpr::False => false,
+        }
+    }
+    fn walk(p: &PredicateExpr) -> Result<(), KovaQueryError> {
+        match p {
+            PredicateExpr::Or(cs) => {
+                if cs.iter().any(has_distance) {
+                    return Err(KovaQueryError::Plan(
+                        "OR with a distance-threshold atom is not supported in v1 ; \
+                         this needs the Union operator (planned milestone)"
+                            .into(),
+                    ));
+                }
+                Ok(())
+            }
+            PredicateExpr::And(cs) => cs.iter().try_for_each(walk),
+            PredicateExpr::Not(inner) => walk(inner),
+            _ => Ok(()),
+        }
+    }
+    walk(pred)
 }
 
 fn unimplemented(name: &str) -> Result<PhysicalPlan, KovaQueryError> {

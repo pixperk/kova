@@ -343,7 +343,8 @@ impl<D: Distance> Engine<D> {
             PhysicalPlan::Limit { .. }
             | PhysicalPlan::KnnSearch { .. }
             | PhysicalPlan::MetadataScan { .. }
-            | PhysicalPlan::ExactDistance { .. } => Err(KovaQueryError::Plan(
+            | PhysicalPlan::ExactDistance { .. }
+            | PhysicalPlan::RadiusSearch { .. } => Err(KovaQueryError::Plan(
                 "read-path operator at top level ; planner must wrap in Projection".into(),
             )),
         }
@@ -411,6 +412,84 @@ impl<D: Distance> Engine<D> {
         })
     }
 
+    /// Metadata-scan read-path arm. Walks every live row's metadata,
+    /// keeps the ones the predicate accepts, and emits `InternalHit`s
+    /// with `distance: None` (the downstream `ExactDistance` fills it).
+    /// Uses the closure-error-capture pattern so predicate-eval errors
+    /// surface instead of getting swallowed as `false`.
+    fn exec_metadata_scan(
+        &self,
+        table: &str,
+        predicate: &PredicateExpr,
+        params: &ParamBindings,
+    ) -> Result<Vec<InternalHit>, KovaQueryError> {
+        self.assert_table(table)?;
+        let mut closure_err: Option<KovaQueryError> = None;
+        let ids = self.shard.scan_metadata(|m| {
+            if closure_err.is_some() {
+                return false;
+            }
+            match eval_predicate(predicate, m, params) {
+                Ok(b) => b,
+                Err(e) => {
+                    closure_err = Some(e);
+                    false
+                }
+            }
+        });
+        if let Some(e) = closure_err {
+            return Err(e);
+        }
+        let hits = ids
+            .into_iter()
+            .filter_map(|id| {
+                self.shard.get_metadata(id).map(|metadata| InternalHit {
+                    id,
+                    distance: None,
+                    metadata,
+                })
+            })
+            .collect();
+        Ok(hits)
+    }
+
+    /// Radius-search read-path arm. Drops boundary hits when the user
+    /// wrote `<` (strict), and applies `post_filter` against each hit's
+    /// metadata when a residue predicate was attached by the planner.
+    fn exec_radius_search(
+        &self,
+        table: &str,
+        query: &crate::ast::ParamRef,
+        radius: f32,
+        inclusive: bool,
+        post_filter: Option<&PredicateExpr>,
+        params: &ParamBindings,
+    ) -> Result<Vec<InternalHit>, KovaQueryError> {
+        self.assert_table(table)?;
+        let query_vec = expect_vector(params.resolve(query)?, "query")?;
+        let hits = self
+            .shard
+            .search_radius(&query_vec, radius)
+            .map_err(|e| KovaQueryError::Backend(Box::new(e)))?;
+        let mut out = Vec::with_capacity(hits.len());
+        for h in hits {
+            if !inclusive && h.distance >= radius {
+                continue;
+            }
+            if let Some(pred) = post_filter
+                && !eval_predicate(pred, &h.metadata, params)?
+            {
+                continue;
+            }
+            out.push(InternalHit {
+                id: h.id,
+                distance: Some(h.distance),
+                metadata: h.metadata,
+            });
+        }
+        Ok(out)
+    }
+
     /// Internal read-path executor. Returns the typed hits that flow
     /// between read operators ; only the outermost `Projection`
     /// converts them into user-facing rows.
@@ -451,38 +530,7 @@ impl<D: Distance> Engine<D> {
                 Ok(out)
             }
             PhysicalPlan::MetadataScan { table, predicate } => {
-                self.assert_table(&table)?;
-                // The closure must signal eval errors back to the caller
-                // without coercing them into `false` (which would silently
-                // drop rows we couldn't classify). Capture into a mut
-                // optional ; check after the scan returns.
-                let mut closure_err: Option<KovaQueryError> = None;
-                let ids = self.shard.scan_metadata(|m| {
-                    if closure_err.is_some() {
-                        return false;
-                    }
-                    match eval_predicate(&predicate, m, params) {
-                        Ok(b) => b,
-                        Err(e) => {
-                            closure_err = Some(e);
-                            false
-                        }
-                    }
-                });
-                if let Some(e) = closure_err {
-                    return Err(e);
-                }
-                let hits = ids
-                    .into_iter()
-                    .filter_map(|id| {
-                        self.shard.get_metadata(id).map(|metadata| InternalHit {
-                            id,
-                            distance: None,
-                            metadata,
-                        })
-                    })
-                    .collect();
-                Ok(hits)
+                self.exec_metadata_scan(&table, &predicate, params)
             }
             PhysicalPlan::ExactDistance {
                 input,
@@ -519,6 +567,21 @@ impl<D: Distance> Engine<D> {
                 let cap = usize::try_from(limit).unwrap_or(usize::MAX);
                 Ok(hits.into_iter().take(cap).collect())
             }
+            PhysicalPlan::RadiusSearch {
+                table,
+                query,
+                metric: _,
+                radius,
+                inclusive,
+                post_filter,
+            } => self.exec_radius_search(
+                &table,
+                &query,
+                radius,
+                inclusive,
+                post_filter.as_ref(),
+                params,
+            ),
             other => Err(KovaQueryError::Plan(format!(
                 "{} is not a read-path operator",
                 physical_kind(&other)
@@ -673,6 +736,7 @@ fn physical_kind(plan: &PhysicalPlan) -> &'static str {
         PhysicalPlan::MetadataScan { .. } => "MetadataScan",
         PhysicalPlan::ExactDistance { .. } => "ExactDistance",
         PhysicalPlan::Count { .. } => "Count",
+        PhysicalPlan::RadiusSearch { .. } => "RadiusSearch",
     }
 }
 
@@ -2240,6 +2304,143 @@ mod tests {
         };
         // axis_vec(1) = [1, 0, 0, 0] equals the query exactly, distance 0.
         assert!(d.abs() < f32::EPSILON, "expected ~0, got {d}");
+    }
+
+    // ----- RadiusSearch -----
+
+    /// `WHERE embedding <-> $q < r` with no ORDER BY and no LIMIT
+    /// becomes a [`PhysicalPlan::RadiusSearch`]. Verifies the planner
+    /// takes the bypass and the executor runs the operator end-to-end.
+    #[test]
+    fn radius_search_returns_ids_within_radius() {
+        let dir = tempdir().expect("tempdir");
+        let mut engine = make_engine(&dir);
+        // 8 axis-aligned vectors : ids 1,5 → e_0 ; 2,6 → e_1 ; etc.
+        let metas: Vec<Metadata> = (0..8).map(|_| Metadata::new()).collect();
+        seed_engine(&mut engine, &metas);
+
+        // Query = e_0. Distance to e_0 ids is 0, to other-axis ids is sqrt(2).
+        let q = Vector::try_new(vec![1.0, 0.0, 0.0, 0.0]).unwrap();
+        let result = engine
+            .execute_str(
+                "SELECT id FROM vectors WHERE embedding <-> $1 < 0.5",
+                ParamBindings::empty().with_positional(ParamValue::Vector(q)),
+            )
+            .expect("execute_str");
+        let ExecutionResult::Rows { rows, .. } = result else {
+            panic!("expected Rows");
+        };
+        let mut ids: Vec<u64> = rows
+            .iter()
+            .map(|r| match r.values[0] {
+                RowValue::Id(id) => id.get(),
+                _ => panic!("expected Id"),
+            })
+            .collect();
+        ids.sort_unstable();
+        // Only ids 1 and 5 sit on e_0.
+        assert_eq!(ids, vec![1, 5]);
+    }
+
+    /// Strict (`<`) versus inclusive (`<=`) : the executor drops
+    /// boundary hits for `<` so users get the semantic they wrote.
+    #[test]
+    fn radius_search_strict_drops_boundary_hits() {
+        let dir = tempdir().expect("tempdir");
+        let mut engine = make_engine(&dir);
+        seed_engine(&mut engine, &[Metadata::new(), Metadata::new()]);
+        // id 1 at e_0, id 2 at e_1. Query at e_0 : distances 0 and sqrt(2).
+        let q = Vector::try_new(vec![1.0, 0.0, 0.0, 0.0]).unwrap();
+
+        // Inclusive : exact boundary at sqrt(2) keeps id 2.
+        let inclusive = engine
+            .execute_str(
+                "SELECT id FROM vectors WHERE embedding <-> $1 <= 1.4142135",
+                ParamBindings::empty().with_positional(ParamValue::Vector(q.clone())),
+            )
+            .expect("inclusive");
+        let ExecutionResult::Rows { rows, .. } = inclusive else {
+            panic!("expected Rows");
+        };
+        assert_eq!(rows.len(), 2);
+
+        // Strict against the same boundary should drop id 2.
+        let strict = engine
+            .execute_str(
+                "SELECT id FROM vectors WHERE embedding <-> $1 < 1.4142135",
+                ParamBindings::empty().with_positional(ParamValue::Vector(q)),
+            )
+            .expect("strict");
+        let ExecutionResult::Rows { rows, .. } = strict else {
+            panic!("expected Rows");
+        };
+        let ids: Vec<u64> = rows
+            .iter()
+            .map(|r| match r.values[0] {
+                RowValue::Id(id) => id.get(),
+                _ => panic!("expected Id"),
+            })
+            .collect();
+        assert_eq!(ids, vec![1]);
+    }
+
+    /// A non-distance atom alongside the radius gets peeled off and
+    /// applied as a `post_filter` after the radius walk.
+    #[test]
+    fn radius_search_with_and_residue_applies_post_filter() {
+        let dir = tempdir().expect("tempdir");
+        let mut engine = make_engine(&dir);
+        // ids 1,5 → e_0. Tag one 'docs', the other 'other'.
+        let metas = vec![
+            meta_of(&[("tag", Value::String("docs".into()))]), // id 1
+            meta_of(&[("tag", Value::String("other".into()))]), // id 2
+            meta_of(&[("tag", Value::String("other".into()))]), // id 3
+            meta_of(&[("tag", Value::String("other".into()))]), // id 4
+            meta_of(&[("tag", Value::String("other".into()))]), // id 5
+        ];
+        seed_engine(&mut engine, &metas);
+
+        let q = Vector::try_new(vec![1.0, 0.0, 0.0, 0.0]).unwrap();
+        let result = engine
+            .execute_str(
+                "SELECT id FROM vectors \
+                 WHERE embedding <-> $1 < 0.5 AND tag = 'docs'",
+                ParamBindings::empty().with_positional(ParamValue::Vector(q)),
+            )
+            .expect("execute_str");
+        let ExecutionResult::Rows { rows, .. } = result else {
+            panic!("expected Rows");
+        };
+        // Without the tag filter we'd get ids 1 and 5. The post_filter
+        // narrows it to id 1.
+        assert_eq!(rows.len(), 1);
+        let RowValue::Id(got) = rows[0].values[0] else {
+            panic!("expected Id");
+        };
+        assert_eq!(got.get(), 1);
+    }
+
+    /// `embedding <-> $1 < r OR tag = 'a'` is rejected by the planner :
+    /// the Union operator that would implement this lands in a later
+    /// milestone, so v1 fails loud rather than silently misinterpreting.
+    #[test]
+    fn radius_search_with_or_distance_is_rejected() {
+        let dir = tempdir().expect("tempdir");
+        let mut engine = make_engine(&dir);
+        seed_engine(&mut engine, &[Metadata::new(), Metadata::new()]);
+
+        let q = Vector::try_new(vec![1.0, 0.0, 0.0, 0.0]).unwrap();
+        let err = engine
+            .execute_str(
+                "SELECT id FROM vectors \
+                 WHERE embedding <-> $1 < 0.5 OR tag = 'docs'",
+                ParamBindings::empty().with_positional(ParamValue::Vector(q)),
+            )
+            .expect_err("OR-with-distance should not plan");
+        assert!(
+            matches!(err, KovaQueryError::Plan(ref m) if m.contains("Union")),
+            "expected Plan error mentioning Union, got {err:?}"
+        );
     }
 
     /// Full write-path round-trip : insert two ids, delete one,

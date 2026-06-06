@@ -41,6 +41,33 @@ where
         Ok(results)
     }
 
+    /// Find every live id within `radius` of `query`, ascending by
+    /// distance, each carrying its metadata bag.
+    ///
+    /// Mirrors [`Shard::search`] but with a distance threshold instead
+    /// of a top-k cap. Result size is unbounded ; very large radii on
+    /// dense shards will scan a large slice of the graph and may run
+    /// into memory pressure. Callers control this by sizing the radius.
+    ///
+    /// # Errors
+    /// Returns [`ShardError::Index`] if the underlying index radius
+    /// search fails (e.g. dimension mismatch).
+    pub fn search_radius(&self, query: &Vector, radius: f32) -> Result<Vec<SearchHit>, ShardError> {
+        let hits = self.index.search_radius(query, radius)?;
+        let results = hits
+            .into_iter()
+            .map(|(id, distance)| {
+                let metadata = self.metadata.get(id).unwrap_or_default();
+                SearchHit {
+                    id,
+                    distance,
+                    metadata,
+                }
+            })
+            .collect();
+        Ok(results)
+    }
+
     /// Scan metadata for live (non-tombstoned) ids whose bag passes
     /// `predicate`. The predicate borrows each metadata, so the walk
     /// avoids per-row clones.
@@ -410,5 +437,72 @@ mod tests {
     fn count_matching_on_empty_shard_returns_zero() {
         let shard = fresh_in_memory();
         assert_eq!(shard.count_matching(|_| true), 0);
+    }
+
+    // ---------- search_radius ----------
+
+    #[test]
+    fn search_radius_returns_hits_within_radius() {
+        let mut shard = fresh_in_memory();
+        shard
+            .insert(id(1), v(vec![0.0, 0.0]), tag_meta("a"))
+            .unwrap();
+        shard
+            .insert(id(2), v(vec![1.0, 0.0]), tag_meta("b"))
+            .unwrap();
+        shard
+            .insert(id(3), v(vec![5.0, 0.0]), tag_meta("c"))
+            .unwrap();
+
+        let hits = shard.search_radius(&v(vec![0.0, 0.0]), 2.0).unwrap();
+        let ids: Vec<_> = hits.iter().map(|h| h.id).collect();
+        assert!(ids.contains(&id(1)));
+        assert!(ids.contains(&id(2)));
+        assert!(!ids.contains(&id(3)));
+    }
+
+    #[test]
+    fn search_radius_attaches_metadata_to_each_hit() {
+        let mut shard = fresh_in_memory();
+        shard
+            .insert(id(1), v(vec![0.0]), tag_meta("alpha"))
+            .unwrap();
+
+        let hits = shard.search_radius(&v(vec![0.0]), 1.0).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(
+            hits[0].metadata.get("tag"),
+            Some(&Value::String("alpha".into()))
+        );
+    }
+
+    #[test]
+    fn search_radius_filters_tombstoned_ids() {
+        let mut shard = fresh_in_memory();
+        shard.insert(id(1), v(vec![0.0]), tag_meta("a")).unwrap();
+        shard.insert(id(2), v(vec![1.0]), tag_meta("b")).unwrap();
+        shard.delete(id(1)).unwrap();
+
+        let hits = shard.search_radius(&v(vec![0.0]), 5.0).unwrap();
+        let ids: Vec<_> = hits.iter().map(|h| h.id).collect();
+        assert!(!ids.contains(&id(1)));
+        assert!(ids.contains(&id(2)));
+    }
+
+    #[test]
+    fn search_radius_dim_mismatch_errors() {
+        let mut shard = fresh_in_memory();
+        shard
+            .insert(id(1), v(vec![1.0, 0.0]), Metadata::new())
+            .unwrap();
+
+        let err = shard.search_radius(&v(vec![1.0]), 5.0).unwrap_err();
+        assert!(matches!(
+            err,
+            ShardError::Index(KovaIndexError::DimensionMismatch {
+                expected: 2,
+                got: 1
+            })
+        ));
     }
 }

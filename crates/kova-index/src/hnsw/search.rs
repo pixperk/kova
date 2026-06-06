@@ -143,6 +143,78 @@ impl<D: Distance, V: VectorStore> HnswIndex<D, V> {
     }
 }
 
+impl<D: Distance, V: VectorStore> HnswIndex<D, V> {
+    /// User-facing radius search.
+    ///
+    /// Strategy : descend the upper layers with kNN-1 to land near
+    /// `query`, then run a kNN-style `search_layer` at layer 0 with
+    /// doubling `ef`. We stop expanding once the result set contains
+    /// *any* node outside the radius — that proves the radius ball is
+    /// fully enclosed within the returned set (HNSW's locality property)
+    /// — or once `ef` reaches the index size. Then filter by radius.
+    ///
+    /// Why doubling instead of a true radius walk : a naive "expand
+    /// while in-radius" walk can't escape a local minimum where the
+    /// entry point is outside the ball but a neighbour two hops away
+    /// is inside. Bumping `ef` reuses the well-tested `search_layer`
+    /// and inherits HNSW's recall guarantees.
+    pub(crate) fn search_radius_impl(
+        &self,
+        query: &Vector,
+        radius: f32,
+    ) -> Result<Vec<(VectorId, f32)>, KovaIndexError> {
+        if !radius.is_finite() || radius < 0.0 {
+            return Ok(Vec::new());
+        }
+
+        let Some(entry_id) = self.entry_point else {
+            return Ok(Vec::new());
+        };
+
+        if let Some(d) = self.dim
+            && query.dim() != d
+        {
+            return Err(KovaIndexError::DimensionMismatch {
+                expected: d,
+                got: query.dim(),
+            });
+        }
+
+        let top_level = self.nodes[&entry_id].top_layer();
+
+        let mut current_ep = entry_id;
+        for layer in (1..=top_level).rev() {
+            let nearest = self.search_layer(query, &[current_ep], 1, layer);
+            if let Some(&(best_id, _)) = nearest.first() {
+                current_ep = best_id;
+            }
+        }
+
+        let total = self.nodes.len();
+        let mut ef = self.params.ef_search.max(16);
+        let mut layer0_hits;
+        loop {
+            layer0_hits = self.search_layer(query, &[current_ep], ef, 0);
+            let saw_outside = layer0_hits.iter().any(|(_, d)| *d > radius);
+            if saw_outside || ef >= total {
+                break;
+            }
+            ef = ef.saturating_mul(2).min(total);
+        }
+
+        let mut results: Vec<(VectorId, f32)> = layer0_hits
+            .into_iter()
+            .filter(|(_, d)| *d <= radius)
+            .collect();
+
+        if !self.tombstones.is_empty() {
+            results.retain(|(id, _)| !self.tombstones.contains(id));
+        }
+
+        Ok(results)
+    }
+}
+
 // Test-only helpers : only available on the default in-memory store so we
 // don't have to worry about fallible `put` in test code.
 #[cfg(test)]
@@ -326,6 +398,128 @@ mod tests {
         for w in out.windows(2) {
             assert!(w[0].1 <= w[1].1);
         }
+    }
+
+    // ---------- search_radius_impl ----------
+
+    #[test]
+    fn search_radius_empty_index_returns_empty() {
+        let idx: HnswIndex<L2, InMemoryVectorStore> = HnswIndex::new(L2);
+        let out = idx.search_radius_impl(&v(vec![0.0]), 10.0).unwrap();
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn search_radius_negative_returns_empty() {
+        let mut idx = HnswIndex::new(L2);
+        crate::Index::insert(&mut idx, id(1), v(vec![0.0])).unwrap();
+        let out = idx.search_radius_impl(&v(vec![0.0]), -1.0).unwrap();
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn search_radius_zero_includes_exact_match() {
+        let mut idx = HnswIndex::new(L2);
+        crate::Index::insert(&mut idx, id(1), v(vec![0.0])).unwrap();
+        crate::Index::insert(&mut idx, id(2), v(vec![5.0])).unwrap();
+        let out = idx.search_radius_impl(&v(vec![0.0]), 0.0).unwrap();
+        let ids: Vec<_> = out.iter().map(|(i, _)| *i).collect();
+        assert_eq!(ids, vec![id(1)]);
+    }
+
+    #[test]
+    fn search_radius_dim_mismatch_errors() {
+        let mut idx = HnswIndex::new(L2);
+        crate::Index::insert(&mut idx, id(1), v(vec![1.0, 2.0])).unwrap();
+        let err = idx.search_radius_impl(&v(vec![1.0]), 10.0).unwrap_err();
+        assert!(matches!(
+            err,
+            crate::KovaIndexError::DimensionMismatch {
+                expected: 2,
+                got: 1,
+            }
+        ));
+    }
+
+    #[test]
+    fn search_radius_filters_tombstones() {
+        let mut idx = HnswIndex::new(L2);
+        for i in 0..5 {
+            #[allow(clippy::cast_precision_loss)]
+            let f = i as f32;
+            crate::Index::insert(&mut idx, id(i), v(vec![f])).unwrap();
+        }
+        idx.tombstone(id(0)).unwrap();
+        let out = idx.search_radius_impl(&v(vec![0.0]), 2.5).unwrap();
+        let ids: Vec<_> = out.iter().map(|(i, _)| *i).collect();
+        assert!(!ids.contains(&id(0)));
+        assert!(ids.contains(&id(1)));
+        assert!(ids.contains(&id(2)));
+    }
+
+    #[test]
+    #[allow(clippy::cast_precision_loss)]
+    fn search_radius_results_sorted_ascending() {
+        let mut idx = HnswIndex::seeded(L2, super::super::HnswParams::default(), 5);
+        for i in 0..20 {
+            let f = i as f32;
+            crate::Index::insert(&mut idx, id(i), v(vec![f])).unwrap();
+        }
+        let out = idx.search_radius_impl(&v(vec![0.0]), 5.0).unwrap();
+        for w in out.windows(2) {
+            assert!(w[0].1 <= w[1].1);
+        }
+        for (_, d) in &out {
+            assert!(*d <= 5.0);
+        }
+    }
+
+    #[test]
+    #[allow(clippy::cast_precision_loss)]
+    fn search_radius_matches_flat_on_random_data() {
+        use crate::{FlatIndex, Index};
+        use rand::{RngExt, SeedableRng, rngs::StdRng};
+        use std::collections::HashSet;
+
+        let mut rng = StdRng::seed_from_u64(42);
+        let mut hnsw = HnswIndex::seeded(L2, super::super::HnswParams::default(), 7);
+        let mut flat: FlatIndex<L2> = FlatIndex::new(L2);
+
+        for i in 0..500 {
+            let data: Vec<f32> = (0..4).map(|_| rng.random::<f32>()).collect();
+            let vec = Vector::try_new(data).unwrap();
+            hnsw.insert(id(i), vec.clone()).unwrap();
+            flat.insert(id(i), vec).unwrap();
+        }
+
+        let qdata: Vec<f32> = (0..4).map(|_| rng.random::<f32>()).collect();
+        let q = Vector::try_new(qdata).unwrap();
+        let radius = 0.3;
+
+        let h_ids: HashSet<VectorId> = hnsw
+            .search_radius(&q, radius)
+            .unwrap()
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        let f_ids: HashSet<VectorId> = flat
+            .search(&q, 500)
+            .unwrap()
+            .into_iter()
+            .filter(|(_, d)| *d <= radius)
+            .map(|(id, _)| id)
+            .collect();
+
+        if f_ids.is_empty() {
+            return;
+        }
+        let recall = h_ids.intersection(&f_ids).count() as f32 / f_ids.len() as f32;
+        assert!(
+            recall >= 0.9,
+            "radius recall was {recall:.3} (hnsw={}, flat={})",
+            h_ids.len(),
+            f_ids.len()
+        );
     }
 
     #[allow(clippy::cast_precision_loss)]

@@ -187,6 +187,22 @@ impl<D: Distance, V: VectorStore> HnswIndex<D, V> {
         self.tombstones.contains(&id)
     }
 
+    /// Find all live ids whose distance to `query` is within `radius`,
+    /// ascending. Inherent (not on the [`Index`] trait) because other
+    /// index families (IVF, flat) want different radius semantics ;
+    /// we'll trait-ify once a second impl appears.
+    ///
+    /// # Errors
+    /// - [`KovaIndexError::DimensionMismatch`] if `query.dim()` doesn't
+    ///   match the index's pinned dimension.
+    pub fn search_radius(
+        &self,
+        query: &Vector,
+        radius: f32,
+    ) -> Result<Vec<(VectorId, f32)>, KovaIndexError> {
+        self.search_radius_impl(query, radius)
+    }
+
     /// Number of tombstoned ids.
     ///
     /// `self.len() - self.tombstone_count()` gives the count of live ids
