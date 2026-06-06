@@ -125,14 +125,15 @@ mod tests {
     #[test]
     fn update_metadata_replaces_bag_and_returns_count() {
         let mut shard = fresh_in_memory();
-        shard.insert(id(1), v(vec![1.0, 0.0]), tag_meta("old")).unwrap();
-        shard.insert(id(2), v(vec![0.0, 1.0]), tag_meta("old")).unwrap();
+        shard
+            .insert(id(1), v(vec![1.0, 0.0]), tag_meta("old"))
+            .unwrap();
+        shard
+            .insert(id(2), v(vec![0.0, 1.0]), tag_meta("old"))
+            .unwrap();
 
         let n = shard
-            .update_metadata(vec![
-                (id(1), tag_meta("new")),
-                (id(2), tag_meta("fresh")),
-            ])
+            .update_metadata(vec![(id(1), tag_meta("new")), (id(2), tag_meta("fresh"))])
             .unwrap();
         assert_eq!(n, 2);
         assert_eq!(
@@ -148,7 +149,9 @@ mod tests {
     #[test]
     fn update_metadata_empty_batch_is_noop() {
         let mut shard = fresh_in_memory();
-        shard.insert(id(1), v(vec![1.0, 0.0]), tag_meta("a")).unwrap();
+        shard
+            .insert(id(1), v(vec![1.0, 0.0]), tag_meta("a"))
+            .unwrap();
         let n = shard
             .update_metadata(std::iter::empty::<(VectorId, Metadata)>())
             .unwrap();
@@ -162,7 +165,9 @@ mod tests {
     #[test]
     fn update_metadata_unknown_id_rejects_whole_batch() {
         let mut shard = fresh_in_memory();
-        shard.insert(id(1), v(vec![1.0, 0.0]), tag_meta("a")).unwrap();
+        shard
+            .insert(id(1), v(vec![1.0, 0.0]), tag_meta("a"))
+            .unwrap();
         let err = shard
             .update_metadata(vec![(id(1), tag_meta("b")), (id(99), tag_meta("c"))])
             .expect_err("phase-1 should reject");
@@ -180,8 +185,12 @@ mod tests {
     #[test]
     fn update_metadata_tombstoned_id_rejects_whole_batch() {
         let mut shard = fresh_in_memory();
-        shard.insert(id(1), v(vec![1.0, 0.0]), tag_meta("a")).unwrap();
-        shard.insert(id(2), v(vec![0.0, 1.0]), tag_meta("b")).unwrap();
+        shard
+            .insert(id(1), v(vec![1.0, 0.0]), tag_meta("a"))
+            .unwrap();
+        shard
+            .insert(id(2), v(vec![0.0, 1.0]), tag_meta("b"))
+            .unwrap();
         shard.delete(id(1)).unwrap();
         let err = shard
             .update_metadata(vec![(id(2), tag_meta("c")), (id(1), tag_meta("d"))])
