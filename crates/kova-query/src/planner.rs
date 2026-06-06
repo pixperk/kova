@@ -116,24 +116,32 @@ pub fn plan_with_estimator<E: SelectivityEstimator>(
         LogicalStatement::Delete(LogicalDelete {
             table,
             single_id_hint,
-            predicate: _,
-        }) => match single_id_hint {
+            predicate,
+        }) => {
             // Hint set : binder spotted `WHERE id = <integer-literal>`.
             // Skip straight to the fast path ; no predicate evaluation
             // needed.
-            Some(id) => Ok(PhysicalPlan::DeleteById {
-                table,
-                id: VectorId::new(id),
-            }),
-            // Hint missing : predicate is param-bound, compound, or
-            // doesn't match the simple-id shape. Full DELETE-by-predicate
-            // is its own milestone (needs metadata scan + delete_many).
-            None => Err(KovaQueryError::Plan(
-                "DELETE WHERE <predicate> is not yet supported ; v1 supports \
-                 DELETE WHERE id = <integer-literal> only"
-                    .into(),
-            )),
-        },
+            if let Some(id) = single_id_hint {
+                return Ok(PhysicalPlan::DeleteById {
+                    table,
+                    id: VectorId::new(id),
+                });
+            }
+            // Hint missing : route to the predicate-driven path. The
+            // executor scans metadata for matching ids and feeds them
+            // to `Shard::delete_many` in one batch. Distance-threshold
+            // predicates are rejected upfront because the metadata
+            // evaluator can't score distances.
+            if predicate_has_distance_threshold(&predicate) {
+                return Err(KovaQueryError::Plan(
+                    "DELETE WHERE <distance-threshold> isn't supported ; \
+                     distance predicates need the radius operator, \
+                     not the metadata scan"
+                        .into(),
+                ));
+            }
+            Ok(PhysicalPlan::DeleteByPredicate { table, predicate })
+        }
 
         LogicalStatement::Query(q) => plan_query(q, estimator, params),
 

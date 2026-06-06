@@ -80,6 +80,73 @@ where
         Ok(())
     }
 
+    /// Batched delete : tombstone every id in `ids` under one WAL
+    /// group-commit. Three-phase discipline mirrors [`Self::insert_many`].
+    ///
+    /// Returns the number of ids actually tombstoned (always equal to
+    /// `ids.len()` on success ; pre-commit validation rejects the whole
+    /// batch if any id is missing or already tombstoned).
+    ///
+    /// # Wins over a `delete()` loop
+    /// Only one `wal.sync()` for the batch instead of N. Append cost is
+    /// linear either way, but `sync` is the disk barrier.
+    ///
+    /// # Errors
+    /// - [`ShardError::Index`] with `KovaIndexError::NotFound` on the
+    ///   first id that was never inserted.
+    /// - [`ShardError::Index`] with `KovaIndexError::AlreadyDeleted` on
+    ///   the first id that's already tombstoned.
+    /// - [`ShardError::Backend`] from `wal.append` / `wal.sync`.
+    ///
+    /// # Panics
+    /// Panics on phase-3 apply failure ; see [`Self::insert`] for the
+    /// rationale.
+    pub fn delete_many<I>(&mut self, ids: I) -> Result<usize, ShardError>
+    where
+        I: IntoIterator<Item = VectorId>,
+    {
+        let ids: Vec<VectorId> = ids.into_iter().collect();
+        if ids.is_empty() {
+            return Ok(0);
+        }
+
+        // Phase 1 : pre-commit validation. Reject the whole batch on
+        // the first bad id rather than processing partials.
+        for &id in &ids {
+            if self.index.top_layer_of(id).is_none() {
+                return Err(KovaIndexError::NotFound { id }.into());
+            }
+            if self.index.is_tombstoned(id) {
+                return Err(KovaIndexError::AlreadyDeleted { id }.into());
+            }
+        }
+
+        // Phase 2 : group-commit. N appends, 1 sync.
+        for &id in &ids {
+            let record = Record::Delete { id };
+            self.wal.append(&record).map_err(ShardError::backend)?;
+        }
+        self.wal.sync().map_err(ShardError::backend)?;
+
+        // Phase 3 : apply, panic on failure.
+        for &id in &ids {
+            if let Err(e) = self.index.tombstone(id) {
+                panic!(
+                    "Shard::delete_many phase-3 apply failure on index.tombstone ({id}): {e:?} \
+                     (WAL has committed the batch ; aborting so replay can reconcile)"
+                );
+            }
+            if let Err(e) = self.metadata.delete(id) {
+                panic!(
+                    "Shard::delete_many phase-3 apply failure on metadata.delete ({id}): {e:?} \
+                     (WAL has committed the batch ; aborting so replay can reconcile)"
+                );
+            }
+        }
+
+        Ok(ids.len())
+    }
+
     /// Physically remove all tombstoned ids : rewire the HNSW graph
     /// so no live node points at a deleted one, free their slots in the
     /// vector store, reset the tombstone set. Returns the number of
@@ -386,5 +453,112 @@ mod tests {
         let freed = shard.vacuum().unwrap();
         assert_eq!(freed, 1);
         assert_eq!(shard.len(), 1);
+    }
+
+    // ---------- delete_many ----------
+
+    fn fresh_in_memory() -> Shard<L2, InMemoryVectorStore, InMemoryMetadataStore, InMemoryWal> {
+        Shard::from_parts(
+            L2,
+            HnswParams::default(),
+            InMemoryVectorStore::new(),
+            InMemoryMetadataStore::new(),
+            InMemoryWal::new(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn delete_many_tombstones_each_id_and_returns_count() {
+        let mut shard = fresh_in_memory();
+        for i in 1..=4 {
+            #[allow(clippy::cast_precision_loss)]
+            let x = i as f32;
+            shard.insert(id(i), v(vec![x, 0.0]), tag_meta("a")).unwrap();
+        }
+        let n = shard.delete_many(vec![id(1), id(3)]).unwrap();
+        assert_eq!(n, 2);
+        assert!(!shard.contains(id(1)));
+        assert!(shard.contains(id(2)));
+        assert!(!shard.contains(id(3)));
+        assert!(shard.contains(id(4)));
+        assert_eq!(shard.len(), 2);
+    }
+
+    #[test]
+    fn delete_many_empty_batch_is_noop() {
+        let mut shard = fresh_in_memory();
+        shard
+            .insert(id(1), v(vec![1.0, 0.0]), tag_meta("a"))
+            .unwrap();
+        let n = shard.delete_many(std::iter::empty::<VectorId>()).unwrap();
+        assert_eq!(n, 0);
+        assert_eq!(shard.len(), 1);
+    }
+
+    #[test]
+    fn delete_many_unknown_id_rejects_whole_batch() {
+        let mut shard = fresh_in_memory();
+        shard
+            .insert(id(1), v(vec![1.0, 0.0]), tag_meta("a"))
+            .unwrap();
+        shard
+            .insert(id(2), v(vec![0.0, 1.0]), tag_meta("b"))
+            .unwrap();
+        let err = shard
+            .delete_many(vec![id(1), id(99), id(2)])
+            .expect_err("phase-1 should reject");
+        assert!(matches!(
+            err,
+            ShardError::Index(KovaIndexError::NotFound { id }) if id == VectorId::new(99)
+        ));
+        // Both live ids stay live : phase-1 ran before any WAL append.
+        assert!(shard.contains(id(1)));
+        assert!(shard.contains(id(2)));
+    }
+
+    #[test]
+    fn delete_many_already_tombstoned_rejects_whole_batch() {
+        let mut shard = fresh_in_memory();
+        shard
+            .insert(id(1), v(vec![1.0, 0.0]), tag_meta("a"))
+            .unwrap();
+        shard
+            .insert(id(2), v(vec![0.0, 1.0]), tag_meta("b"))
+            .unwrap();
+        shard.delete(id(1)).unwrap();
+        let err = shard
+            .delete_many(vec![id(2), id(1)])
+            .expect_err("phase-1 should reject");
+        assert!(matches!(
+            err,
+            ShardError::Index(KovaIndexError::AlreadyDeleted { id }) if id == VectorId::new(1)
+        ));
+        // id 2 stays live.
+        assert!(shard.contains(id(2)));
+    }
+
+    #[test]
+    fn delete_many_persists_across_reopen() {
+        let dir = tempdir().expect("tempdir");
+        {
+            let mut shard = Shard::open(dir.path(), 4, L2, HnswParams::default()).unwrap();
+            for i in 1..=4usize {
+                let mut vec = vec![0.0_f32; 4];
+                vec[(i - 1) % 4] = 1.0;
+                shard
+                    .insert(VectorId::new(i as u64), v(vec), tag_meta("a"))
+                    .unwrap();
+            }
+            let n = shard
+                .delete_many(vec![VectorId::new(1), VectorId::new(3)])
+                .unwrap();
+            assert_eq!(n, 2);
+        }
+        let shard = Shard::open(dir.path(), 4, L2, HnswParams::default()).unwrap();
+        assert!(!shard.contains(VectorId::new(1)));
+        assert!(shard.contains(VectorId::new(2)));
+        assert!(!shard.contains(VectorId::new(3)));
+        assert!(shard.contains(VectorId::new(4)));
     }
 }

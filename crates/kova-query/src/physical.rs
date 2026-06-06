@@ -61,6 +61,16 @@ pub enum PhysicalPlan {
         /// Pre-resolved id (no parameter lookup needed at execute time).
         id: VectorId,
     },
+    /// DELETE by predicate : scan metadata for matching ids, then
+    /// batch-tombstone the lot in a single WAL group-commit. Produced
+    /// when the binder couldn't extract a single-id hint (predicate
+    /// is param-bound, compound, or doesn't match the trivial form).
+    DeleteByPredicate {
+        /// Target table.
+        table: String,
+        /// Predicate evaluated against each row's metadata.
+        predicate: PredicateExpr,
+    },
     /// kNN search : the read path's entry point. Calls
     /// `Shard::search` for `k` candidates, then applies `post_filter`
     /// (if any) to drop rows that fail the predicate. Returns a

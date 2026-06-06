@@ -318,6 +318,9 @@ impl<D: Distance> Engine<D> {
                     .map_err(|e| KovaQueryError::Backend(Box::new(e)))?;
                 Ok(ExecutionResult::Delete { table, deleted: 1 })
             }
+            PhysicalPlan::DeleteByPredicate { table, predicate } => {
+                self.exec_delete_by_predicate(&table, &predicate, params)
+            }
 
             // Read path : the outermost operator must be Projection,
             // because that's the only one that builds user-facing
@@ -454,6 +457,44 @@ impl<D: Distance> Engine<D> {
                 metadata: h.metadata,
             })
             .collect())
+    }
+
+    /// DELETE-by-predicate write-path arm. Scans the metadata for ids
+    /// whose bag passes `predicate`, then dispatches the whole id set
+    /// to `Shard::delete_many` for one batched WAL commit. The
+    /// closure-error-capture pattern propagates any predicate-eval
+    /// failure instead of silently dropping rows.
+    fn exec_delete_by_predicate(
+        &mut self,
+        table: &str,
+        predicate: &PredicateExpr,
+        params: &ParamBindings,
+    ) -> Result<ExecutionResult, KovaQueryError> {
+        self.assert_table(table)?;
+        let mut closure_err: Option<KovaQueryError> = None;
+        let ids = self.shard.scan_metadata(|m| {
+            if closure_err.is_some() {
+                return false;
+            }
+            match eval_predicate(predicate, m, params) {
+                Ok(b) => b,
+                Err(e) => {
+                    closure_err = Some(e);
+                    false
+                }
+            }
+        });
+        if let Some(e) = closure_err {
+            return Err(e);
+        }
+        let deleted = self
+            .shard
+            .delete_many(ids)
+            .map_err(|e| KovaQueryError::Backend(Box::new(e)))?;
+        Ok(ExecutionResult::Delete {
+            table: table.to_string(),
+            deleted: deleted as u64,
+        })
     }
 
     /// Metadata-scan read-path arm. Walks every live row's metadata,
@@ -781,6 +822,7 @@ fn physical_kind(plan: &PhysicalPlan) -> &'static str {
         PhysicalPlan::InsertOne { .. } => "InsertOne",
         PhysicalPlan::InsertMany { .. } => "InsertMany",
         PhysicalPlan::DeleteById { .. } => "DeleteById",
+        PhysicalPlan::DeleteByPredicate { .. } => "DeleteByPredicate",
         PhysicalPlan::KnnSearch { .. } => "KnnSearch",
         PhysicalPlan::Limit { .. } => "Limit",
         PhysicalPlan::Projection { .. } => "Projection",
@@ -1562,40 +1604,104 @@ mod tests {
         assert!(!engine.shard().contains(VectorId::new(10)));
     }
 
-    /// Param-bound id : the binder did NOT set the single-id hint
-    /// because the value isn't known at bind time. The planner
-    /// reports the unsupported-shape Plan error cleanly. This is
-    /// the v1 boundary that `DeleteByPredicate` will lift later.
+    /// Param-bound id with an `I64` value : binder leaves the single-id
+    /// hint as `None`, so the planner routes to `DeleteByPredicate`.
+    /// The metadata evaluator finds no `id` field in any metadata bag,
+    /// returns false for every row, and the delete count is 0. Not the
+    /// path you want for "delete by id", but it doesn't error : the
+    /// engineering-honest behavior is to no-op rather than crash.
     #[test]
-    fn rejects_delete_by_param_bound_id() {
+    fn delete_by_param_bound_id_routes_to_predicate_path() {
         let dir = tempdir().expect("tempdir");
         let mut engine = make_engine(&dir);
-        let params = ParamBindings::empty().with_positional(ParamValue::Id(VectorId::new(1)));
-        let err = engine
+        seed_engine(&mut engine, &[meta_of(&[]), meta_of(&[])]);
+        let params = ParamBindings::empty().with_positional(ParamValue::I64(1));
+        let result = engine
             .execute_str("DELETE FROM vectors WHERE id = $1", params)
+            .expect("execute_str");
+        let ExecutionResult::Delete { deleted, .. } = result else {
+            panic!("expected Delete, got {result:?}");
+        };
+        assert_eq!(deleted, 0);
+        assert!(engine.shard().contains(VectorId::new(1)));
+        assert!(engine.shard().contains(VectorId::new(2)));
+    }
+
+    /// Compound predicate on a metadata field routes through
+    /// `DeleteByPredicate` and tombstones every matching row.
+    #[test]
+    fn delete_by_compound_predicate_deletes_matching_rows() {
+        let dir = tempdir().expect("tempdir");
+        let mut engine = make_engine(&dir);
+        seed_engine(
+            &mut engine,
+            &[
+                meta_of(&[("category", Value::String("old".into()))]),
+                meta_of(&[("category", Value::String("new".into()))]),
+                meta_of(&[("category", Value::String("old".into()))]),
+            ],
+        );
+        let result = engine
+            .execute_str(
+                "DELETE FROM vectors WHERE category = 'old'",
+                ParamBindings::empty(),
+            )
+            .expect("execute_str");
+        let ExecutionResult::Delete { deleted, .. } = result else {
+            panic!("expected Delete, got {result:?}");
+        };
+        assert_eq!(deleted, 2);
+        assert!(!engine.shard().contains(VectorId::new(1)));
+        assert!(engine.shard().contains(VectorId::new(2)));
+        assert!(!engine.shard().contains(VectorId::new(3)));
+    }
+
+    /// DELETE matching nothing returns `deleted = 0` cleanly. No WAL
+    /// activity, no errors.
+    #[test]
+    fn delete_by_predicate_no_matches_returns_zero() {
+        let dir = tempdir().expect("tempdir");
+        let mut engine = make_engine(&dir);
+        seed_engine(
+            &mut engine,
+            &[meta_of(&[("category", Value::String("a".into()))])],
+        );
+        let result = engine
+            .execute_str(
+                "DELETE FROM vectors WHERE category = 'nonexistent'",
+                ParamBindings::empty(),
+            )
+            .expect("execute_str");
+        let ExecutionResult::Delete { deleted, .. } = result else {
+            panic!("expected Delete");
+        };
+        assert_eq!(deleted, 0);
+        assert!(engine.shard().contains(VectorId::new(1)));
+    }
+
+    /// DELETE WHERE distance-threshold is rejected at plan time : the
+    /// metadata evaluator can't score distances, so the executor
+    /// would error mid-scan. Catching it at the planner gives a
+    /// cleaner error.
+    #[test]
+    fn rejects_delete_by_distance_threshold() {
+        let dir = tempdir().expect("tempdir");
+        let mut engine = make_engine(&dir);
+        seed_engine(&mut engine, &[Metadata::new()]);
+        let q = Vector::try_new(vec![1.0, 0.0, 0.0, 0.0]).unwrap();
+        let err = engine
+            .execute_str(
+                "DELETE FROM vectors WHERE embedding <-> $1 < 0.5",
+                ParamBindings::empty().with_positional(ParamValue::Vector(q)),
+            )
             .expect_err("expected Plan error");
         let KovaQueryError::Plan(msg) = err else {
             panic!("expected Plan, got {err:?}");
         };
         assert!(
-            msg.contains("integer-literal"),
-            "message should call out the literal-only constraint : {msg}"
+            msg.contains("distance"),
+            "message should call out distance limitation : {msg}"
         );
-    }
-
-    /// Same as above but a compound predicate. Binder leaves hint as
-    /// None ; planner errors with the same message.
-    #[test]
-    fn rejects_delete_by_compound_predicate() {
-        let dir = tempdir().expect("tempdir");
-        let mut engine = make_engine(&dir);
-        let err = engine
-            .execute_str(
-                "DELETE FROM vectors WHERE category = 'old'",
-                ParamBindings::empty(),
-            )
-            .expect_err("expected Plan error");
-        assert!(matches!(err, KovaQueryError::Plan(_)));
     }
 
     /// DELETE on a non-existent id surfaces the Shard's `NotFound` as
