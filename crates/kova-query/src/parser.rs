@@ -1217,8 +1217,8 @@ mod tests {
             "attrs['tags'] @> 'rust'",
         ];
         for q in cases {
-            let p = parse_predicate_str(q)
-                .unwrap_or_else(|e| panic!("parse failed for `{q}` : {e:?}"));
+            let p =
+                parse_predicate_str(q).unwrap_or_else(|e| panic!("parse failed for `{q}` : {e:?}"));
             let (AstPredicate::Cmp(field, _, _)
             | AstPredicate::In(field, _)
             | AstPredicate::Between(field, _, _)
