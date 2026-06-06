@@ -169,18 +169,27 @@ pub fn plan_with_estimator<E: SelectivityEstimator>(
 
         LogicalStatement::Update(LogicalUpdate {
             table,
-            predicate: _,
+            predicate,
             assignments,
             single_id_hint,
-        }) => plan_update(table, assignments, single_id_hint),
+        }) => plan_update(table, predicate, assignments, single_id_hint),
     }
 }
 
-/// Plan an UPDATE statement. Phase B ships the two single-id fast
-/// paths ; everything else (radius, predicate scan) is Phase C and is
-/// rejected here with a clear message.
+/// Plan an UPDATE statement.
+///
+/// Dispatch order mirrors DELETE :
+/// 1. Single-id hint (literal or param) → `UpdateById` / `UpdateByParamId`.
+/// 2. `OR` containing a distance-threshold → rejected.
+/// 3. Top-level `embedding <-> $q < r` → `UpdateByRadius`.
+/// 4. Anything else → `UpdateByPredicate` (metadata scan).
+///
+/// Distance-threshold atoms hidden inside `NOT` or nested `OR` are
+/// rejected upfront so they don't surface as runtime errors in the
+/// metadata-scan evaluator.
 fn plan_update(
     table: String,
+    predicate: PredicateExpr,
     assignments: Vec<LogicalAssignment>,
     single_id_hint: Option<IdHint>,
 ) -> Result<PhysicalPlan, KovaQueryError> {
@@ -199,22 +208,48 @@ fn plan_update(
         ));
     }
     match single_id_hint {
-        Some(IdHint::Literal(id)) => Ok(PhysicalPlan::UpdateById {
-            table,
-            id: VectorId::new(id),
-            assignments,
-        }),
-        Some(IdHint::Param(id_param)) => Ok(PhysicalPlan::UpdateByParamId {
-            table,
-            id_param,
-            assignments,
-        }),
-        None => Err(KovaQueryError::Plan(
-            "UPDATE WHERE <predicate> isn't supported yet ; only \
-             `WHERE id = <literal>` and `WHERE id = $param` work"
-                .into(),
-        )),
+        Some(IdHint::Literal(id)) => {
+            return Ok(PhysicalPlan::UpdateById {
+                table,
+                id: VectorId::new(id),
+                assignments,
+            });
+        }
+        Some(IdHint::Param(id_param)) => {
+            return Ok(PhysicalPlan::UpdateByParamId {
+                table,
+                id_param,
+                assignments,
+            });
+        }
+        None => {}
     }
+    reject_or_with_distance_threshold(&predicate)?;
+    if let Some(extracted) = extract_radius_atom(&predicate) {
+        return Ok(PhysicalPlan::UpdateByRadius {
+            table,
+            query: extracted.query_param,
+            metric: extracted.metric,
+            radius: extracted.radius,
+            inclusive: extracted.inclusive,
+            post_filter: extracted.residue,
+            assignments,
+        });
+    }
+    if predicate_has_distance_threshold(&predicate) {
+        return Err(KovaQueryError::Plan(
+            "UPDATE WHERE <distance-threshold> in a shape the radius \
+             planner doesn't recognise (e.g. NOT, nested OR) ; only \
+             `<distance> < r` or `<distance> <= r` at the top of the \
+             WHERE is supported"
+                .into(),
+        ));
+    }
+    Ok(PhysicalPlan::UpdateByPredicate {
+        table,
+        predicate,
+        assignments,
+    })
 }
 
 /// Build the physical plan for a SELECT statement.

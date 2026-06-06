@@ -83,6 +83,36 @@ pub enum PhysicalPlan {
         /// One or more assignments, in source order.
         assignments: Vec<LogicalAssignment>,
     },
+    /// UPDATE by predicate : scan metadata for ids whose bag passes
+    /// `predicate`, then apply `assignments` to each matched bag in
+    /// one WAL group-commit. Symmetric with [`Self::DeleteByPredicate`].
+    UpdateByPredicate {
+        /// Target table.
+        table: String,
+        /// Predicate evaluated against each row's metadata.
+        predicate: PredicateExpr,
+        /// Assignments applied to every matched row.
+        assignments: Vec<LogicalAssignment>,
+    },
+    /// UPDATE by radius : every live id within `radius` of `query`
+    /// gets its metadata bag rewritten with `assignments`. Same
+    /// `post_filter` semantics as [`Self::DeleteByRadius`].
+    UpdateByRadius {
+        /// Target table.
+        table: String,
+        /// Parameter slot for the query vector.
+        query: ParamRef,
+        /// Distance metric requested.
+        metric: DistanceOp,
+        /// Distance bound.
+        radius: f32,
+        /// Strict (`<`) or inclusive (`<=`) boundary.
+        inclusive: bool,
+        /// Optional non-distance predicate residue from the WHERE.
+        post_filter: Option<PredicateExpr>,
+        /// Assignments applied to every matched row.
+        assignments: Vec<LogicalAssignment>,
+    },
     /// DELETE by an id sourced from a parameter slot. Mirror of
     /// `DeleteById` for `WHERE id = $param` — the executor resolves
     /// the param at run time, then dispatches to `Shard::delete`.

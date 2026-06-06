@@ -344,27 +344,19 @@ impl<D: Distance> Engine<D> {
                 radius,
                 inclusive,
                 post_filter,
-            } => self.exec_delete_by_radius(
-                &table,
-                &query,
-                radius,
-                inclusive,
-                post_filter.as_ref(),
-                params,
-            ),
-            PhysicalPlan::UpdateById {
-                table,
-                id,
-                assignments,
-            } => self.exec_update_by_id(&table, id, &assignments, params),
-            PhysicalPlan::UpdateByParamId {
-                table,
-                id_param,
-                assignments,
             } => {
-                let id = expect_id(params.resolve(&id_param)?, "id")?;
-                self.exec_update_by_id(&table, id, &assignments, params)
+                let op = RadiusOp {
+                    query: &query,
+                    radius,
+                    inclusive,
+                    post_filter: post_filter.as_ref(),
+                };
+                self.exec_delete_by_radius(&table, &op, params)
             }
+            PhysicalPlan::UpdateById { .. }
+            | PhysicalPlan::UpdateByParamId { .. }
+            | PhysicalPlan::UpdateByPredicate { .. }
+            | PhysicalPlan::UpdateByRadius { .. } => self.dispatch_update(plan, params),
 
             // Read path : the outermost operator must be Projection,
             // because that's the only one that builds user-facing
@@ -503,11 +495,61 @@ impl<D: Distance> Engine<D> {
             .collect())
     }
 
+    /// Dispatch the four UPDATE variants to their respective exec
+    /// helpers. Kept out of [`Self::execute`] to hold the dispatch
+    /// table under its line cap.
+    fn dispatch_update(
+        &mut self,
+        plan: PhysicalPlan,
+        params: &ParamBindings,
+    ) -> Result<ExecutionResult, KovaQueryError> {
+        match plan {
+            PhysicalPlan::UpdateById {
+                table,
+                id,
+                assignments,
+            } => self.exec_update_by_id(&table, id, &assignments, params),
+            PhysicalPlan::UpdateByParamId {
+                table,
+                id_param,
+                assignments,
+            } => {
+                let id = expect_id(params.resolve(&id_param)?, "id")?;
+                self.exec_update_by_id(&table, id, &assignments, params)
+            }
+            PhysicalPlan::UpdateByPredicate {
+                table,
+                predicate,
+                assignments,
+            } => self.exec_update_by_predicate(&table, &predicate, &assignments, params),
+            PhysicalPlan::UpdateByRadius {
+                table,
+                query,
+                metric: _,
+                radius,
+                inclusive,
+                post_filter,
+                assignments,
+            } => {
+                let op = RadiusOp {
+                    query: &query,
+                    radius,
+                    inclusive,
+                    post_filter: post_filter.as_ref(),
+                };
+                self.exec_update_by_radius(&table, &op, &assignments, params)
+            }
+            other => Err(KovaQueryError::Execution(format!(
+                "dispatch_update called with non-update plan : {}",
+                physical_kind(&other)
+            ))),
+        }
+    }
+
     /// UPDATE-by-id arm. Fetches the current metadata bag (errors if
     /// the id is missing or tombstoned), applies each assignment to a
     /// fresh copy, and dispatches the resulting bag to
-    /// `Shard::update_metadata`. Assignment values resolve through
-    /// the same `BoundExpr` evaluator as predicate atoms.
+    /// `Shard::update_metadata`.
     fn exec_update_by_id(
         &mut self,
         table: &str,
@@ -521,17 +563,7 @@ impl<D: Distance> Engine<D> {
                 "UPDATE target id {id:?} not found in metadata store"
             ))
         })?;
-        for a in assignments {
-            // Subscript was already rejected at plan time, but defend
-            // against a planner bug by erroring instead of dropping.
-            if a.subscript.is_some() {
-                return Err(KovaQueryError::Execution(
-                    "subscripted assignment leaked past the planner".into(),
-                ));
-            }
-            let value = resolve_bound_value(&a.value, params)?;
-            bag.insert(a.field.clone(), value);
-        }
+        apply_assignments(&mut bag, assignments, params)?;
         let updated = self
             .shard
             .update_metadata(std::iter::once((id, bag)))
@@ -542,6 +574,111 @@ impl<D: Distance> Engine<D> {
         })
     }
 
+    /// UPDATE-by-predicate arm. Scans metadata for ids whose bag
+    /// passes `predicate`, builds the `(id, new_bag)` pairs in memory,
+    /// then dispatches the whole batch to `Shard::update_metadata`
+    /// for one WAL group-commit. Uses the closure-error-capture
+    /// pattern to propagate predicate-eval failures.
+    fn exec_update_by_predicate(
+        &mut self,
+        table: &str,
+        predicate: &PredicateExpr,
+        assignments: &[LogicalAssignment],
+        params: &ParamBindings,
+    ) -> Result<ExecutionResult, KovaQueryError> {
+        self.assert_table(table)?;
+        let mut closure_err: Option<KovaQueryError> = None;
+        let ids = self.shard.scan_metadata(|m| {
+            if closure_err.is_some() {
+                return false;
+            }
+            match eval_predicate(predicate, m, params) {
+                Ok(b) => b,
+                Err(e) => {
+                    closure_err = Some(e);
+                    false
+                }
+            }
+        });
+        if let Some(e) = closure_err {
+            return Err(e);
+        }
+        let staged = self.build_updates_from_ids(&ids, assignments, params)?;
+        let written = self
+            .shard
+            .update_metadata(staged)
+            .map_err(|e| KovaQueryError::Backend(Box::new(e)))?;
+        Ok(ExecutionResult::Update {
+            table: table.to_string(),
+            updated: written as u64,
+        })
+    }
+
+    /// UPDATE-by-radius arm. Runs the radius walk to produce the
+    /// in-ball hit set, applies strict-boundary and post-filter drops,
+    /// then writes the assignment-mutated bags via
+    /// `Shard::update_metadata`. Reuses the metadata bag carried by
+    /// each `SearchHit` instead of re-fetching from the store.
+    fn exec_update_by_radius(
+        &mut self,
+        table: &str,
+        op: &RadiusOp<'_>,
+        assignments: &[LogicalAssignment],
+        params: &ParamBindings,
+    ) -> Result<ExecutionResult, KovaQueryError> {
+        self.assert_table(table)?;
+        let query_vec = expect_vector(params.resolve(op.query)?, "query")?;
+        let hits = self
+            .shard
+            .search_radius(&query_vec, op.radius)
+            .map_err(|e| KovaQueryError::Backend(Box::new(e)))?;
+        let mut staged: Vec<(VectorId, Metadata)> = Vec::with_capacity(hits.len());
+        for h in hits {
+            if !op.inclusive && h.distance >= op.radius {
+                continue;
+            }
+            if let Some(pred) = op.post_filter
+                && !eval_predicate(pred, &h.metadata, params)?
+            {
+                continue;
+            }
+            let mut bag = h.metadata;
+            apply_assignments(&mut bag, assignments, params)?;
+            staged.push((h.id, bag));
+        }
+        let written = self
+            .shard
+            .update_metadata(staged)
+            .map_err(|e| KovaQueryError::Backend(Box::new(e)))?;
+        Ok(ExecutionResult::Update {
+            table: table.to_string(),
+            updated: written as u64,
+        })
+    }
+
+    /// Fetch the current bag for each id and apply `assignments` to a
+    /// copy. Returns the staged batch ready for
+    /// `Shard::update_metadata`. Used by the predicate path where the
+    /// id-producer (`scan_metadata`) doesn't carry bags.
+    fn build_updates_from_ids(
+        &self,
+        ids: &[VectorId],
+        assignments: &[LogicalAssignment],
+        params: &ParamBindings,
+    ) -> Result<Vec<(VectorId, Metadata)>, KovaQueryError> {
+        let mut updates: Vec<(VectorId, Metadata)> = Vec::with_capacity(ids.len());
+        for &id in ids {
+            let Some(mut bag) = self.shard.get_metadata(id) else {
+                return Err(KovaQueryError::Execution(format!(
+                    "id {id:?} disappeared from metadata store between scan and update"
+                )));
+            };
+            apply_assignments(&mut bag, assignments, params)?;
+            updates.push((id, bag));
+        }
+        Ok(updates)
+    }
+
     /// DELETE-by-radius write-path arm. Runs the radius walk to
     /// produce the in-ball id set, drops boundary hits when the user
     /// wrote `<` (strict), applies any `post_filter` residue against
@@ -550,24 +687,21 @@ impl<D: Distance> Engine<D> {
     fn exec_delete_by_radius(
         &mut self,
         table: &str,
-        query: &crate::ast::ParamRef,
-        radius: f32,
-        inclusive: bool,
-        post_filter: Option<&PredicateExpr>,
+        op: &RadiusOp<'_>,
         params: &ParamBindings,
     ) -> Result<ExecutionResult, KovaQueryError> {
         self.assert_table(table)?;
-        let query_vec = expect_vector(params.resolve(query)?, "query")?;
+        let query_vec = expect_vector(params.resolve(op.query)?, "query")?;
         let hits = self
             .shard
-            .search_radius(&query_vec, radius)
+            .search_radius(&query_vec, op.radius)
             .map_err(|e| KovaQueryError::Backend(Box::new(e)))?;
         let mut ids: Vec<VectorId> = Vec::with_capacity(hits.len());
         for h in hits {
-            if !inclusive && h.distance >= radius {
+            if !op.inclusive && h.distance >= op.radius {
                 continue;
             }
-            if let Some(pred) = post_filter
+            if let Some(pred) = op.post_filter
                 && !eval_predicate(pred, &h.metadata, params)?
             {
                 continue;
@@ -938,6 +1072,37 @@ fn count_matching_with_predicate<D: Distance>(
     Ok(count)
 }
 
+/// Borrowed bundle of the radius-shape fields shared between the
+/// radius search / delete / update arms. Keeps the per-arm helper
+/// signatures from blowing past the argument-count limit.
+struct RadiusOp<'a> {
+    query: &'a crate::ast::ParamRef,
+    radius: f32,
+    inclusive: bool,
+    post_filter: Option<&'a PredicateExpr>,
+}
+
+/// Mutate `bag` in place by applying each assignment in source order.
+/// Subscript was already rejected at plan time, but defend against a
+/// planner bug by erroring instead of silently dropping. Used by all
+/// three UPDATE arms (single-id, predicate, radius).
+fn apply_assignments(
+    bag: &mut Metadata,
+    assignments: &[LogicalAssignment],
+    params: &ParamBindings,
+) -> Result<(), KovaQueryError> {
+    for a in assignments {
+        if a.subscript.is_some() {
+            return Err(KovaQueryError::Execution(
+                "subscripted assignment leaked past the planner".into(),
+            ));
+        }
+        let value = resolve_bound_value(&a.value, params)?;
+        bag.insert(a.field.clone(), value);
+    }
+    Ok(())
+}
+
 /// Static label for a [`PhysicalPlan`] variant ; used in error
 /// messages when a read-path operator shows up at the wrong place.
 fn physical_kind(plan: &PhysicalPlan) -> &'static str {
@@ -952,6 +1117,8 @@ fn physical_kind(plan: &PhysicalPlan) -> &'static str {
         PhysicalPlan::DeleteByRadius { .. } => "DeleteByRadius",
         PhysicalPlan::UpdateById { .. } => "UpdateById",
         PhysicalPlan::UpdateByParamId { .. } => "UpdateByParamId",
+        PhysicalPlan::UpdateByPredicate { .. } => "UpdateByPredicate",
+        PhysicalPlan::UpdateByRadius { .. } => "UpdateByRadius",
         PhysicalPlan::KnnSearch { .. } => "KnnSearch",
         PhysicalPlan::Limit { .. } => "Limit",
         PhysicalPlan::Projection { .. } => "Projection",
@@ -1327,9 +1494,10 @@ mod tests {
         assert!(matches!(err, KovaQueryError::Bind(_)));
     }
 
-    /// Statement shapes that the planner doesn't yet handle (predicate
-    /// UPDATE, radius UPDATE, etc.) report a clean Plan error rather
-    /// than panicking deeper in the executor.
+    /// Plan errors propagate cleanly through `execute_str` instead of
+    /// panicking deeper in the pipeline. Uses a subscripted assignment
+    /// (planner-rejected because metadata `Value` has no `Map`
+    /// variant) as the exemplar.
     #[test]
     fn execute_str_propagates_plan_error_for_unimplemented() {
         let dir = tempdir().expect("tempdir");
@@ -1337,7 +1505,7 @@ mod tests {
         let mut engine = Engine::new(shard, "vectors");
         let err = engine
             .execute_str(
-                "UPDATE vectors SET tag = 'x' WHERE category = 'old'",
+                "UPDATE vectors SET tag['key'] = 'x' WHERE id = 1",
                 ParamBindings::empty(),
             )
             .expect_err("expected error");
@@ -2068,26 +2236,204 @@ mod tests {
         assert_eq!(bag.get("c"), Some(&Value::I64(30)));
     }
 
-    /// Predicate UPDATE (no single-id hint) is rejected at plan time
-    /// with a clear message ; Phase C wires the metadata-scan path.
+    /// Predicate UPDATE : scan metadata for matching ids, apply the
+    /// assignments to each bag, write the batch via one
+    /// `Shard::update_metadata` call.
     #[test]
-    fn rejects_update_by_predicate() {
+    fn update_by_predicate_rewrites_matching_rows() {
+        let dir = tempdir().expect("tempdir");
+        let mut engine = make_engine(&dir);
+        seed_engine(
+            &mut engine,
+            &[
+                meta_of(&[("category", Value::String("old".into()))]),
+                meta_of(&[("category", Value::String("new".into()))]),
+                meta_of(&[("category", Value::String("old".into()))]),
+            ],
+        );
+        let result = engine
+            .execute_str(
+                "UPDATE vectors SET category = 'archived' WHERE category = 'old'",
+                ParamBindings::empty(),
+            )
+            .expect("execute_str");
+        let ExecutionResult::Update { updated, .. } = result else {
+            panic!("expected Update, got {result:?}");
+        };
+        assert_eq!(updated, 2);
+        // ids 1 and 3 had category='old' → now 'archived' ;
+        // id 2 had 'new' and stays unchanged.
+        assert_eq!(
+            engine
+                .shard()
+                .get_metadata(VectorId::new(1))
+                .unwrap()
+                .get("category"),
+            Some(&Value::String("archived".into()))
+        );
+        assert_eq!(
+            engine
+                .shard()
+                .get_metadata(VectorId::new(2))
+                .unwrap()
+                .get("category"),
+            Some(&Value::String("new".into()))
+        );
+        assert_eq!(
+            engine
+                .shard()
+                .get_metadata(VectorId::new(3))
+                .unwrap()
+                .get("category"),
+            Some(&Value::String("archived".into()))
+        );
+    }
+
+    /// Predicate UPDATE that matches no rows returns `updated = 0`
+    /// cleanly. No WAL activity (`Shard::update_metadata` early-returns
+    /// on empty input).
+    #[test]
+    fn update_by_predicate_no_matches_returns_zero() {
+        let dir = tempdir().expect("tempdir");
+        let mut engine = make_engine(&dir);
+        seed_engine(
+            &mut engine,
+            &[meta_of(&[("category", Value::String("docs".into()))])],
+        );
+        let result = engine
+            .execute_str(
+                "UPDATE vectors SET category = 'archived' WHERE category = 'nonexistent'",
+                ParamBindings::empty(),
+            )
+            .expect("execute_str");
+        let ExecutionResult::Update { updated, .. } = result else {
+            panic!("expected Update");
+        };
+        assert_eq!(updated, 0);
+        // Original row untouched.
+        assert_eq!(
+            engine
+                .shard()
+                .get_metadata(VectorId::new(1))
+                .unwrap()
+                .get("category"),
+            Some(&Value::String("docs".into()))
+        );
+    }
+
+    /// Radius UPDATE : every id in the ball gets its assignments
+    /// applied. Out-of-ball rows untouched.
+    #[test]
+    fn update_by_radius_rewrites_in_ball() {
+        let dir = tempdir().expect("tempdir");
+        let mut engine = make_engine(&dir);
+        // 8 axis-aligned ; ids 1, 5 sit on e_0.
+        let metas: Vec<Metadata> = (0..8)
+            .map(|_| meta_of(&[("tag", Value::String("old".into()))]))
+            .collect();
+        seed_engine(&mut engine, &metas);
+
+        let q = Vector::try_new(vec![1.0, 0.0, 0.0, 0.0]).unwrap();
+        let result = engine
+            .execute_str(
+                "UPDATE vectors SET tag = 'new' WHERE embedding <-> $1 < 0.5",
+                ParamBindings::empty().with_positional(ParamValue::Vector(q)),
+            )
+            .expect("execute_str");
+        let ExecutionResult::Update { updated, .. } = result else {
+            panic!("expected Update");
+        };
+        assert_eq!(updated, 2);
+        assert_eq!(
+            engine
+                .shard()
+                .get_metadata(VectorId::new(1))
+                .unwrap()
+                .get("tag"),
+            Some(&Value::String("new".into()))
+        );
+        assert_eq!(
+            engine
+                .shard()
+                .get_metadata(VectorId::new(5))
+                .unwrap()
+                .get("tag"),
+            Some(&Value::String("new".into()))
+        );
+        // id 2 is at e_1 (distance sqrt(2) > 0.5), should stay 'old'.
+        assert_eq!(
+            engine
+                .shard()
+                .get_metadata(VectorId::new(2))
+                .unwrap()
+                .get("tag"),
+            Some(&Value::String("old".into()))
+        );
+    }
+
+    /// Radius UPDATE with AND-residue : only ids that are in-ball AND
+    /// pass the residue get updated.
+    #[test]
+    fn update_by_radius_with_and_residue_applies_post_filter() {
+        let dir = tempdir().expect("tempdir");
+        let mut engine = make_engine(&dir);
+        // ids 1, 5 → e_0. id 1 tagged 'docs', id 5 tagged 'other'.
+        let metas = vec![
+            meta_of(&[("tag", Value::String("docs".into()))]),
+            meta_of(&[("tag", Value::String("other".into()))]),
+            meta_of(&[("tag", Value::String("other".into()))]),
+            meta_of(&[("tag", Value::String("other".into()))]),
+            meta_of(&[("tag", Value::String("other".into()))]),
+        ];
+        seed_engine(&mut engine, &metas);
+
+        let q = Vector::try_new(vec![1.0, 0.0, 0.0, 0.0]).unwrap();
+        let result = engine
+            .execute_str(
+                "UPDATE vectors SET status = 'archived' \
+                 WHERE embedding <-> $1 < 0.5 AND tag = 'docs'",
+                ParamBindings::empty().with_positional(ParamValue::Vector(q)),
+            )
+            .expect("execute_str");
+        let ExecutionResult::Update { updated, .. } = result else {
+            panic!("expected Update");
+        };
+        assert_eq!(updated, 1);
+        assert_eq!(
+            engine
+                .shard()
+                .get_metadata(VectorId::new(1))
+                .unwrap()
+                .get("status"),
+            Some(&Value::String("archived".into()))
+        );
+        // id 5 was in-ball but failed the residue, no 'status' added.
+        assert_eq!(
+            engine
+                .shard()
+                .get_metadata(VectorId::new(5))
+                .unwrap()
+                .get("status"),
+            None
+        );
+    }
+
+    /// OR containing a distance-threshold atom is rejected at the
+    /// planner exactly like DELETE.
+    #[test]
+    fn update_by_or_distance_is_rejected() {
         let dir = tempdir().expect("tempdir");
         let mut engine = make_engine(&dir);
         seed_engine(&mut engine, &[meta_of(&[])]);
+        let q = Vector::try_new(vec![1.0, 0.0, 0.0, 0.0]).unwrap();
         let err = engine
             .execute_str(
-                "UPDATE vectors SET tag = 'x' WHERE category = 'old'",
-                ParamBindings::empty(),
+                "UPDATE vectors SET tag = 'x' \
+                 WHERE embedding <-> $1 < 0.5 OR tag = 'docs'",
+                ParamBindings::empty().with_positional(ParamValue::Vector(q)),
             )
             .expect_err("expected Plan error");
-        let KovaQueryError::Plan(msg) = err else {
-            panic!("expected Plan, got {err:?}");
-        };
-        assert!(
-            msg.contains("WHERE id"),
-            "message should call out the id-only limit : {msg}"
-        );
+        assert!(matches!(err, KovaQueryError::Plan(_)));
     }
 
     /// Subscripted assignment is rejected at plan time : `Value` has
