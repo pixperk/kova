@@ -6,13 +6,13 @@
 //! v2 grows a context carrying the strict-schema registry.
 
 use crate::ast::{
-    AstAssignment, AstCreateIndex, AstDelete, AstDropIndex, AstExpr, AstInsert, AstInsertSource,
-    AstLiteral, AstOrderBy, AstPredicate, AstProjection, AstQuery, AstStatement, AstUpdate,
-    AstVacuum, OrderDir as AstOrderDir,
+    AstAssignment, AstCreateIndex, AstDelete, AstDropIndex, AstExpr, AstFieldRef, AstInsert,
+    AstInsertSource, AstLiteral, AstOrderBy, AstPredicate, AstProjection, AstQuery, AstStatement,
+    AstUpdate, AstVacuum, OrderDir as AstOrderDir,
 };
 use crate::error::KovaQueryError;
 use crate::logical::{
-    BoundExpr, BoundLiteral, BoundProjection, IdHint, LogicalAssignment, LogicalDelete,
+    BoundExpr, BoundLiteral, BoundProjection, FieldRef, IdHint, LogicalAssignment, LogicalDelete,
     LogicalInsert, LogicalInsertSource, LogicalQuery, LogicalStatement, LogicalUpdate,
     LogicalVacuum, OrderDir, OrderingSpec, PredAtom, PredicateExpr, ProjectionSpec,
 };
@@ -169,6 +169,16 @@ fn bind_update(u: AstUpdate) -> Result<LogicalStatement, KovaQueryError> {
     }))
 }
 
+/// Translate an [`AstFieldRef`] into its bound twin. One-to-one for
+/// now ; the binder may eventually error here (e.g. unknown column
+/// when a schema registry lands).
+fn bind_field_ref(f: AstFieldRef) -> FieldRef {
+    FieldRef {
+        name: f.name,
+        subscript: f.subscript,
+    }
+}
+
 /// Translate one `SET <field> = <value>` (or `SET <field>['key'] =
 /// <value>`) assignment, after rejecting embedding assignments.
 fn bind_assignment(a: AstAssignment) -> Result<LogicalAssignment, KovaQueryError> {
@@ -210,7 +220,12 @@ fn detect_single_id_hint(pred: &PredicateExpr) -> Option<IdHint> {
     let PredicateExpr::Atom(PredAtom::Eq { field, value }) = pred else {
         return None;
     };
-    if !field.eq_ignore_ascii_case("id") {
+    // Subscripted-id predicates (`id['x'] = ...`) don't qualify ; the
+    // id is a virtual u64, not a Map.
+    if field.subscript.is_some() {
+        return None;
+    }
+    if !field.name.eq_ignore_ascii_case("id") {
         return None;
     }
     match value {
@@ -244,26 +259,28 @@ fn bind_predicate(p: AstPredicate) -> Result<PredicateExpr, KovaQueryError> {
         }
         AstPredicate::Not(inner) => PredicateExpr::Not(Box::new(bind_predicate(*inner)?)),
         AstPredicate::Eq(field, value) => PredicateExpr::Atom(PredAtom::Eq {
-            field,
+            field: bind_field_ref(field),
             value: bind_expr(value),
         }),
         AstPredicate::Cmp(field, op, value) => PredicateExpr::Atom(PredAtom::Cmp {
-            field,
+            field: bind_field_ref(field),
             op,
             value: bind_expr(value),
         }),
         AstPredicate::In(field, values) => PredicateExpr::Atom(PredAtom::In {
-            field,
+            field: bind_field_ref(field),
             values: values.into_iter().map(bind_literal).collect(),
         }),
         AstPredicate::Between(field, lo, hi) => PredicateExpr::Atom(PredAtom::Between {
-            field,
+            field: bind_field_ref(field),
             lo: bind_literal(lo),
             hi: bind_literal(hi),
         }),
         AstPredicate::IsNull(field, negated) => {
             // `IS NOT NULL` is the positive form, `IS NULL` wraps it in NOT.
-            let atom = PredicateExpr::Atom(PredAtom::IsNotNull { field });
+            let atom = PredicateExpr::Atom(PredAtom::IsNotNull {
+                field: bind_field_ref(field),
+            });
             if negated {
                 atom
             } else {
@@ -271,7 +288,7 @@ fn bind_predicate(p: AstPredicate) -> Result<PredicateExpr, KovaQueryError> {
             }
         }
         AstPredicate::ArrayContains(field, value) => PredicateExpr::Atom(PredAtom::ArrayContains {
-            field,
+            field: bind_field_ref(field),
             value: bind_literal(value),
         }),
         AstPredicate::DistanceThreshold(dist, op, radius) => {

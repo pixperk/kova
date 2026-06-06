@@ -1169,7 +1169,7 @@ fn physical_kind(plan: &PhysicalPlan) -> &'static str {
 
 use crate::ast::CmpOp;
 use crate::logical::{
-    BoundExpr, BoundLiteral, BoundProjection, LogicalAssignment, PredAtom, PredicateExpr,
+    BoundExpr, BoundLiteral, BoundProjection, FieldRef, LogicalAssignment, PredAtom, PredicateExpr,
     ProjectionSpec,
 };
 
@@ -1203,6 +1203,28 @@ fn eval_predicate(
     }
 }
 
+/// Resolve a [`FieldRef`] against a row's metadata bag. Bare
+/// references key into the bag directly ; subscripted references
+/// expect a `Value::Map` at the top-level field and key into it.
+/// Returns `None` when any step misses, matching the SQL "predicate
+/// is false on NULL" convention.
+fn lookup_field_value<'a>(field: &FieldRef, meta: &'a Metadata) -> Option<&'a Value> {
+    let top = meta.get(&field.name)?;
+    match &field.subscript {
+        None => Some(top),
+        Some(key) => match top {
+            Value::Map(inner) => inner.get(key),
+            _ => None,
+        },
+    }
+}
+
+/// `IS NOT NULL` form of [`lookup_field_value`] : reports presence
+/// without borrowing.
+fn field_is_present(field: &FieldRef, meta: &Metadata) -> bool {
+    lookup_field_value(field, meta).is_some()
+}
+
 /// Walk one atom against a row.
 fn eval_atom(
     atom: &PredAtom,
@@ -1212,17 +1234,16 @@ fn eval_atom(
     match atom {
         PredAtom::Eq { field, value } => {
             let expected = resolve_bound_value(value, params)?;
-            Ok(meta.get(field).is_some_and(|v| values_eq(v, &expected)))
+            Ok(lookup_field_value(field, meta).is_some_and(|v| values_eq(v, &expected)))
         }
         PredAtom::Cmp { field, op, value } => {
             let expected = resolve_bound_value(value, params)?;
-            Ok(meta
-                .get(field)
+            Ok(lookup_field_value(field, meta)
                 .and_then(|v| values_cmp(v, &expected, *op))
                 .unwrap_or(false))
         }
         PredAtom::In { field, values } => {
-            let Some(actual) = meta.get(field) else {
+            let Some(actual) = lookup_field_value(field, meta) else {
                 return Ok(false);
             };
             Ok(values
@@ -1231,7 +1252,7 @@ fn eval_atom(
                 .any(|lit| values_eq(actual, &lit)))
         }
         PredAtom::Between { field, lo, hi } => {
-            let Some(actual) = meta.get(field) else {
+            let Some(actual) = lookup_field_value(field, meta) else {
                 return Ok(false);
             };
             let lo_v = literal_to_value(lo);
@@ -1240,10 +1261,10 @@ fn eval_atom(
             let le_hi = values_cmp(actual, &hi_v, CmpOp::Le).unwrap_or(false);
             Ok(ge_lo && le_hi)
         }
-        PredAtom::IsNotNull { field } => Ok(meta.contains_key(field)),
+        PredAtom::IsNotNull { field } => Ok(field_is_present(field, meta)),
         PredAtom::ArrayContains { field, value } => {
             let target = literal_to_value(value);
-            match meta.get(field) {
+            match lookup_field_value(field, meta) {
                 Some(Value::Array(arr)) => Ok(arr.iter().any(|v| values_eq(v, &target))),
                 _ => Ok(false),
             }
@@ -2499,10 +2520,7 @@ mod tests {
         let Some(Value::Map(inner)) = bag.get("attrs") else {
             panic!("expected attrs to be a Map, got {:?}", bag.get("attrs"));
         };
-        assert_eq!(
-            inner.get("author"),
-            Some(&Value::String("alice".into()))
-        );
+        assert_eq!(inner.get("author"), Some(&Value::String("alice".into())));
     }
 
     /// Subscripted assignment on a field that's already a Map merges
@@ -2565,13 +2583,10 @@ mod tests {
         let mut new_attrs = Metadata::new();
         new_attrs.insert("country".into(), Value::String("IN".into()));
         new_attrs.insert("verified".into(), Value::Bool(true));
-        let params = ParamBindings::empty()
-            .with_positional(ParamValue::Metadata(new_attrs.clone()));
+        let params =
+            ParamBindings::empty().with_positional(ParamValue::Metadata(new_attrs.clone()));
         engine
-            .execute_str(
-                "UPDATE vectors SET attrs = $1 WHERE id = 1",
-                params,
-            )
+            .execute_str("UPDATE vectors SET attrs = $1 WHERE id = 1", params)
             .expect("execute_str");
         let bag = engine.shard().get_metadata(VectorId::new(1)).unwrap();
         let Some(Value::Map(map)) = bag.get("attrs") else {
@@ -2596,16 +2611,108 @@ mod tests {
                 )
                 .expect("execute_str");
         }
-        let shard =
-            Shard::open(dir.path(), 4, L2, HnswParams::default()).expect("Shard::open");
+        let shard = Shard::open(dir.path(), 4, L2, HnswParams::default()).expect("Shard::open");
         let bag = shard.get_metadata(VectorId::new(1)).unwrap();
         let Some(Value::Map(map)) = bag.get("attrs") else {
             panic!("expected attrs to be a Map after replay");
         };
-        assert_eq!(
-            map.get("author"),
-            Some(&Value::String("alice".into()))
+        assert_eq!(map.get("author"), Some(&Value::String("alice".into())));
+    }
+
+    // ----- subscripted-predicate end-to-end -----
+
+    /// SELECT with a subscripted predicate finds rows whose nested
+    /// Map value matches. Plan A's metadata post-filter runs the
+    /// evaluator's subscript navigation.
+    #[test]
+    fn select_with_subscripted_predicate_finds_matching_rows() {
+        let dir = tempdir().expect("tempdir");
+        let mut engine = make_engine(&dir);
+        let mut attrs_in = Metadata::new();
+        attrs_in.insert("country".into(), Value::String("IN".into()));
+        let mut attrs_us = Metadata::new();
+        attrs_us.insert("country".into(), Value::String("US".into()));
+        seed_engine(
+            &mut engine,
+            &[
+                meta_of(&[("attrs", Value::Map(attrs_in))]),
+                meta_of(&[("attrs", Value::Map(attrs_us))]),
+            ],
         );
+
+        let q = Vector::try_new(vec![1.0, 0.0, 0.0, 0.0]).unwrap();
+        let result = engine
+            .execute_str(
+                "SELECT id FROM vectors WHERE attrs['country'] = 'IN' \
+                 ORDER BY embedding <-> $1 LIMIT 5",
+                ParamBindings::empty().with_positional(ParamValue::Vector(q)),
+            )
+            .expect("execute_str");
+        let ExecutionResult::Rows { rows, .. } = result else {
+            panic!("expected Rows");
+        };
+        let ids: Vec<u64> = rows
+            .iter()
+            .map(|r| match r.values[0] {
+                RowValue::Id(id) => id.get(),
+                _ => panic!("expected Id"),
+            })
+            .collect();
+        assert!(ids.contains(&1), "id 1 (attrs.country=IN) should match");
+        assert!(
+            !ids.contains(&2),
+            "id 2 (attrs.country=US) should not match"
+        );
+    }
+
+    /// Subscripted predicate on a missing nested key returns no
+    /// matches, no error. Same semantics as a top-level missing field.
+    #[test]
+    fn select_with_subscripted_predicate_no_match_returns_empty() {
+        let dir = tempdir().expect("tempdir");
+        let mut engine = make_engine(&dir);
+        let mut attrs = Metadata::new();
+        attrs.insert("country".into(), Value::String("IN".into()));
+        seed_engine(&mut engine, &[meta_of(&[("attrs", Value::Map(attrs))])]);
+
+        let q = Vector::try_new(vec![1.0, 0.0, 0.0, 0.0]).unwrap();
+        let result = engine
+            .execute_str(
+                "SELECT id FROM vectors WHERE attrs['missing'] = 'x' \
+                 ORDER BY embedding <-> $1 LIMIT 5",
+                ParamBindings::empty().with_positional(ParamValue::Vector(q)),
+            )
+            .expect("execute_str");
+        let ExecutionResult::Rows { rows, .. } = result else {
+            panic!("expected Rows");
+        };
+        assert!(rows.is_empty());
+    }
+
+    /// Subscripted predicate against a non-Map field is treated as
+    /// "no match" (same as bare predicates against a missing field).
+    /// We don't want a runtime error here ; the row just doesn't
+    /// satisfy.
+    #[test]
+    fn select_with_subscripted_predicate_on_non_map_is_no_match() {
+        let dir = tempdir().expect("tempdir");
+        let mut engine = make_engine(&dir);
+        seed_engine(
+            &mut engine,
+            &[meta_of(&[("attrs", Value::String("flat".into()))])],
+        );
+        let q = Vector::try_new(vec![1.0, 0.0, 0.0, 0.0]).unwrap();
+        let result = engine
+            .execute_str(
+                "SELECT id FROM vectors WHERE attrs['country'] = 'IN' \
+                 ORDER BY embedding <-> $1 LIMIT 5",
+                ParamBindings::empty().with_positional(ParamValue::Vector(q)),
+            )
+            .expect("execute_str");
+        let ExecutionResult::Rows { rows, .. } = result else {
+            panic!("expected Rows");
+        };
+        assert!(rows.is_empty());
     }
 
     // ----- SELECT plan A : helpers -----

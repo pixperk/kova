@@ -135,18 +135,18 @@ pub enum AstLiteral {
 /// combinators.
 #[derive(Debug, Clone)]
 pub enum AstPredicate {
-    /// `field = value`.
-    Eq(String, AstExpr),
+    /// `field = value` or `field['key'] = value`.
+    Eq(AstFieldRef, AstExpr),
     /// `field <op> value` for ops other than `=`.
-    Cmp(String, CmpOp, AstExpr),
+    Cmp(AstFieldRef, CmpOp, AstExpr),
     /// `field IN (lit, lit, ...)`.
-    In(String, Vec<AstLiteral>),
+    In(AstFieldRef, Vec<AstLiteral>),
     /// `field BETWEEN lo AND hi`.
-    Between(String, AstLiteral, AstLiteral),
+    Between(AstFieldRef, AstLiteral, AstLiteral),
     /// `field IS NULL` (`false`) or `field IS NOT NULL` (`true`).
-    IsNull(String, bool),
+    IsNull(AstFieldRef, bool),
     /// `field @> value` : array containment.
-    ArrayContains(String, AstLiteral),
+    ArrayContains(AstFieldRef, AstLiteral),
     /// Boolean AND of two or more child predicates. Flattened :
     /// `(a AND b) AND c` parses as `And([a, b, c])`.
     And(Vec<AstPredicate>),
@@ -159,6 +159,17 @@ pub enum AstPredicate {
     /// bound ; parameter binding on the right is rejected at the
     /// binder.
     DistanceThreshold(AstDistance, CmpOp, f32),
+}
+
+/// Field reference inside a predicate atom : `field` or
+/// `field['key']`. Same single-level subscript shape as
+/// [`AstAssignment`] so both sides of the language stay symmetric.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AstFieldRef {
+    /// Top-level field name.
+    pub name: String,
+    /// `Some("key")` for `field['key']` ; `None` for bare `field`.
+    pub subscript: Option<String>,
 }
 
 /// Distance expression : `embedding <op> $param`.

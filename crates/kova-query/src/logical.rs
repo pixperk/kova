@@ -169,17 +169,17 @@ pub enum PredicateExpr {
 /// moment we added a fourth.
 #[derive(Debug, Clone, PartialEq)]
 pub enum PredAtom {
-    /// `field = value`.
+    /// `field = value` or `field['key'] = value`.
     Eq {
-        /// Target field.
-        field: String,
+        /// Target field, optionally subscripted into a nested map.
+        field: FieldRef,
         /// Right-hand side.
         value: BoundExpr,
     },
     /// `field <op> value` for ops other than `=`.
     Cmp {
-        /// Target field.
-        field: String,
+        /// Target field, optionally subscripted.
+        field: FieldRef,
         /// Comparison operator.
         op: CmpOp,
         /// Right-hand side.
@@ -187,15 +187,15 @@ pub enum PredAtom {
     },
     /// `field IN (lit, lit, ...)`.
     In {
-        /// Target field.
-        field: String,
+        /// Target field, optionally subscripted.
+        field: FieldRef,
         /// Membership set.
         values: Vec<BoundLiteral>,
     },
     /// `field BETWEEN lo AND hi`.
     Between {
-        /// Target field.
-        field: String,
+        /// Target field, optionally subscripted.
+        field: FieldRef,
         /// Lower bound (inclusive).
         lo: BoundLiteral,
         /// Upper bound (inclusive).
@@ -205,13 +205,13 @@ pub enum PredAtom {
     /// `NOT IsNotNull(field)` so downstream code only handles one
     /// shape.
     IsNotNull {
-        /// Target field.
-        field: String,
+        /// Target field, optionally subscripted.
+        field: FieldRef,
     },
     /// `field @> value` : array containment.
     ArrayContains {
-        /// Target field.
-        field: String,
+        /// Target field, optionally subscripted.
+        field: FieldRef,
         /// Value the array must contain.
         value: BoundLiteral,
     },
@@ -228,6 +228,30 @@ pub enum PredAtom {
         /// Distance bound.
         radius: f32,
     },
+}
+
+/// Bound field reference inside a predicate atom : the field name
+/// plus an optional single-level subscript. Shared between every
+/// [`PredAtom`] variant so the downstream evaluator has one lookup
+/// helper for all of them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FieldRef {
+    /// Top-level field name in the metadata bag.
+    pub name: String,
+    /// `Some("key")` for `field['key']` ; `None` for bare `field`.
+    /// At-most-one level of nesting is supported by the grammar.
+    pub subscript: Option<String>,
+}
+
+impl FieldRef {
+    /// Convenience constructor for a bare (no-subscript) reference.
+    #[must_use]
+    pub fn plain(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            subscript: None,
+        }
+    }
 }
 
 /// Value expression after binding : either a literal or a parameter

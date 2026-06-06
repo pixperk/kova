@@ -4,9 +4,9 @@ use pest::Parser;
 use pest::iterators::Pair;
 
 use crate::ast::{
-    AstAssignment, AstCreateIndex, AstDelete, AstDistance, AstDropIndex, AstExpr, AstInsert,
-    AstInsertSource, AstLiteral, AstOrderBy, AstPredicate, AstProjection, AstQuery, AstStatement,
-    AstUpdate, AstVacuum, CmpOp, DistanceOp, IndexMethod, OrderDir, ParamRef,
+    AstAssignment, AstCreateIndex, AstDelete, AstDistance, AstDropIndex, AstExpr, AstFieldRef,
+    AstInsert, AstInsertSource, AstLiteral, AstOrderBy, AstPredicate, AstProjection, AstQuery,
+    AstStatement, AstUpdate, AstVacuum, CmpOp, DistanceOp, IndexMethod, OrderDir, ParamRef,
 };
 use crate::error::KovaQueryError;
 
@@ -488,16 +488,27 @@ fn parse_atom(pair: Pair<Rule>) -> AstPredicate {
     }
 }
 
-/// `comparison_atom = { identifier ~ comparison_op ~ atom_value }`.
+/// `field_ref = { identifier ~ ("[" ~ string_literal ~ "]")? }`.
+/// Builds an [`AstFieldRef`] capturing the field name plus the
+/// optional bracketed subscript. Shared by every atom kind so the
+/// language stays uniform.
+fn parse_field_ref(pair: Pair<Rule>) -> AstFieldRef {
+    let mut inner = pair.into_inner();
+    let name = inner
+        .next()
+        .expect("field_ref has identifier")
+        .as_str()
+        .to_string();
+    let subscript = inner.next().map(|p| parse_string_literal(&p));
+    AstFieldRef { name, subscript }
+}
+
+/// `comparison_atom = { field_ref ~ comparison_op ~ atom_value }`.
 /// Splits `=` into [`AstPredicate::Eq`] ; all other ops go to
 /// [`AstPredicate::Cmp`].
 fn parse_comparison_atom(pair: Pair<Rule>) -> AstPredicate {
     let mut inner = pair.into_inner();
-    let field = inner
-        .next()
-        .expect("comparison_atom has identifier")
-        .as_str()
-        .to_string();
+    let field = parse_field_ref(inner.next().expect("comparison_atom has field_ref"));
     let op = parse_cmp_op(&inner.next().expect("comparison_atom has comparison_op"));
     let value = parse_atom_value(inner.next().expect("comparison_atom has atom_value"));
     if matches!(op, CmpOp::Eq) {
@@ -507,53 +518,37 @@ fn parse_comparison_atom(pair: Pair<Rule>) -> AstPredicate {
     }
 }
 
-/// `in_atom = { identifier ~ ^"IN" ~ "(" ~ literal ~ ("," ~ literal)* ~ ")" }`.
+/// `in_atom = { field_ref ~ ^"IN" ~ "(" ~ literal ~ ("," ~ literal)* ~ ")" }`.
 fn parse_in_atom(pair: Pair<Rule>) -> AstPredicate {
     let mut inner = pair.into_inner();
-    let field = inner
-        .next()
-        .expect("in_atom has identifier")
-        .as_str()
-        .to_string();
+    let field = parse_field_ref(inner.next().expect("in_atom has field_ref"));
     let values: Vec<AstLiteral> = inner.map(parse_literal).collect();
     AstPredicate::In(field, values)
 }
 
-/// `between_atom = { identifier ~ ^"BETWEEN" ~ literal ~ ^"AND" ~ literal }`.
+/// `between_atom = { field_ref ~ ^"BETWEEN" ~ literal ~ ^"AND" ~ literal }`.
 fn parse_between_atom(pair: Pair<Rule>) -> AstPredicate {
     let mut inner = pair.into_inner();
-    let field = inner
-        .next()
-        .expect("between_atom has identifier")
-        .as_str()
-        .to_string();
+    let field = parse_field_ref(inner.next().expect("between_atom has field_ref"));
     let lo = parse_literal(inner.next().expect("between_atom has lo literal"));
     let hi = parse_literal(inner.next().expect("between_atom has hi literal"));
     AstPredicate::Between(field, lo, hi)
 }
 
-/// `is_null_atom = { identifier ~ ^"IS" ~ is_null_negation? ~ ^"NULL" }`.
+/// `is_null_atom = { field_ref ~ ^"IS" ~ is_null_negation? ~ ^"NULL" }`.
 /// The optional `is_null_negation` is the only visible second child ;
 /// presence detects the `IS NOT NULL` form.
 fn parse_is_null_atom(pair: Pair<Rule>) -> AstPredicate {
     let mut inner = pair.into_inner();
-    let field = inner
-        .next()
-        .expect("is_null_atom has identifier")
-        .as_str()
-        .to_string();
+    let field = parse_field_ref(inner.next().expect("is_null_atom has field_ref"));
     let negated = inner.next().is_some();
     AstPredicate::IsNull(field, negated)
 }
 
-/// `array_contains_atom = { identifier ~ "@>" ~ literal }`.
+/// `array_contains_atom = { field_ref ~ "@>" ~ literal }`.
 fn parse_array_contains_atom(pair: Pair<Rule>) -> AstPredicate {
     let mut inner = pair.into_inner();
-    let field = inner
-        .next()
-        .expect("array_contains_atom has identifier")
-        .as_str()
-        .to_string();
+    let field = parse_field_ref(inner.next().expect("array_contains_atom has field_ref"));
     let value = parse_literal(inner.next().expect("array_contains_atom has literal"));
     AstPredicate::ArrayContains(field, value)
 }
@@ -1032,7 +1027,8 @@ mod tests {
         let AstPredicate::Eq(field, AstExpr::Literal(AstLiteral::I64(5))) = p else {
             panic!("expected Eq(id, 5), got {p:?}");
         };
-        assert_eq!(field, "id");
+        assert_eq!(field.name, "id");
+        assert!(field.subscript.is_none());
     }
 
     #[test]
@@ -1041,7 +1037,7 @@ mod tests {
         let AstPredicate::Eq(field, AstExpr::Literal(AstLiteral::String(s))) = p else {
             panic!("expected Eq with string, got {p:?}");
         };
-        assert_eq!(field, "name");
+        assert_eq!(field.name, "name");
         assert_eq!(s, "hello");
     }
 
@@ -1051,7 +1047,7 @@ mod tests {
         let AstPredicate::Eq(field, AstExpr::Param(ParamRef::Positional(1))) = p else {
             panic!("expected Eq with param, got {p:?}");
         };
-        assert_eq!(field, "id");
+        assert_eq!(field.name, "id");
     }
 
     #[test]
@@ -1140,7 +1136,7 @@ mod tests {
         let AstPredicate::In(field, values) = p else {
             panic!("expected In, got {p:?}");
         };
-        assert_eq!(field, "category");
+        assert_eq!(field.name, "category");
         assert_eq!(values.len(), 3);
         assert!(matches!(values[0], AstLiteral::String(ref s) if s == "docs"));
     }
@@ -1160,7 +1156,7 @@ mod tests {
         let AstPredicate::Between(field, AstLiteral::F64(lo), AstLiteral::F64(hi)) = p else {
             panic!("expected Between, got {p:?}");
         };
-        assert_eq!(field, "score");
+        assert_eq!(field.name, "score");
         assert!((lo - 0.5).abs() < f64::EPSILON);
         assert!((hi - 1.0).abs() < f64::EPSILON);
     }
@@ -1171,7 +1167,7 @@ mod tests {
         let AstPredicate::IsNull(field, negated) = p else {
             panic!("expected IsNull, got {p:?}");
         };
-        assert_eq!(field, "category");
+        assert_eq!(field.name, "category");
         assert!(!negated);
     }
 
@@ -1190,8 +1186,53 @@ mod tests {
         let AstPredicate::ArrayContains(field, AstLiteral::String(value)) = p else {
             panic!("expected ArrayContains, got {p:?}");
         };
-        assert_eq!(field, "tags");
+        assert_eq!(field.name, "tags");
         assert_eq!(value, "rust");
+    }
+
+    // ----- Predicates : subscripted field references -----
+
+    /// `WHERE attrs['country'] = 'IN'` parses with the subscript
+    /// captured on the field side.
+    #[test]
+    fn predicate_eq_with_subscripted_field() {
+        let p = parse_predicate_str("attrs['country'] = 'IN'").expect("parse Ok");
+        let AstPredicate::Eq(field, AstExpr::Literal(AstLiteral::String(s))) = p else {
+            panic!("expected Eq, got {p:?}");
+        };
+        assert_eq!(field.name, "attrs");
+        assert_eq!(field.subscript.as_deref(), Some("country"));
+        assert_eq!(s, "IN");
+    }
+
+    /// Subscripts work on every atom kind, not just `Eq`. Spot-check
+    /// `Cmp`, `In`, `Between`, `IsNull`, `@>`.
+    #[test]
+    fn predicate_subscripts_work_across_all_atoms() {
+        let cases = [
+            "attrs['score'] > 0.5",
+            "attrs['cat'] IN ('a', 'b')",
+            "attrs['year'] BETWEEN 2000 AND 2024",
+            "attrs['phone'] IS NOT NULL",
+            "attrs['tags'] @> 'rust'",
+        ];
+        for q in cases {
+            let p = parse_predicate_str(q)
+                .unwrap_or_else(|e| panic!("parse failed for `{q}` : {e:?}"));
+            let (AstPredicate::Cmp(field, _, _)
+            | AstPredicate::In(field, _)
+            | AstPredicate::Between(field, _, _)
+            | AstPredicate::IsNull(field, _)
+            | AstPredicate::ArrayContains(field, _)) = &p
+            else {
+                panic!("unexpected variant for `{q}` : {p:?}");
+            };
+            assert_eq!(field.name, "attrs", "wrong name for `{q}`");
+            assert!(
+                field.subscript.is_some(),
+                "subscript dropped for `{q}` : {p:?}"
+            );
+        }
     }
 
     // ----- Predicates : distance threshold -----
@@ -1347,7 +1388,7 @@ mod tests {
         let AstPredicate::Eq(field, AstExpr::Param(ParamRef::Positional(1))) = predicate else {
             panic!("expected Eq(id, $1), got {predicate:?}");
         };
-        assert_eq!(field, "id");
+        assert_eq!(field.name, "id");
     }
 
     #[test]
@@ -1374,7 +1415,7 @@ mod tests {
         let AstPredicate::In(field, values) = predicate else {
             panic!("expected In, got {predicate:?}");
         };
-        assert_eq!(field, "category");
+        assert_eq!(field.name, "category");
         assert_eq!(values.len(), 3);
     }
 

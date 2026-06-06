@@ -124,12 +124,18 @@ distance_expr = { ^"embedding" ~ distance_op ~ param }
 //<-> : Euclidean distance, <=> : cosine distance, <#> : inner product (negative for similarity)
 distance_op = { "<->" | "<=>" | "<#>" }
 
-comparison_atom = { identifier ~ comparison_op ~ atom_value }
-in_atom = { identifier ~ ^"IN" ~ "(" ~ literal ~ ("," ~ literal)* ~ ")" }
-between_atom = { identifier ~ ^"BETWEEN" ~ literal ~ ^"AND" ~ literal }
-is_null_atom = { identifier ~ ^"IS" ~ is_null_negation? ~ ^"NULL" }
+// Field reference inside a predicate atom : either a bare identifier
+// (`category`) or one with a single-level subscript (`attrs['key']`).
+// Centralised so every atom kind accepts the same shape, mirroring
+// the SET-assignment grammar.
+field_ref = { identifier ~ ("[" ~ string_literal ~ "]")? }
+
+comparison_atom = { field_ref ~ comparison_op ~ atom_value }
+in_atom = { field_ref ~ ^"IN" ~ "(" ~ literal ~ ("," ~ literal)* ~ ")" }
+between_atom = { field_ref ~ ^"BETWEEN" ~ literal ~ ^"AND" ~ literal }
+is_null_atom = { field_ref ~ ^"IS" ~ is_null_negation? ~ ^"NULL" }
 is_null_negation = { ^"NOT" }
-array_contains_atom = { identifier ~ "@>" ~ literal }
+array_contains_atom = { field_ref ~ "@>" ~ literal }
 
 // Two-char ops listed before their one-char prefixes : PEG is
 // first-match-wins, so `<=` has to be tried before `<`.

@@ -12,9 +12,9 @@
 //! `a = 1 AND b = 2` round-trips without growing parens each time.
 
 use crate::ast::{
-    AstAssignment, AstCreateIndex, AstDelete, AstDistance, AstDropIndex, AstExpr, AstInsert,
-    AstInsertSource, AstLiteral, AstOrderBy, AstPredicate, AstProjection, AstQuery, AstStatement,
-    AstUpdate, AstVacuum, CmpOp, DistanceOp, IndexMethod, OrderDir, ParamRef,
+    AstAssignment, AstCreateIndex, AstDelete, AstDistance, AstDropIndex, AstExpr, AstFieldRef,
+    AstInsert, AstInsertSource, AstLiteral, AstOrderBy, AstPredicate, AstProjection, AstQuery,
+    AstStatement, AstUpdate, AstVacuum, CmpOp, DistanceOp, IndexMethod, OrderDir, ParamRef,
 };
 
 /// Pretty-print a top-level KQL statement to canonical form.
@@ -70,6 +70,13 @@ fn print_assignment(a: &AstAssignment) -> String {
         None => a.field.clone(),
     };
     format!("{lhs} = {}", print_expr(&a.value))
+}
+
+fn print_field_ref(f: &AstFieldRef) -> String {
+    match &f.subscript {
+        Some(key) => format!("{}['{}']", f.name, key),
+        None => f.name.clone(),
+    }
 }
 
 fn print_delete(d: &AstDelete) -> String {
@@ -274,25 +281,35 @@ fn print_predicate_at(p: &AstPredicate, parent_prec: u8) -> String {
             .collect::<Vec<_>>()
             .join(" AND "),
         AstPredicate::Not(inner) => format!("NOT {}", print_predicate_at(inner, 2)),
-        AstPredicate::Eq(field, val) => format!("{field} = {}", print_expr(val)),
+        AstPredicate::Eq(field, val) => {
+            format!("{} = {}", print_field_ref(field), print_expr(val))
+        }
         AstPredicate::Cmp(field, op, val) => {
-            format!("{field} {} {}", print_cmp_op(*op), print_expr(val))
+            format!(
+                "{} {} {}",
+                print_field_ref(field),
+                print_cmp_op(*op),
+                print_expr(val),
+            )
         }
         AstPredicate::In(field, values) => {
             let vals: Vec<String> = values.iter().map(print_literal).collect();
-            format!("{field} IN ({})", vals.join(", "))
+            format!("{} IN ({})", print_field_ref(field), vals.join(", "))
         }
         AstPredicate::Between(field, lo, hi) => {
             format!(
-                "{field} BETWEEN {} AND {}",
+                "{} BETWEEN {} AND {}",
+                print_field_ref(field),
                 print_literal(lo),
                 print_literal(hi),
             )
         }
-        AstPredicate::IsNull(field, true) => format!("{field} IS NOT NULL"),
-        AstPredicate::IsNull(field, false) => format!("{field} IS NULL"),
+        AstPredicate::IsNull(field, true) => {
+            format!("{} IS NOT NULL", print_field_ref(field))
+        }
+        AstPredicate::IsNull(field, false) => format!("{} IS NULL", print_field_ref(field)),
         AstPredicate::ArrayContains(field, val) => {
-            format!("{field} @> {}", print_literal(val))
+            format!("{} @> {}", print_field_ref(field), print_literal(val))
         }
         AstPredicate::DistanceThreshold(dist, op, radius) => {
             format!(
