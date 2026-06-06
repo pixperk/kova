@@ -700,7 +700,11 @@ mod tests {
             sum += h_ids.intersection(&f_ids).count() as f32 / f_ids.len() as f32;
             counted += 1;
         }
-        if counted == 0 { 1.0 } else { sum / counted as f32 }
+        if counted == 0 {
+            1.0
+        } else {
+            sum / counted as f32
+        }
     }
 
     #[test]
