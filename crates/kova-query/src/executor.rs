@@ -2083,7 +2083,7 @@ mod tests {
     fn delete_by_radius_tombstones_in_ball() {
         let dir = tempdir().expect("tempdir");
         let mut engine = make_engine(&dir);
-        // 8 axis-aligned vectors : ids 1,5 → e_0 ; 2,6 → e_1 ; etc.
+        // 8 axis-aligned vectors : ids 1,5 -> e_0 ; 2,6 -> e_1 ; etc.
         let metas: Vec<Metadata> = (0..8).map(|_| Metadata::new()).collect();
         seed_engine(&mut engine, &metas);
 
@@ -2112,7 +2112,7 @@ mod tests {
     fn delete_by_radius_with_and_residue_applies_post_filter() {
         let dir = tempdir().expect("tempdir");
         let mut engine = make_engine(&dir);
-        // ids 1, 5 → e_0. Tag id 1 as 'docs', id 5 as 'other'.
+        // ids 1, 5 -> e_0. Tag id 1 as 'docs', id 5 as 'other'.
         let metas = vec![
             meta_of(&[("tag", Value::String("docs".into()))]), // id 1
             meta_of(&[("tag", Value::String("other".into()))]), // id 2
@@ -2327,7 +2327,7 @@ mod tests {
             panic!("expected Update, got {result:?}");
         };
         assert_eq!(updated, 2);
-        // ids 1 and 3 had category='old' → now 'archived' ;
+        // ids 1 and 3 had category='old' -> now 'archived' ;
         // id 2 had 'new' and stays unchanged.
         assert_eq!(
             engine
@@ -2443,7 +2443,7 @@ mod tests {
     fn update_by_radius_with_and_residue_applies_post_filter() {
         let dir = tempdir().expect("tempdir");
         let mut engine = make_engine(&dir);
-        // ids 1, 5 → e_0. id 1 tagged 'docs', id 5 tagged 'other'.
+        // ids 1, 5 -> e_0. id 1 tagged 'docs', id 5 tagged 'other'.
         let metas = vec![
             meta_of(&[("tag", Value::String("docs".into()))]),
             meta_of(&[("tag", Value::String("other".into()))]),
@@ -3285,7 +3285,7 @@ mod tests {
         let physical = crate::planner::plan_with_estimator(logical, &est, &ParamBindings::empty())
             .expect("plan");
 
-        // Projection → Limit → KnnSearch (with post_filter)
+        // Projection -> Limit -> KnnSearch (with post_filter)
         let PhysicalPlan::Projection { input, .. } = physical else {
             panic!("expected Projection");
         };
@@ -3520,7 +3520,7 @@ mod tests {
 
         let q = Vector::try_new(vec![1.0, 0.0, 0.0, 0.0]).unwrap();
 
-        // Engine A uses ShardEstimator (selectivity ~50% → plan A
+        // Engine A uses ShardEstimator (selectivity ~50% -> plan A
         // wins, since 0.5 is the threshold-boundary). Engine B is
         // forced to plan B by replaying the SAME query through both.
         // Both should yield the same set of ids (order may differ
@@ -3701,7 +3701,7 @@ mod tests {
     fn radius_search_returns_ids_within_radius() {
         let dir = tempdir().expect("tempdir");
         let mut engine = make_engine(&dir);
-        // 8 axis-aligned vectors : ids 1,5 → e_0 ; 2,6 → e_1 ; etc.
+        // 8 axis-aligned vectors : ids 1,5 -> e_0 ; 2,6 -> e_1 ; etc.
         let metas: Vec<Metadata> = (0..8).map(|_| Metadata::new()).collect();
         seed_engine(&mut engine, &metas);
 
@@ -3776,7 +3776,7 @@ mod tests {
     fn radius_search_with_and_residue_applies_post_filter() {
         let dir = tempdir().expect("tempdir");
         let mut engine = make_engine(&dir);
-        // ids 1,5 → e_0. Tag one 'docs', the other 'other'.
+        // ids 1,5 -> e_0. Tag one 'docs', the other 'other'.
         let metas = vec![
             meta_of(&[("tag", Value::String("docs".into()))]), // id 1
             meta_of(&[("tag", Value::String("other".into()))]), // id 2

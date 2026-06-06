@@ -16,11 +16,11 @@ with gRPC between nodes. Every byte, every index, every network call is ours.
 | `kova-core`    | shipped     | `Vector`, `Distance` trait + `Cosine` / `L2` / `InnerProduct` (SIMD)   |
 | `kova-index`   | shipped     | `Index` trait, `FlatIndex` baseline, `HnswIndex` (insert + search + two-pass vacuum + streaming snapshot) |
 | `kova-storage` | shipped     | Segmented WAL, `MmapVectorStore` (free-list slot reuse, crash-mid-init recovery), `FileMetadataStore`, `atomic_write` (+ streaming variant), `Manifest` commit point, `Shard` (log-then-mutate, batched inserts, logical delete, vacuum, checkpoint + WAL truncate, generation-numbered snapshots). SIGKILL-tested across 55,697 acks and 962 checkpoints. |
-| `kova-query`   | in progress | KQL parser (Pest grammar for all 8 statements : SELECT / INSERT / UPDATE / DELETE / VACUUM / CHECKPOINT / CREATE / DROP INDEX), pretty-printer with round-trip property tests, binder (AST -> typed LogicalStatement with predicate translation, embedding-immutability rejection, kNN-requires-LIMIT enforcement). Executor next. |
+| `kova-query`   | Phase 1 shipped | KQL end to end : parser (Pest grammar, all 8 statements), binder (typed `LogicalStatement` with hard semantic rejections), planner (three SELECT strategies dispatched by predicate selectivity, plus radius, COUNT and scan-and-limit bypasses), executor wired to `Shard` for both read and write paths, full DML (INSERT / UPDATE / DELETE including subscripted, radius, and param-bound shapes), `Value::Map` for nested metadata, probabilistic query fuzzer with reference-impl correctness check, recall regression sweep across kNN / filtered / radius. See [`docs/query.md`](docs/query.md). |
 | `kova-cluster` | not started | Consistent hashing, quorum replication, coordinator                    |
 | `kova-server`  | not started | gRPC node binary                                                       |
 
-416 tests passing across the workspace; `cargo clippy --workspace --all-targets -- -D warnings` clean.
+544 lib tests + 9 fuzz tests passing across the workspace. The full fuzz long-run pushes 12k+ correctness-checked queries and 32k+ no-panic queries per CI cycle. `cargo clippy --workspace --all-targets -- -D warnings` clean.
 
 ## Build
 
@@ -136,21 +136,43 @@ The 100k build alone takes ~2-3 minutes.
 ## Recall validation
 
 `HnswIndex` is correctness-tested against `FlatIndex` (ground truth) on
-random uniform workloads:
+random uniform workloads. The parametrised sweep
+[`recall_sweep_baseline`](crates/kova-index/src/hnsw/search.rs) runs three
+recall variants across a grid and asserts every cell clears 0.9. Today's
+baseline :
 
-| N       | dim | Recall@10 | Notes                                                     |
-| ------- | --- | --------- | --------------------------------------------------------- |
-|     300 |   8 | **1.000** | default; runs in milliseconds                             |
-|  10,000 |  32 | > 0.9     | default; runs in ~4s release mode                         |
-|  50,000 |  32 | > 0.9     | `#[ignore]`; run with `cargo test --release -- --ignored` |
+| Shape         | Configuration                  | Recall    |
+| ------------- | ------------------------------ | --------- |
+| kNN @10       | n=500, dim=4                   | **1.000** |
+| kNN @10       | n=500, dim=16                  | **1.000** |
+| kNN @10       | n=2k, dim=8                    | **1.000** |
+| kNN @10       | n=2k, dim=32                   | 0.985     |
+| kNN @10       | n=10k, dim=16                  | 0.990     |
+| Filtered @10  | n=500, dim=8, keep=0.5         | **1.000** |
+| Filtered @10  | n=2k, dim=16, keep=0.2 (tight) | **1.000** |
+| Filtered @10  | n=2k, dim=16, keep=0.5         | **1.000** |
+| Filtered @10  | n=2k, dim=16, keep=0.8         | **1.000** |
+| Filtered @10  | n=5k, dim=16, keep=0.3         | **1.000** |
+| Radius        | n=500, dim=4, r=0.30           | **1.000** |
+| Radius        | n=2k, dim=16, r=0.60           | **1.000** |
+| Radius        | n=5k, dim=16, r=0.50           | **1.000** |
+| Radius        | n=5k, dim=32, r=1.00           | **1.000** |
 
-The 300-case hits the brute-force ground truth exactly; larger scales meet
-the > 0.9 threshold with default `HnswParams`. No parameter tuning required
-for uniform random data at these sizes.
+12 of 14 cells perfect ; the two that drop are the high-dim kNN ones, where
+the curse of dimensionality is the natural enemy of ANN. Filtered and
+radius recall hold at 1.0 even at the tight-selectivity (20% kept) and
+high-dim ends. Any future change that drops a cell below 0.9 fails the
+test with the specific cell named, not a vague "recall regressed."
 
-All numbers above use SIMD distance (`wide::f32x8`). The `wide` crate falls
-back to scalar on platforms without 8-lane f32 SIMD, so this builds and
-runs everywhere.
+Plus a 50k-vector torture variant kept as `#[ignore]`'d :
+
+```sh
+cargo test -p kova-index --release -- --ignored recall_at_10_vs_flat_on_50k_dim32
+```
+
+All numbers use SIMD distance (`wide::f32x8`). The `wide` crate falls back
+to scalar on platforms without 8-lane f32 SIMD, so this builds and runs
+everywhere.
 
 ## Crash recovery
 
@@ -643,50 +665,134 @@ data (what tables exist, what indexes are built) belongs at the
 runtime layer. Catching this early saves a multi-week refactor in
 month 6.
 
-## `kova-query` : KQL
+## `kova-query` : KQL (Phase 1 shipped)
 
-KQL is the SQL-shaped language for hybrid vector + metadata workloads.
-Full surface : SELECT (kNN search with predicates), INSERT / UPDATE /
-DELETE (DML), VACUUM / CHECKPOINT (management). Sample shape :
+KQL is the SQL-shaped query language Kova uses for hybrid vector +
+metadata workloads. Everything user-visible goes through the same
+parse -> bind -> plan -> execute pipeline.
+
+This is the **highlights** view. Full reference, architecture, plan
+dispatch, type system, and the Phase 2 plan live in
+[`docs/query.md`](docs/query.md).
+
+### Sample shapes
 
 ```sql
+-- kNN with metadata filter
 SELECT id, embedding <-> $query AS distance, metadata
 FROM vectors
 WHERE category = 'docs' AND year >= 2024
 ORDER BY embedding <-> $query LIMIT 10
+
+-- Radius search with AND-residue
+SELECT id FROM vectors
+WHERE embedding <-> $q < 0.5 AND tag = 'archived'
+
+-- Count with subscripted predicate
+SELECT COUNT(*) FROM vectors WHERE attrs['country'] = 'IN'
+
+-- Update a nested attribute, by id
+UPDATE vectors SET attrs['priority'] = 5 WHERE id = $1
+
+-- Predicate-driven delete
+DELETE FROM vectors WHERE category = 'old' AND year < 2020
 ```
 
-What's landed :
+### Coverage
 
-- **Parser** : Pest grammar for all 8 statement types, atom-level
-  predicate tree with proper precedence (`OR < AND < NOT < atom`),
-  three distance operators (`<->` L2, `<=>` cosine, `<#>` inner),
-  six comparison ops, parametric values (positional `$1` and named
-  `$query`), and reserved-keyword handling that prevents `SELECT ON
-  FROM vectors`-style collisions.
-- **Pretty-printer** with round-trip property tests :
-  `parse → print → parse → print` is idempotent across every
-  statement and predicate shape.
-- **Binder** : AST -> typed `LogicalStatement` with predicate
-  translation, `IS NULL` normalised to `NOT IsNotNull`, single-id
-  hint detection for DELETE, hard rejects for embedding mutation
-  (`UPDATE SET embedding = ...`), distance ordering with `DESC`,
-  kNN queries without LIMIT, and v2-only DDL (CREATE / DROP INDEX).
+| Layer | What lands in Phase 1 |
+|-------|------------------------|
+| Grammar | All 8 statements parse (SELECT / INSERT / UPDATE / DELETE / VACUUM / CHECKPOINT / CREATE / DROP INDEX). Predicates : 6 comparison ops, `IN`, `BETWEEN`, `IS NULL`, `@>`, distance threshold, AND/OR/NOT with correct precedence. Subscripted field references (`attrs['key']`) work in both predicates and assignments. |
+| Binder | Hard semantic rejections : embedding mutation, kNN without LIMIT, distance ordering with `DESC`, OR containing a distance threshold, v2-only DDL. |
+| Planner | Three kNN strategies dispatched by predicate selectivity, plus radius operator, COUNT bypass, scan-and-limit bypass. Single-id hint detection (literal + param) fast-paths DELETE / UPDATE. |
+| Executor | Full DML : single + batch INSERT, DELETE-by-id / by-param / by-predicate / by-radius, UPDATE-by-id / by-param / by-predicate / by-radius with flat or subscripted SET clauses. VACUUM + CHECKPOINT bridge to `Shard`. |
+| Types | `Value` covers `String`, `I64`, `F64`, `Bool`, `Array`, `Map` (nested bags). Numeric coercion (`5 == 5.0`) ; everything else is type-strict. |
 
-What's next : **executor**. Wire the LogicalStatement through to
-`Shard` for the write path first (INSERT / DELETE-by-id / VACUUM /
-CHECKPOINT) so end-to-end KQL works, then add the read planner
-(scan vs index, post-filter vs pre-filter vs soft-filtered ANN) so
-hybrid queries actually run.
+### The three SELECT plans
+
+The planner picks A / B / C from an estimated selectivity :
+
+| Selectivity | Plan | What it does |
+|-------------|------|--------------|
+| `< 0.05`    | B    | Walk metadata for matching ids, compute exact distance, top-k. Bypasses ANN. |
+| `[0.05, 0.5)` | C  | Filtered ANN : predicate is consulted **during** the HNSW walk. |
+| `>= 0.5`    | A    | Overfetched kNN (k × 4), post-filter the candidates. |
+
+The bands are constants today ; Phase 2 swaps in a cost model. The
+decision-grid test pins the boundary behaviour.
+
+### Robustness
+
+| Test | Iterations | What it asserts |
+|------|------------|-----------------|
+| `fuzz_smoke_*` | 1,500+ per run | No panics across grammar-conformant random queries on a random shard |
+| `correctness_fuzz_*` | 1,000 per run | Engine result matches a reference-impl for COUNT, scan-and-limit, DELETE, UPDATE |
+| `fuzz_long_run` (ignored) | 32k+ | Long-run no-panic over 16 seeds |
+| `correctness_fuzz_long_run` (ignored) | 12k+ | Long-run correctness over 8 seeds |
+
+The harness is deterministic given a seed : every failing iteration
+prints the seed + query verbatim ; rerunning with the same seed
+reproduces the bug.
+
+### KQL design notes
+
+A few decisions worth calling out, both for future-me and for anyone
+following the code.
+
+**Four IRs, not one.** AST -> LogicalStatement -> PhysicalPlan ->
+ExecutionResult. Each IR has exactly one job, each transformation
+has its own test surface. Failures stay local to one layer. The
+boundaries are stable contracts so grammar changes do not churn the
+planner and vice versa.
+
+**Selectivity-driven plan dispatch, behind a trait.** The
+`SelectivityEstimator` trait is what picks plan A / B / C. Phase 1
+ships a `ShardEstimator` that evaluates the predicate against every
+row (cheap : metadata is in-memory). Phase 2 swaps in a histogram-
+backed estimator behind the same trait, no planner change.
+
+**Single-id hint instead of duplicate paths.** `DELETE WHERE id = 42`
+and `DELETE WHERE id = $1` both flow through the same `LogicalDelete
+{ single_id_hint }` field, which carries either a literal id or a
+parameter slot. The planner dispatches to `DeleteById` or
+`DeleteByParamId` from one match. Same shape for UPDATE.
+
+**Operator symmetry across the language.** `SELECT WHERE
+embedding <-> $q < r`, `DELETE WHERE embedding <-> $q < r`, and
+`UPDATE WHERE embedding <-> $q < r` all share a single `RadiusOp`
+borrowed bundle struct in the executor. Adding a new radius-flavoured
+operation costs one helper, not three.
+
+**`Value::Map` is the only nested type.** Metadata bags are
+`HashMap<String, Value>` and Value can recurse exactly through `Map`
+(and `Array`). Lets subscripted access work on both predicates and
+SET clauses without growing the grammar to multi-level paths.
+
+**Errors are a closed taxonomy.** `KovaQueryError` has five
+variants : `Parse`, `Bind`, `Plan`, `Execution`, `Backend`. The
+fuzzer enforces that every code path through the pipeline returns
+one of these, never panics. A panic is always a bug ; a typed error
+is a contract.
+
+**The reference fuzzer caught its own bug.** Phase 1's correctness
+fuzzer is reference-first : the reference impl computes the expected
+result before the engine runs. An earlier version let the engine
+run first and the reference fell behind on shapes it could not
+evaluate, manifesting as a fake "engine deleted 0, expected 10"
+mismatch. The fix was harness discipline, not engine code, but the
+mode of failure is the kind of methodology Phase 2 inherits.
 
 ## Longer-term scope
 
-Beyond `kova-storage` :
+Beyond Phase 1 of `kova-query` :
 
-- **`kova-query`** : KQL, a SQL-inspired query language for hybrid
-  searches that combine vector similarity with metadata filters. Pest
-  grammar, planner that picks pre-filter vs post-filter based on
-  selectivity, executor that walks plans against the storage layer.
+- **`kova-query` Phase 2** : real metadata indexes (hash / btree /
+  inverted), `RoaringBitmap` predicate composition, `CREATE INDEX` /
+  `DROP INDEX` DDL unrejected at the binder, histogram-backed
+  statistics, cost-model planner replacing the hardcoded 0.05 / 0.5
+  selectivity bands. Every milestone is a trait-impl swap behind a
+  stable interface : same KQL grammar, same operators, same fuzzer.
+  See [`docs/query.md`](docs/query.md) for the full plan.
 - **`kova-cluster` + `kova-server`** : the distribution layer. Consistent
   hashing with virtual nodes, quorum replication, a coordinator that
   fans out queries and merges results across shards via gRPC. `openraft`

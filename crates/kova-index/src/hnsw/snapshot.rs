@@ -201,7 +201,7 @@ mod tests {
         VectorId::new(n)
     }
 
-    /// Round-trip on a small graph : write → read → compare graph
+    /// Round-trip on a small graph : write -> read -> compare graph
     /// structure (top layer, neighbour lists) and search behaviour.
     #[test]
     fn snapshot_roundtrip_preserves_graph_and_search() {

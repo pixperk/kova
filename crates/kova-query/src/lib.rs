@@ -17,7 +17,7 @@ pub mod printer;
 pub use ast::AstStatement;
 pub use binder::bind;
 pub use error::KovaQueryError;
-pub use executor::{Engine, ExecutionResult, ParamBindings, ParamValue};
+pub use executor::{Engine, ExecutionResult, ParamBindings, ParamValue, Row, RowValue};
 pub use logical::LogicalStatement;
 pub use parser::parse_str;
 pub use physical::PhysicalPlan;

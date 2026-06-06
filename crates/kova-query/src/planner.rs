@@ -179,10 +179,10 @@ pub fn plan_with_estimator<E: SelectivityEstimator>(
 /// Plan an UPDATE statement.
 ///
 /// Dispatch order mirrors DELETE :
-/// 1. Single-id hint (literal or param) → `UpdateById` / `UpdateByParamId`.
-/// 2. `OR` containing a distance-threshold → rejected.
-/// 3. Top-level `embedding <-> $q < r` → `UpdateByRadius`.
-/// 4. Anything else → `UpdateByPredicate` (metadata scan).
+/// 1. Single-id hint (literal or param) -> `UpdateById` / `UpdateByParamId`.
+/// 2. `OR` containing a distance-threshold -> rejected.
+/// 3. Top-level `embedding <-> $q < r` -> `UpdateByRadius`.
+/// 4. Anything else -> `UpdateByPredicate` (metadata scan).
 ///
 /// Distance-threshold atoms hidden inside `NOT` or nested `OR` are
 /// rejected upfront so they don't surface as runtime errors in the
@@ -605,8 +605,8 @@ struct ExtractedRadius {
 /// exists, returning its parts plus whatever predicate is left after
 /// removing it. Recognised shapes :
 ///
-/// - Bare atom : `DistanceThreshold` → consumed, residue is `None`
-/// - `And([..., DistanceThreshold, ...])` → atom consumed, residue is
+/// - Bare atom : `DistanceThreshold` -> consumed, residue is `None`
+/// - `And([..., DistanceThreshold, ...])` -> atom consumed, residue is
 ///   the rest (single child unwrapped, multiple children re-wrapped
 ///   in `And`)
 ///
