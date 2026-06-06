@@ -10,7 +10,8 @@
 
 use kova_core::VectorId;
 
-use crate::ast::ParamRef;
+use crate::ast::{DistanceOp, ParamRef};
+use crate::logical::{PredicateExpr, ProjectionSpec};
 
 /// Physical operator. v1 grows this enum as each statement gets its
 /// executor support. Explicit variants (no catchall) so the executor's
@@ -59,5 +60,43 @@ pub enum PhysicalPlan {
         table: String,
         /// Pre-resolved id (no parameter lookup needed at execute time).
         id: VectorId,
+    },
+    /// kNN search : the read path's entry point. Calls
+    /// `Shard::search` for `k` candidates, then applies `post_filter`
+    /// (if any) to drop rows that fail the predicate. Returns a
+    /// stream of [`kova_storage::SearchHit`] up the operator tree.
+    ///
+    /// The planner already inflated `k` to `user_limit * overfetch`
+    /// so the post-filter has room to drop some candidates without
+    /// starving the final LIMIT.
+    KnnSearch {
+        /// Target table.
+        table: String,
+        /// Parameter slot for the query vector.
+        query: ParamRef,
+        /// Distance metric requested (planner records ; executor uses
+        /// the shard's native metric in v1).
+        metric: DistanceOp,
+        /// kNN result count (already overfetched).
+        k: usize,
+        /// Optional predicate applied after the kNN returns. Drops
+        /// rows whose metadata fails the predicate.
+        post_filter: Option<PredicateExpr>,
+    },
+    /// Truncate the input row stream to at most `limit` rows.
+    Limit {
+        /// Sub-plan producing the input rows.
+        input: Box<PhysicalPlan>,
+        /// Maximum rows to emit.
+        limit: u64,
+    },
+    /// Shape the output rows according to a projection spec. Always
+    /// the outermost read operator ; converts internal hits into
+    /// user-facing [`crate::executor::Row`] values.
+    Projection {
+        /// Sub-plan producing the input rows.
+        input: Box<PhysicalPlan>,
+        /// Projection list with wildcards already expanded.
+        spec: ProjectionSpec,
     },
 }

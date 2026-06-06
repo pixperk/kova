@@ -6,8 +6,8 @@
 
 use std::collections::HashMap;
 
-use kova_core::{Distance, Metadata, Vector, VectorId};
-use kova_storage::{FileMetadataStore, FileWal, Lsn, MmapVectorStore, Shard};
+use kova_core::{Distance, Metadata, Value, Vector, VectorId};
+use kova_storage::{FileMetadataStore, FileWal, Lsn, MmapVectorStore, SearchHit, Shard};
 
 use crate::ast::ParamRef;
 use crate::binder::bind;
@@ -103,15 +103,29 @@ impl ParamBindings {
 /// Typed parameter value the caller passes for a `$param` slot.
 #[derive(Debug, Clone)]
 pub enum ParamValue {
-    /// Vector primary key.
+    /// Vector primary key. INSERT row id slot.
     Id(VectorId),
-    /// Embedding vector. For single-row INSERT.
+    /// Embedding vector. Single-row INSERT, or SELECT's `$query`.
     Vector(Vector),
-    /// Metadata bag. For single-row INSERT / UPDATE.
+    /// Metadata bag. Single-row INSERT / UPDATE metadata slot.
     Metadata(Metadata),
-    /// Batch of `(id, embedding, metadata)` tuples. For `VALUES $1`
-    /// batch INSERT.
+    /// Batch of `(id, embedding, metadata)` tuples. `INSERT VALUES $1`.
     Batch(Vec<(VectorId, Vector, Metadata)>),
+    // ---- Predicate-side value bindings ----
+    //
+    // Used when a predicate atom binds a literal slot, e.g.
+    // `WHERE category = $1`. Same shape as `kova_core::Value` so
+    // the evaluator can compare directly.
+    /// UTF-8 string literal value. Predicate side.
+    String(String),
+    /// Signed 64-bit integer literal value. Predicate side.
+    I64(i64),
+    /// 64-bit float literal value. Predicate side.
+    F64(f64),
+    /// Boolean literal value. Predicate side.
+    Bool(bool),
+    /// SQL NULL. Predicate side.
+    Null,
 }
 
 /// The outcome of executing a statement. One variant per operator
@@ -147,6 +161,41 @@ pub enum ExecutionResult {
         /// `DeleteByPredicate` lands).
         deleted: u64,
     },
+    /// SELECT returned a result set.
+    Rows {
+        /// Output column headers, in projection order.
+        columns: Vec<String>,
+        /// Output rows.
+        rows: Vec<Row>,
+    },
+}
+
+/// One output row from a SELECT result. Cell values are positional
+/// in [`Row::values`] ; column headers in
+/// [`ExecutionResult::Rows::columns`] line up by index.
+#[derive(Debug, Clone)]
+pub struct Row {
+    /// Cell values in column order.
+    pub values: Vec<RowValue>,
+}
+
+/// Typed cell value in a [`Row`]. The variants cover everything
+/// SELECT can project today : the magic `id` and `distance` columns,
+/// the whole metadata bag, individual metadata fields, and `NULL`.
+#[derive(Debug, Clone)]
+pub enum RowValue {
+    /// The row's vector id.
+    Id(VectorId),
+    /// Distance under the kNN's metric (smaller = closer).
+    Distance(f32),
+    /// Whole metadata bag, returned when the projection includes
+    /// the `metadata` keyword.
+    Metadata(Metadata),
+    /// A single named metadata field value.
+    Field(Value),
+    /// `NULL` : returned when a projected metadata field is absent
+    /// from the row's bag.
+    Null,
 }
 
 /// Top-level KQL execution engine. Owns a file-backed [`Shard`] and
@@ -286,6 +335,75 @@ impl<D: Distance> Engine<D> {
                     .map_err(|e| KovaQueryError::Backend(Box::new(e)))?;
                 Ok(ExecutionResult::Delete { table, deleted: 1 })
             }
+
+            // Read path : the outermost operator must be Projection,
+            // because that's the only one that builds user-facing
+            // `Row` values. Limit / KnnSearch are *internal* — they
+            // flow `Vec<SearchHit>` between themselves via
+            // `execute_read` and shouldn't appear at the top level.
+            PhysicalPlan::Projection { input, spec } => {
+                let hits = self.execute_read(*input, params)?;
+                let columns = projection_column_names(&spec);
+                let rows: Result<Vec<Row>, _> =
+                    hits.iter().map(|h| project_hit(h, &spec)).collect();
+                Ok(ExecutionResult::Rows {
+                    columns,
+                    rows: rows?,
+                })
+            }
+            PhysicalPlan::Limit { .. } | PhysicalPlan::KnnSearch { .. } => {
+                Err(KovaQueryError::Plan(
+                    "read-path operator at top level ; planner must wrap in Projection".into(),
+                ))
+            }
+        }
+    }
+
+    /// Internal read-path executor. Returns the typed hits that flow
+    /// between read operators ; only the outermost `Projection`
+    /// converts them into user-facing rows.
+    fn execute_read(
+        &self,
+        plan: PhysicalPlan,
+        params: &ParamBindings,
+    ) -> Result<Vec<SearchHit>, KovaQueryError> {
+        match plan {
+            PhysicalPlan::KnnSearch {
+                table,
+                query,
+                metric: _,
+                k,
+                post_filter,
+            } => {
+                self.assert_table(&table)?;
+                let query_vec = expect_vector(params.resolve(&query)?, "query")?;
+                let hits = self
+                    .shard
+                    .search(&query_vec, k)
+                    .map_err(|e| KovaQueryError::Backend(Box::new(e)))?;
+                let filtered = match post_filter {
+                    None => hits,
+                    Some(pred) => {
+                        let mut kept = Vec::with_capacity(hits.len());
+                        for h in hits {
+                            if eval_predicate(&pred, &h.metadata, params)? {
+                                kept.push(h);
+                            }
+                        }
+                        kept
+                    }
+                };
+                Ok(filtered)
+            }
+            PhysicalPlan::Limit { input, limit } => {
+                let hits = self.execute_read(*input, params)?;
+                let cap = usize::try_from(limit).unwrap_or(usize::MAX);
+                Ok(hits.into_iter().take(cap).collect())
+            }
+            other => Err(KovaQueryError::Plan(format!(
+                "{} is not a read-path operator",
+                physical_kind(&other)
+            ))),
         }
     }
 
@@ -368,6 +486,274 @@ fn expect_batch(
     }
 }
 
+/// Static label for a [`PhysicalPlan`] variant ; used in error
+/// messages when a read-path operator shows up at the wrong place.
+fn physical_kind(plan: &PhysicalPlan) -> &'static str {
+    match plan {
+        PhysicalPlan::Checkpoint => "Checkpoint",
+        PhysicalPlan::Vacuum { .. } => "Vacuum",
+        PhysicalPlan::InsertOne { .. } => "InsertOne",
+        PhysicalPlan::InsertMany { .. } => "InsertMany",
+        PhysicalPlan::DeleteById { .. } => "DeleteById",
+        PhysicalPlan::KnnSearch { .. } => "KnnSearch",
+        PhysicalPlan::Limit { .. } => "Limit",
+        PhysicalPlan::Projection { .. } => "Projection",
+    }
+}
+
+// =========================================================================
+// Predicate evaluation
+// =========================================================================
+//
+// Walks a `PredicateExpr` against a row's `Metadata` bag and the
+// caller's `ParamBindings`. Returns a boolean : does the row pass
+// the filter? Used by `KnnSearch`'s post-filter step.
+//
+// NULL handling : v1 follows the "filtered out" rule for atoms
+// touching absent fields (e.g. `category = 'docs'` on a row with no
+// `category` returns false). v2 may switch to Postgres 3-value
+// logic (NULL = NULL produces NULL, propagates through AND/OR), but
+// for plan A the "drop unknowns" behaviour is what users expect.
+
+use crate::ast::CmpOp;
+use crate::logical::{
+    BoundExpr, BoundLiteral, BoundProjection, PredAtom, PredicateExpr, ProjectionSpec,
+};
+
+/// Walk a predicate against a row.
+fn eval_predicate(
+    pred: &PredicateExpr,
+    meta: &Metadata,
+    params: &ParamBindings,
+) -> Result<bool, KovaQueryError> {
+    match pred {
+        PredicateExpr::True => Ok(true),
+        PredicateExpr::False => Ok(false),
+        PredicateExpr::And(children) => {
+            for c in children {
+                if !eval_predicate(c, meta, params)? {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+        PredicateExpr::Or(children) => {
+            for c in children {
+                if eval_predicate(c, meta, params)? {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+        PredicateExpr::Not(inner) => Ok(!eval_predicate(inner, meta, params)?),
+        PredicateExpr::Atom(atom) => eval_atom(atom, meta, params),
+    }
+}
+
+/// Walk one atom against a row.
+fn eval_atom(
+    atom: &PredAtom,
+    meta: &Metadata,
+    params: &ParamBindings,
+) -> Result<bool, KovaQueryError> {
+    match atom {
+        PredAtom::Eq { field, value } => {
+            let expected = resolve_bound_value(value, params)?;
+            Ok(meta.get(field).is_some_and(|v| values_eq(v, &expected)))
+        }
+        PredAtom::Cmp { field, op, value } => {
+            let expected = resolve_bound_value(value, params)?;
+            Ok(meta
+                .get(field)
+                .and_then(|v| values_cmp(v, &expected, *op))
+                .unwrap_or(false))
+        }
+        PredAtom::In { field, values } => {
+            let Some(actual) = meta.get(field) else {
+                return Ok(false);
+            };
+            Ok(values
+                .iter()
+                .map(literal_to_value)
+                .any(|lit| values_eq(actual, &lit)))
+        }
+        PredAtom::Between { field, lo, hi } => {
+            let Some(actual) = meta.get(field) else {
+                return Ok(false);
+            };
+            let lo_v = literal_to_value(lo);
+            let hi_v = literal_to_value(hi);
+            let ge_lo = values_cmp(actual, &lo_v, CmpOp::Ge).unwrap_or(false);
+            let le_hi = values_cmp(actual, &hi_v, CmpOp::Le).unwrap_or(false);
+            Ok(ge_lo && le_hi)
+        }
+        PredAtom::IsNotNull { field } => Ok(meta.contains_key(field)),
+        PredAtom::ArrayContains { field, value } => {
+            let target = literal_to_value(value);
+            match meta.get(field) {
+                Some(Value::Array(arr)) => Ok(arr.iter().any(|v| values_eq(v, &target))),
+                _ => Ok(false),
+            }
+        }
+        PredAtom::DistanceThreshold { .. } => Err(KovaQueryError::Execution(
+            "DistanceThreshold predicate in SELECT WHERE is not supported in plan A ; \
+             use it as a radius search later"
+                .into(),
+        )),
+    }
+}
+
+/// Resolve a [`BoundExpr`] (either a literal or a `$param`) to a
+/// concrete [`Value`] for predicate comparison.
+fn resolve_bound_value(expr: &BoundExpr, params: &ParamBindings) -> Result<Value, KovaQueryError> {
+    match expr {
+        BoundExpr::Literal(l) => Ok(literal_to_value(l)),
+        BoundExpr::Param(p) => param_value_to_value(params.resolve(p)?),
+    }
+}
+
+fn literal_to_value(l: &BoundLiteral) -> Value {
+    match l {
+        BoundLiteral::String(s) => Value::String(s.clone()),
+        BoundLiteral::I64(n) => Value::I64(*n),
+        BoundLiteral::F64(f) => Value::F64(*f),
+        BoundLiteral::Bool(b) => Value::Bool(*b),
+        // NULL is represented as "no entry in the metadata bag" ; we
+        // model it as an unmatchable sentinel here so equality and
+        // ordering against any concrete value fall through to false.
+        BoundLiteral::Null => Value::Array(Vec::new()),
+    }
+}
+
+/// Turn a caller-bound [`ParamValue`] into a [`Value`] for predicate
+/// comparison. Only the literal-shaped variants are valid here ;
+/// vector / id / metadata / batch in a WHERE position is a binder
+/// bug we surface as an Execution error.
+fn param_value_to_value(p: &ParamValue) -> Result<Value, KovaQueryError> {
+    match p {
+        ParamValue::String(s) => Ok(Value::String(s.clone())),
+        ParamValue::I64(n) => Ok(Value::I64(*n)),
+        ParamValue::F64(f) => Ok(Value::F64(*f)),
+        ParamValue::Bool(b) => Ok(Value::Bool(*b)),
+        ParamValue::Null => Ok(Value::Array(Vec::new())),
+        other => Err(KovaQueryError::Execution(format!(
+            "parameter in WHERE clause must be a literal type (String/I64/F64/Bool/Null), \
+             got {}",
+            param_value_kind(other)
+        ))),
+    }
+}
+
+/// Equality on [`Value`] : same-type direct compare, plus numeric
+/// cross-type (I64 <-> F64). Different non-numeric types are always
+/// unequal.
+fn values_eq(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::String(x), Value::String(y)) => x == y,
+        (Value::I64(x), Value::I64(y)) => x == y,
+        (Value::F64(x), Value::F64(y)) => x == y,
+        (Value::Bool(x), Value::Bool(y)) => x == y,
+        (Value::Array(x), Value::Array(y)) => x == y,
+        // Numeric coercion : 5 == 5.0
+        (Value::I64(x), Value::F64(y)) | (Value::F64(y), Value::I64(x)) => {
+            #[allow(clippy::cast_precision_loss)]
+            let xf = *x as f64;
+            xf == *y
+        }
+        _ => false,
+    }
+}
+
+/// Ordering compare on [`Value`] using the SQL comparison ops.
+/// Returns `Some(bool)` when comparable, `None` when not (different
+/// non-coercible types).
+fn values_cmp(a: &Value, b: &Value, op: CmpOp) -> Option<bool> {
+    use std::cmp::Ordering;
+
+    let ordering: Ordering = match (a, b) {
+        (Value::String(x), Value::String(y)) => x.partial_cmp(y),
+        (Value::I64(x), Value::I64(y)) => x.partial_cmp(y),
+        (Value::F64(x), Value::F64(y)) => x.partial_cmp(y),
+        (Value::Bool(x), Value::Bool(y)) => x.partial_cmp(y),
+        (Value::I64(x), Value::F64(y)) => {
+            #[allow(clippy::cast_precision_loss)]
+            let xf = *x as f64;
+            xf.partial_cmp(y)
+        }
+        (Value::F64(x), Value::I64(y)) => {
+            #[allow(clippy::cast_precision_loss)]
+            let yf = *y as f64;
+            x.partial_cmp(&yf)
+        }
+        _ => return None,
+    }?;
+    Some(match op {
+        CmpOp::Eq => ordering == Ordering::Equal,
+        CmpOp::Ne => ordering != Ordering::Equal,
+        CmpOp::Lt => ordering == Ordering::Less,
+        CmpOp::Le => ordering != Ordering::Greater,
+        CmpOp::Gt => ordering == Ordering::Greater,
+        CmpOp::Ge => ordering != Ordering::Less,
+    })
+}
+
+// =========================================================================
+// Projection
+// =========================================================================
+//
+// Turn the typed `SearchHit` flowing up from the kNN into a
+// user-facing `Row` with the columns the projection spec asked for.
+
+/// Build the column-name vector for a projection spec, in order.
+fn projection_column_names(spec: &ProjectionSpec) -> Vec<String> {
+    spec.columns.iter().map(column_name).collect()
+}
+
+/// Output column name for a single projection : the alias if set,
+/// otherwise the natural name (e.g. `"id"`, `"metadata"`, the field
+/// name).
+fn column_name(col: &BoundProjection) -> String {
+    match col {
+        BoundProjection::Wildcard => "*".into(),
+        BoundProjection::CountStar { alias } => alias.clone().unwrap_or_else(|| "count".into()),
+        BoundProjection::Id { alias } => alias.clone().unwrap_or_else(|| "id".into()),
+        BoundProjection::Metadata { alias } => alias.clone().unwrap_or_else(|| "metadata".into()),
+        BoundProjection::Distance { alias, .. } => alias.clone(),
+        BoundProjection::MetadataField { name, alias } => {
+            alias.clone().unwrap_or_else(|| name.clone())
+        }
+    }
+}
+
+/// Convert one [`SearchHit`] to a [`Row`] under the projection spec.
+fn project_hit(hit: &SearchHit, spec: &ProjectionSpec) -> Result<Row, KovaQueryError> {
+    let values: Result<Vec<RowValue>, _> = spec
+        .columns
+        .iter()
+        .map(|c| project_column(hit, c))
+        .collect();
+    Ok(Row { values: values? })
+}
+
+/// Project one column from a hit.
+fn project_column(hit: &SearchHit, col: &BoundProjection) -> Result<RowValue, KovaQueryError> {
+    match col {
+        BoundProjection::Wildcard => Err(KovaQueryError::Plan(
+            "wildcard projection should have been expanded by the planner".into(),
+        )),
+        BoundProjection::CountStar { .. } => Err(KovaQueryError::Plan(
+            "COUNT(*) is not supported in plan A ; lands with aggregates later".into(),
+        )),
+        BoundProjection::Id { .. } => Ok(RowValue::Id(hit.id)),
+        BoundProjection::Distance { .. } => Ok(RowValue::Distance(hit.distance)),
+        BoundProjection::Metadata { .. } => Ok(RowValue::Metadata(hit.metadata.clone())),
+        BoundProjection::MetadataField { name, .. } => Ok(hit
+            .metadata
+            .get(name)
+            .map_or(RowValue::Null, |v| RowValue::Field(v.clone()))),
+    }
+}
+
 /// Static label for each [`ParamValue`] variant ; used to build
 /// helpful "got X, expected Y" error messages.
 fn param_value_kind(value: &ParamValue) -> &'static str {
@@ -376,6 +762,11 @@ fn param_value_kind(value: &ParamValue) -> &'static str {
         ParamValue::Vector(_) => "Vector",
         ParamValue::Metadata(_) => "Metadata",
         ParamValue::Batch(_) => "Batch",
+        ParamValue::String(_) => "String",
+        ParamValue::I64(_) => "I64",
+        ParamValue::F64(_) => "F64",
+        ParamValue::Bool(_) => "Bool",
+        ParamValue::Null => "Null",
     }
 }
 
@@ -918,6 +1309,329 @@ mod tests {
         let mut engine = make_engine(&dir);
         let err = engine
             .execute_str("DELETE FROM products WHERE id = 1", ParamBindings::empty())
+            .expect_err("expected error");
+        assert!(matches!(err, KovaQueryError::Execution(_)));
+    }
+
+    // ----- SELECT plan A : helpers -----
+
+    /// Build a unit vector that points in the `i`th direction at
+    /// distance 1, padded with zeros. `i` is 1-based (matching ids),
+    /// so `axis_vec(1)` is `[1, 0, 0, 0]`, `axis_vec(2)` is
+    /// `[0, 1, 0, 0]`, etc.
+    fn axis_vec(i: u16) -> Vector {
+        let mut v = vec![0.0_f32; 4];
+        let idx = ((i as usize) - 1) % 4;
+        v[idx] = 1.0;
+        Vector::try_new(v).expect("non-empty")
+    }
+
+    fn meta_of(pairs: &[(&str, Value)]) -> Metadata {
+        let mut m = Metadata::new();
+        for (k, v) in pairs {
+            m.insert((*k).to_string(), v.clone());
+        }
+        m
+    }
+
+    /// Seed `engine` with rows 1..=N where each row has a distinct
+    /// axis-aligned vector and a metadata bag.
+    fn seed_engine(engine: &mut Engine<L2>, metas: &[Metadata]) {
+        for (i, meta) in metas.iter().enumerate() {
+            #[allow(clippy::cast_possible_truncation)]
+            let i = i as u16 + 1;
+            engine
+                .shard_mut()
+                .insert(VectorId::new(u64::from(i)), axis_vec(i), meta.clone())
+                .expect("seed insert");
+        }
+    }
+
+    // ----- SELECT plan A : kNN happy paths -----
+
+    #[test]
+    fn executes_select_id_with_knn_ordering() {
+        let dir = tempdir().expect("tempdir");
+        let mut engine = make_engine(&dir);
+        seed_engine(
+            &mut engine,
+            &[Metadata::new(), Metadata::new(), Metadata::new()],
+        );
+        // Query points at axis 0 ; id=1 has its 1.0 on axis 0, so it
+        // should be the nearest.
+        let q = Vector::try_new(vec![1.0, 0.0, 0.0, 0.0]).unwrap();
+        let result = engine
+            .execute_str(
+                "SELECT id FROM vectors ORDER BY embedding <-> $1 LIMIT 2",
+                ParamBindings::empty().with_positional(ParamValue::Vector(q)),
+            )
+            .expect("execute_str");
+        let ExecutionResult::Rows { columns, rows } = result else {
+            panic!("expected Rows, got {result:?}");
+        };
+        assert_eq!(columns, vec!["id".to_string()]);
+        assert_eq!(rows.len(), 2);
+        // First row is the closest match.
+        let RowValue::Id(first) = rows[0].values[0] else {
+            panic!("expected Id");
+        };
+        assert_eq!(first.get(), 1);
+    }
+
+    #[test]
+    fn executes_select_with_distance_alias() {
+        let dir = tempdir().expect("tempdir");
+        let mut engine = make_engine(&dir);
+        seed_engine(&mut engine, &[Metadata::new(), Metadata::new()]);
+        let q = Vector::try_new(vec![1.0, 0.0, 0.0, 0.0]).unwrap();
+        let result = engine
+            .execute_str(
+                "SELECT id, embedding <-> $1 AS dist FROM vectors ORDER BY embedding <-> $1 LIMIT 2",
+                ParamBindings::empty().with_positional(ParamValue::Vector(q)),
+            )
+            .expect("execute_str");
+        let ExecutionResult::Rows { columns, rows } = result else {
+            panic!("expected Rows");
+        };
+        assert_eq!(columns, vec!["id".to_string(), "dist".to_string()]);
+        // Distance for the nearest neighbour : 0.0 (exact match).
+        let RowValue::Distance(d) = rows[0].values[1] else {
+            panic!("expected Distance");
+        };
+        assert!(
+            d.abs() < f32::EPSILON,
+            "nearest distance should be ~0, got {d}"
+        );
+    }
+
+    #[test]
+    fn executes_select_star_expands_to_id_and_metadata() {
+        let dir = tempdir().expect("tempdir");
+        let mut engine = make_engine(&dir);
+        let m = meta_of(&[("category", Value::String("docs".into()))]);
+        seed_engine(&mut engine, std::slice::from_ref(&m));
+        let q = Vector::try_new(vec![1.0, 0.0, 0.0, 0.0]).unwrap();
+        let result = engine
+            .execute_str(
+                "SELECT * FROM vectors ORDER BY embedding <-> $1 LIMIT 1",
+                ParamBindings::empty().with_positional(ParamValue::Vector(q)),
+            )
+            .expect("execute_str");
+        let ExecutionResult::Rows { columns, rows } = result else {
+            panic!("expected Rows");
+        };
+        assert_eq!(columns, vec!["id".to_string(), "metadata".to_string()]);
+        let row = &rows[0];
+        assert!(matches!(row.values[0], RowValue::Id(_)));
+        let RowValue::Metadata(actual) = &row.values[1] else {
+            panic!("expected Metadata");
+        };
+        assert_eq!(actual.get("category"), Some(&Value::String("docs".into())));
+    }
+
+    #[test]
+    fn executes_select_metadata_field_projects_field_value() {
+        let dir = tempdir().expect("tempdir");
+        let mut engine = make_engine(&dir);
+        let m = meta_of(&[("category", Value::String("docs".into()))]);
+        seed_engine(&mut engine, &[m]);
+        let q = Vector::try_new(vec![1.0, 0.0, 0.0, 0.0]).unwrap();
+        let result = engine
+            .execute_str(
+                "SELECT id, category FROM vectors ORDER BY embedding <-> $1 LIMIT 1",
+                ParamBindings::empty().with_positional(ParamValue::Vector(q)),
+            )
+            .expect("execute_str");
+        let ExecutionResult::Rows { rows, .. } = result else {
+            panic!("expected Rows");
+        };
+        let RowValue::Field(Value::String(s)) = &rows[0].values[1] else {
+            panic!("expected Field(String), got {:?}", rows[0].values[1]);
+        };
+        assert_eq!(s, "docs");
+    }
+
+    #[test]
+    fn missing_metadata_field_projects_as_null() {
+        let dir = tempdir().expect("tempdir");
+        let mut engine = make_engine(&dir);
+        seed_engine(&mut engine, &[Metadata::new()]);
+        let q = Vector::try_new(vec![1.0, 0.0, 0.0, 0.0]).unwrap();
+        let result = engine
+            .execute_str(
+                "SELECT id, ghost_field FROM vectors ORDER BY embedding <-> $1 LIMIT 1",
+                ParamBindings::empty().with_positional(ParamValue::Vector(q)),
+            )
+            .expect("execute_str");
+        let ExecutionResult::Rows { rows, .. } = result else {
+            panic!("expected Rows");
+        };
+        assert!(matches!(rows[0].values[1], RowValue::Null));
+    }
+
+    // ----- SELECT plan A : post-filter (WHERE) -----
+
+    #[test]
+    fn post_filter_drops_rows_that_fail_predicate() {
+        let dir = tempdir().expect("tempdir");
+        let mut engine = make_engine(&dir);
+        seed_engine(
+            &mut engine,
+            &[
+                meta_of(&[("category", Value::String("docs".into()))]),
+                meta_of(&[("category", Value::String("specs".into()))]),
+                meta_of(&[("category", Value::String("docs".into()))]),
+            ],
+        );
+        let q = Vector::try_new(vec![1.0, 0.0, 0.0, 0.0]).unwrap();
+        let result = engine
+            .execute_str(
+                "SELECT id FROM vectors WHERE category = 'docs' \
+                 ORDER BY embedding <-> $1 LIMIT 10",
+                ParamBindings::empty().with_positional(ParamValue::Vector(q)),
+            )
+            .expect("execute_str");
+        let ExecutionResult::Rows { rows, .. } = result else {
+            panic!("expected Rows");
+        };
+        assert_eq!(rows.len(), 2, "two 'docs' rows pass the post-filter");
+        let ids: Vec<u64> = rows
+            .iter()
+            .map(|r| match r.values[0] {
+                RowValue::Id(id) => id.get(),
+                _ => unreachable!(),
+            })
+            .collect();
+        assert!(ids.contains(&1));
+        assert!(ids.contains(&3));
+    }
+
+    #[test]
+    fn post_filter_supports_and_or_combinators() {
+        let dir = tempdir().expect("tempdir");
+        let mut engine = make_engine(&dir);
+        seed_engine(
+            &mut engine,
+            &[
+                meta_of(&[
+                    ("category", Value::String("docs".into())),
+                    ("year", Value::I64(2024)),
+                ]),
+                meta_of(&[
+                    ("category", Value::String("docs".into())),
+                    ("year", Value::I64(2020)),
+                ]),
+                meta_of(&[
+                    ("category", Value::String("specs".into())),
+                    ("year", Value::I64(2024)),
+                ]),
+            ],
+        );
+        let q = Vector::try_new(vec![1.0, 0.0, 0.0, 0.0]).unwrap();
+        let result = engine
+            .execute_str(
+                "SELECT id FROM vectors \
+                 WHERE category = 'docs' AND year >= 2024 \
+                 ORDER BY embedding <-> $1 LIMIT 10",
+                ParamBindings::empty().with_positional(ParamValue::Vector(q)),
+            )
+            .expect("execute_str");
+        let ExecutionResult::Rows { rows, .. } = result else {
+            panic!("expected Rows");
+        };
+        assert_eq!(rows.len(), 1, "only id=1 matches docs AND year>=2024");
+    }
+
+    #[test]
+    fn post_filter_resolves_param_in_where() {
+        let dir = tempdir().expect("tempdir");
+        let mut engine = make_engine(&dir);
+        seed_engine(
+            &mut engine,
+            &[
+                meta_of(&[("category", Value::String("docs".into()))]),
+                meta_of(&[("category", Value::String("specs".into()))]),
+            ],
+        );
+        let q = Vector::try_new(vec![1.0, 0.0, 0.0, 0.0]).unwrap();
+        let result = engine
+            .execute_str(
+                "SELECT id FROM vectors WHERE category = $cat \
+                 ORDER BY embedding <-> $q LIMIT 10",
+                ParamBindings::empty()
+                    .with_named("q", ParamValue::Vector(q))
+                    .with_named("cat", ParamValue::String("specs".into())),
+            )
+            .expect("execute_str");
+        let ExecutionResult::Rows { rows, .. } = result else {
+            panic!("expected Rows");
+        };
+        assert_eq!(rows.len(), 1);
+        let RowValue::Id(id) = rows[0].values[0] else {
+            panic!("expected Id");
+        };
+        assert_eq!(id.get(), 2);
+    }
+
+    #[test]
+    fn post_filter_with_in_list() {
+        let dir = tempdir().expect("tempdir");
+        let mut engine = make_engine(&dir);
+        seed_engine(
+            &mut engine,
+            &[
+                meta_of(&[("category", Value::String("a".into()))]),
+                meta_of(&[("category", Value::String("b".into()))]),
+                meta_of(&[("category", Value::String("c".into()))]),
+            ],
+        );
+        let q = Vector::try_new(vec![1.0, 0.0, 0.0, 0.0]).unwrap();
+        let result = engine
+            .execute_str(
+                "SELECT id FROM vectors WHERE category IN ('a', 'c') \
+                 ORDER BY embedding <-> $1 LIMIT 10",
+                ParamBindings::empty().with_positional(ParamValue::Vector(q)),
+            )
+            .expect("execute_str");
+        let ExecutionResult::Rows { rows, .. } = result else {
+            panic!("expected Rows");
+        };
+        assert_eq!(rows.len(), 2);
+    }
+
+    // ----- SELECT plan A : rejection paths -----
+
+    #[test]
+    fn rejects_non_knn_select() {
+        // Non-kNN SELECT (no distance ordering) is plan B / C
+        // territory ; plan A errors here cleanly.
+        let dir = tempdir().expect("tempdir");
+        let mut engine = make_engine(&dir);
+        let err = engine
+            .execute_str(
+                "SELECT id FROM vectors WHERE category = 'docs' LIMIT 10",
+                ParamBindings::empty(),
+            )
+            .expect_err("expected Plan error");
+        let KovaQueryError::Plan(msg) = err else {
+            panic!("expected Plan, got {err:?}");
+        };
+        assert!(
+            msg.contains("kNN"),
+            "message should call out kNN-only constraint : {msg}"
+        );
+    }
+
+    #[test]
+    fn rejects_select_on_wrong_table() {
+        let dir = tempdir().expect("tempdir");
+        let mut engine = make_engine(&dir);
+        let q = Vector::try_new(vec![1.0, 0.0, 0.0, 0.0]).unwrap();
+        let err = engine
+            .execute_str(
+                "SELECT id FROM products ORDER BY embedding <-> $1 LIMIT 10",
+                ParamBindings::empty().with_positional(ParamValue::Vector(q)),
+            )
             .expect_err("expected error");
         assert!(matches!(err, KovaQueryError::Execution(_)));
     }
