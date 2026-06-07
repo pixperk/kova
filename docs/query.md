@@ -370,11 +370,12 @@ the read side.
 
 ```mermaid
 flowchart TD
-    Q["SELECT id FROM vectors WHERE pred ORDER BY embedding <-> $q LIMIT k"]
-    Q -. selectivity .-> D{estimator}
-    D -. < 0.05 .-> B["Plan B<br/>MetadataScan + ExactDistance"]
-    D -. 0.05 to 0.5 .-> C["Plan C<br/>FilteredKnnSearch"]
-    D -. >= 0.5 .-> A["Plan A<br/>KnnSearch + post_filter"]
+    Q["SELECT with kNN ORDER BY<br/>and a WHERE predicate"]
+    Q -.-> Est["SelectivityEstimator<br/>fraction = matches / total"]
+    Est -.-> Branch{"selectivity<br/>fraction"}
+    Branch -. "tight, below 0.05" .-> B["Plan B<br/>MetadataScan, then<br/>ExactDistance on the small set<br/>(bypasses ANN entirely)"]
+    Branch -. "middle, 0.05 to 0.5" .-> C["Plan C<br/>FilteredKnnSearch<br/>predicate INSIDE the HNSW walk"]
+    Branch -. "loose, 0.5 or higher" .-> A["Plan A<br/>KnnSearch with k * 4 overfetch<br/>plus a cheap post_filter"]
 ```
 
 Three strategies, chosen by **estimated predicate selectivity**.
