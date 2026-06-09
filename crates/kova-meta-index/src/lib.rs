@@ -32,6 +32,7 @@
 #![warn(missing_docs)]
 
 pub mod btree;
+pub mod catalog;
 pub mod error;
 pub mod hash;
 pub mod inverted;
@@ -40,6 +41,7 @@ use kova_core::{Value, VectorId};
 use roaring::RoaringTreemap;
 
 pub use btree::BTreeIndex;
+pub use catalog::IndexCatalog;
 pub use error::KovaMetaIndexError;
 pub use hash::HashIndex;
 pub use inverted::InvertedIndex;
