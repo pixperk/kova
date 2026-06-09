@@ -38,11 +38,12 @@ use std::ops::{Bound, RangeBounds};
 
 use kova_core::{Value, VectorId};
 use roaring::RoaringTreemap;
+use serde::{Deserialize, Serialize};
 
 use crate::{CmpOp, IndexAtom, MetaIndex, NormalizedKey};
 
 /// BTree-backed range index. See [module-level docs](self).
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct BTreeIndex {
     // Sorted map from normalized key to bitmap of matching row ids.
     buckets: BTreeMap<NormalizedKey, RoaringTreemap>,

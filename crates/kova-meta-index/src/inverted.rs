@@ -46,11 +46,12 @@ use std::collections::hash_map::Entry;
 
 use kova_core::{Value, VectorId};
 use roaring::RoaringTreemap;
+use serde::{Deserialize, Serialize};
 
 use crate::{IndexAtom, MetaIndex, NormalizedKey};
 
 /// Inverted index for array containment. See [module-level docs](self).
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct InvertedIndex {
     // Map from normalized element key to bitmap of rows whose array contains it.
     buckets: HashMap<NormalizedKey, RoaringTreemap>,

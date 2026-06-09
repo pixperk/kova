@@ -31,19 +31,32 @@
 //! the same bitmap.
 
 use std::collections::HashMap;
+use std::fs;
+use std::path::Path;
 
 use kova_core::{Metadata, Value, VectorId};
 use roaring::RoaringTreemap;
+use serde::{Deserialize, Serialize};
 
+use crate::error::KovaMetaIndexError;
 use crate::{BTreeIndex, HashIndex, IndexAtom, InvertedIndex, MetaIndex};
 
+/// Magic header on every catalog file. 8 bytes, ASCII for "KOVAIDX1".
+const CATALOG_MAGIC: &[u8; 8] = b"KOVAIDX1";
+
+/// Bumped when the on-disk catalog layout changes incompatibly.
+const CATALOG_FORMAT_VERSION: u32 = 1;
+
+/// Fixed header bytes : magic + version.
+const CATALOG_HEADER_LEN: usize = CATALOG_MAGIC.len() + std::mem::size_of::<u32>();
+
 /// Catalog of meta-indexes for one shard. See [module-level docs](self).
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct IndexCatalog {
     fields: HashMap<String, FieldIndexes>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 struct FieldIndexes {
     hash: Option<HashIndex>,
     btree: Option<BTreeIndex>,
@@ -252,6 +265,85 @@ impl IndexCatalog {
     pub fn indexed_fields(&self) -> impl Iterator<Item = &str> {
         self.fields.keys().map(String::as_str)
     }
+
+    /// Encode the catalog into a self-describing byte buffer :
+    ///
+    /// ```text
+    /// +----------+----------+-------------------------------+
+    /// | magic[8] | ver[u32] | bincode( IndexCatalog )       |
+    /// +----------+----------+-------------------------------+
+    /// ```
+    ///
+    /// The header is fixed-size (12 bytes) ; the bincode payload is
+    /// variable. The storage layer wraps this output in an atomic
+    /// write (tmp + fsync + rename + dirsync) so observers see either
+    /// the whole new file or the previous one, never a partial.
+    ///
+    /// # Errors
+    /// Returns [`KovaMetaIndexError::Decode`] (yes, wrapping the
+    /// bincode error type even on encode ; `bincode::Error` covers
+    /// both directions) if the payload can't be serialised, which is
+    /// effectively never for the catalog's shape.
+    pub fn encode(&self) -> Result<Vec<u8>, KovaMetaIndexError> {
+        let payload = bincode::serialize(self)?;
+        let mut buf = Vec::with_capacity(CATALOG_HEADER_LEN + payload.len());
+        buf.extend_from_slice(CATALOG_MAGIC);
+        buf.extend_from_slice(&CATALOG_FORMAT_VERSION.to_le_bytes());
+        buf.extend_from_slice(&payload);
+        Ok(buf)
+    }
+
+    /// Decode a catalog from a byte buffer produced by
+    /// [`Self::encode`]. Validates the magic header and version
+    /// before handing the rest to bincode.
+    ///
+    /// # Errors
+    /// - [`KovaMetaIndexError::Truncated`] if `bytes` is shorter than
+    ///   the fixed header.
+    /// - [`KovaMetaIndexError::BadMagic`] if the magic bytes don't
+    ///   match.
+    /// - [`KovaMetaIndexError::UnsupportedVersion`] if the version
+    ///   field doesn't match this build's expected version.
+    /// - [`KovaMetaIndexError::Decode`] if bincode rejects the
+    ///   payload.
+    pub fn decode(bytes: &[u8]) -> Result<Self, KovaMetaIndexError> {
+        if bytes.len() < CATALOG_HEADER_LEN {
+            return Err(KovaMetaIndexError::Truncated {
+                bytes: bytes.len(),
+                min: CATALOG_HEADER_LEN,
+            });
+        }
+        if &bytes[..CATALOG_MAGIC.len()] != CATALOG_MAGIC {
+            return Err(KovaMetaIndexError::BadMagic);
+        }
+        let ver_bytes: [u8; 4] = bytes[CATALOG_MAGIC.len()..CATALOG_HEADER_LEN]
+            .try_into()
+            .expect("4-byte slice");
+        let version = u32::from_le_bytes(ver_bytes);
+        if version != CATALOG_FORMAT_VERSION {
+            return Err(KovaMetaIndexError::UnsupportedVersion {
+                expected: CATALOG_FORMAT_VERSION,
+                got: version,
+            });
+        }
+        let catalog: IndexCatalog = bincode::deserialize(&bytes[CATALOG_HEADER_LEN..])?;
+        Ok(catalog)
+    }
+
+    /// Read + decode the catalog at `path`. Returns `Ok(None)` if the
+    /// file doesn't exist (fresh shard with no persisted catalog).
+    ///
+    /// # Errors
+    /// All variants of [`KovaMetaIndexError`] that
+    /// [`Self::decode`] can produce, plus
+    /// [`KovaMetaIndexError::Io`] for read failures.
+    pub fn load(path: &Path) -> Result<Option<Self>, KovaMetaIndexError> {
+        if !path.exists() {
+            return Ok(None);
+        }
+        let bytes = fs::read(path)?;
+        Ok(Some(Self::decode(&bytes)?))
+    }
 }
 
 #[cfg(test)]
@@ -260,8 +352,8 @@ mod tests {
 
     use kova_core::{Metadata, Value, VectorId};
 
-    use super::IndexCatalog;
-    use crate::{CmpOp, IndexAtom};
+    use super::{CATALOG_MAGIC, IndexCatalog};
+    use crate::{CmpOp, IndexAtom, KovaMetaIndexError};
 
     fn s(x: &str) -> Value {
         Value::String(x.into())
@@ -550,6 +642,87 @@ mod tests {
         let mut fields: Vec<_> = cat.indexed_fields().collect();
         fields.sort_unstable();
         assert_eq!(fields, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn encode_decode_round_trip_preserves_buckets() {
+        let mut cat = IndexCatalog::new();
+        cat.add_hash_index("category");
+        cat.add_btree_index("year");
+        cat.add_inverted_index("tags");
+
+        for n in 0u64..20 {
+            cat.on_insert(
+                id(n),
+                &meta(&[
+                    ("category", if n % 2 == 0 { s("docs") } else { s("blog") }),
+                    ("year", i(2020 + i64::from(u8::try_from(n).unwrap()))),
+                    ("tags", arr(&["rust", "async"])),
+                ]),
+            );
+        }
+
+        let bytes = cat.encode().unwrap();
+        let back = IndexCatalog::decode(&bytes).unwrap();
+
+        // Every supported atom must give the same answer pre- and
+        // post- round-trip.
+        let atoms = [
+            ("category", IndexAtom::Eq(s("docs"))),
+            ("category", IndexAtom::IsNotNull),
+            ("year", IndexAtom::Cmp(CmpOp::Gt, i(2025))),
+            ("year", IndexAtom::Between(i(2022), i(2027))),
+            ("tags", IndexAtom::ArrayContains(s("rust"))),
+        ];
+        for (field, atom) in &atoms {
+            assert_eq!(
+                cat.lookup(field, atom).map(|b| b.len()),
+                back.lookup(field, atom).map(|b| b.len()),
+                "atom = {field}.{atom:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn decode_rejects_bad_magic() {
+        let bytes = vec![0u8; 64];
+        let err = IndexCatalog::decode(&bytes).unwrap_err();
+        assert!(matches!(err, KovaMetaIndexError::BadMagic), "{err:?}");
+    }
+
+    #[test]
+    fn decode_rejects_unsupported_version() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(CATALOG_MAGIC);
+        bytes.extend_from_slice(&999u32.to_le_bytes());
+        bytes.extend_from_slice(&[0u8; 8]);
+        let err = IndexCatalog::decode(&bytes).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                KovaMetaIndexError::UnsupportedVersion {
+                    expected: 1,
+                    got: 999
+                }
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn decode_rejects_truncated() {
+        let err = IndexCatalog::decode(&[0u8; 3]).unwrap_err();
+        assert!(
+            matches!(err, KovaMetaIndexError::Truncated { .. }),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn load_missing_file_returns_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nonexistent.bin");
+        assert!(IndexCatalog::load(&path).unwrap().is_none());
     }
 
     #[test]

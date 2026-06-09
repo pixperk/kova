@@ -39,6 +39,7 @@ pub mod inverted;
 
 use kova_core::{Value, VectorId};
 use roaring::RoaringTreemap;
+use serde::{Deserialize, Serialize};
 
 pub use btree::BTreeIndex;
 pub use catalog::IndexCatalog;
@@ -165,7 +166,7 @@ pub trait MetaIndex: Send + Sync {
 /// only. Mixed signs and NaN diverge. The v1 [`BTreeIndex`]
 /// therefore rejects ranged queries on float fields ; see
 /// [`BTreeIndex::supports`] for the gate.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum NormalizedKey {
     /// UTF-8 string key.
     String(String),

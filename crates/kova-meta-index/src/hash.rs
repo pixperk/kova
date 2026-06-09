@@ -27,11 +27,12 @@ use std::collections::hash_map::Entry;
 
 use kova_core::{Value, VectorId};
 use roaring::RoaringTreemap;
+use serde::{Deserialize, Serialize};
 
 use crate::{CmpOp, IndexAtom, MetaIndex, NormalizedKey};
 
 /// Hash-backed equality index. See [module-level docs](self).
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct HashIndex {
     // Map from normalized key to bitmap of matching row ids.
     buckets: HashMap<NormalizedKey, RoaringTreemap>,

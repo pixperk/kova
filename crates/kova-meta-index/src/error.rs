@@ -7,11 +7,43 @@
 //! fail : building from a mistyped row set, querying with an atom
 //! shape the index does not support, etc.
 
+use std::io;
+
 use thiserror::Error;
 
 /// Failure modes for [`crate::MetaIndex`] operations.
 #[derive(Debug, Error)]
 pub enum KovaMetaIndexError {
+    /// I/O failure while reading or writing a catalog file.
+    #[error("io error: {0}")]
+    Io(#[from] io::Error),
+
+    /// Catalog file's magic header is missing or wrong.
+    #[error("catalog magic mismatch (file may not be a kova catalog)")]
+    BadMagic,
+
+    /// Catalog file's format version is not supported by this build.
+    #[error("unsupported catalog format version : {got} (expected {expected})")]
+    UnsupportedVersion {
+        /// Version this build expects.
+        expected: u32,
+        /// Version found on disk.
+        got: u32,
+    },
+
+    /// Catalog file is shorter than the fixed header.
+    #[error("catalog file truncated : {bytes} bytes, need at least {min}")]
+    Truncated {
+        /// Bytes present.
+        bytes: usize,
+        /// Minimum bytes required.
+        min: usize,
+    },
+
+    /// Bincode decode error on the catalog payload.
+    #[error("decode error: {0}")]
+    Decode(#[from] bincode::Error),
+
     /// An attempt to index a [`kova_core::Value`] variant the index
     /// cannot key on (e.g. inserting a `Value::Map` into a
     /// `HashIndex`).

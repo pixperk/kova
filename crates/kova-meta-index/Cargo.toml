@@ -9,11 +9,13 @@ description = "Secondary indexes for Kova metadata predicates : Hash / BTree / I
 
 [dependencies]
 kova-core = { path = "../kova-core" }
-roaring = "0.10"
+roaring = { version = "0.10", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+bincode = "1"
 thiserror.workspace = true
 
 [dev-dependencies]
-# none yet
+tempfile = "3"
 
 [lints]
 workspace = true
