@@ -33,6 +33,18 @@ impl fmt::Display for VectorId {
     }
 }
 
+impl From<VectorId> for u64 {
+    fn from(id: VectorId) -> Self {
+        id.0
+    }
+}
+
+impl From<u64> for VectorId {
+    fn from(raw: u64) -> Self {
+        VectorId(raw)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -56,5 +68,14 @@ mod tests {
     fn test_vector_id_display() {
         let id = VectorId::new(42);
         assert_eq!(id.to_string(), "42");
+    }
+
+    #[test]
+    fn test_u64_round_trip() {
+        let id = VectorId::new(42);
+        let raw: u64 = id.into();
+        let back: VectorId = raw.into();
+        assert_eq!(id, back);
+        assert_eq!(raw, 42);
     }
 }
