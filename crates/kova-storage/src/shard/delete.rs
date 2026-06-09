@@ -64,6 +64,12 @@ where
         self.wal.sync().map_err(ShardError::backend)?;
 
         // Phase 3 : apply. Post-commit failures panic.
+        //
+        // Snapshot the old metadata bag before we drop it from the
+        // store ; the catalog needs it to remove the row from every
+        // bucket the value lived in. Missing bag (None) means the row
+        // had no metadata to index : on_delete becomes a no-op.
+        let old_meta = self.metadata.get(id);
         if let Err(e) = self.index.tombstone(id) {
             panic!(
                 "Shard::delete phase-3 apply failure on index.tombstone: {e:?} \
@@ -75,6 +81,9 @@ where
                 "Shard::delete phase-3 apply failure on metadata.delete: {e:?} \
                  (WAL has committed the record ; aborting so replay can reconcile)"
             );
+        }
+        if let Some(ref meta) = old_meta {
+            self.catalog.on_delete(id, meta);
         }
 
         Ok(())
@@ -129,7 +138,12 @@ where
         self.wal.sync().map_err(ShardError::backend)?;
 
         // Phase 3 : apply, panic on failure.
+        //
+        // Snapshot each old metadata bag just before its delete so the
+        // catalog can remove the row from every bucket the value lived
+        // in. Missing bag means there was no metadata to index.
         for &id in &ids {
+            let old_meta = self.metadata.get(id);
             if let Err(e) = self.index.tombstone(id) {
                 panic!(
                     "Shard::delete_many phase-3 apply failure on index.tombstone ({id}): {e:?} \
@@ -141,6 +155,9 @@ where
                     "Shard::delete_many phase-3 apply failure on metadata.delete ({id}): {e:?} \
                      (WAL has committed the batch ; aborting so replay can reconcile)"
                 );
+            }
+            if let Some(ref meta) = old_meta {
+                self.catalog.on_delete(id, meta);
             }
         }
 

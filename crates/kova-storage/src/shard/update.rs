@@ -76,6 +76,21 @@ where
         // Phase 3 : apply. One batched `put_many` for the metadata
         // store (the optimisation `insert_many` uses too) ; failure
         // here panics because the WAL has already committed.
+        //
+        // Catalog hooks run BEFORE put_many consumes `updates` : we
+        // snapshot every row's old metadata, then call on_update with
+        // (old, new) refs in one pass. on_update internally handles
+        // each field's four presence cases (both / old-only /
+        // new-only / neither). Empty-bag fallback covers ids that
+        // had no metadata stored at all.
+        let olds: Vec<Metadata> = updates
+            .iter()
+            .map(|(id, _)| self.metadata.get(*id).unwrap_or_default())
+            .collect();
+        for ((id, new), old) in updates.iter().zip(olds.iter()) {
+            self.catalog.on_update(*id, old, new);
+        }
+
         let count = updates.len();
         if let Err(e) = self.metadata.put_many(updates) {
             panic!(

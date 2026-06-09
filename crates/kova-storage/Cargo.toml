@@ -13,6 +13,7 @@ tempfile = "3"
 [dependencies]
 kova-core = { path = "../kova-core" }
 kova-index = { path = "../kova-index" }
+kova-meta-index = { path = "../kova-meta-index" }
 thiserror.workspace = true
 crc32fast = "1"
 serde = { version = "1", features = ["derive"] }

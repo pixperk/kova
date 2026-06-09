@@ -42,8 +42,9 @@
 use std::error::Error as StdError;
 use std::path::PathBuf;
 
-use kova_core::{Distance, Metadata, MetadataStore, VectorId, VectorStore};
+use kova_core::{Distance, Metadata, MetadataStore, Value, VectorId, VectorStore};
 use kova_index::{HnswIndex, HnswParams, Index, KovaIndexError};
+use kova_meta_index::IndexCatalog;
 use thiserror::Error;
 
 use crate::{Lsn, Record, Wal};
@@ -139,6 +140,12 @@ where
     pub(super) index: HnswIndex<D, V>,
     pub(super) metadata: M,
     pub(super) wal: W,
+    /// In-memory catalog of secondary indexes on metadata fields.
+    /// Empty after open ; populated via
+    /// [`Shard::add_hash_index`] / [`Shard::add_btree_index`] /
+    /// [`Shard::add_inverted_index`]. Maintained synchronously in
+    /// phase 3 of every mutation, after the WAL commit.
+    pub(super) catalog: IndexCatalog,
     /// Data directory, populated by [`Shard::open`] for the file-backed
     /// combo. `None` for in-memory composition (`from_parts`) ; in that
     /// case checkpoint is a no-op (nothing to write to).
@@ -194,6 +201,7 @@ where
             index,
             metadata,
             wal,
+            catalog: IndexCatalog::new(),
             // In-memory composition has no on-disk directory and no
             // checkpoint state. The file-backed `Shard::open` populates
             // these via `Self::from_parts_with_checkpoint_state` below.
@@ -222,6 +230,7 @@ where
             index,
             metadata,
             wal,
+            catalog: IndexCatalog::new(),
             dir,
             snapshot_id,
             checkpoint_lsn,
@@ -252,6 +261,62 @@ where
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// Read-only access to the shard's secondary-index catalog. Use
+    /// [`IndexCatalog::lookup`] or
+    /// [`IndexCatalog::estimate`] to query the indexes registered via
+    /// [`Self::add_hash_index`] (or its siblings).
+    #[must_use]
+    pub fn catalog(&self) -> &IndexCatalog {
+        &self.catalog
+    }
+
+    /// Register a [`HashIndex`](kova_meta_index::HashIndex) on `field`
+    /// and backfill it from the shard's current metadata. The new
+    /// index is then maintained automatically by every subsequent
+    /// `insert`/`delete`/`update` op.
+    ///
+    /// Idempotent-replace : calling this twice on the same field
+    /// rebuilds the index from scratch.
+    pub fn add_hash_index(&mut self, field: &str) {
+        self.catalog.add_hash_index(field);
+        self.backfill_field(field);
+    }
+
+    /// Register a [`BTreeIndex`](kova_meta_index::BTreeIndex) on
+    /// `field` and backfill it from current metadata. See
+    /// [`Self::add_hash_index`] for the maintenance contract.
+    pub fn add_btree_index(&mut self, field: &str) {
+        self.catalog.add_btree_index(field);
+        self.backfill_field(field);
+    }
+
+    /// Register an [`InvertedIndex`](kova_meta_index::InvertedIndex)
+    /// on `field` and backfill it from current metadata. See
+    /// [`Self::add_hash_index`] for the maintenance contract.
+    pub fn add_inverted_index(&mut self, field: &str) {
+        self.catalog.add_inverted_index(field);
+        self.backfill_field(field);
+    }
+
+    /// Scan the metadata store for rows that have `field`, pull the
+    /// value for each, and bulk-load every index attached to that
+    /// field. The catalog handles the broadcast to the per-field
+    /// index bundle.
+    fn backfill_field(&mut self, field: &str) {
+        let ids = self.metadata.scan_ids(|m| m.contains_key(field));
+
+        let rows: Vec<(VectorId, Value)> = ids
+            .into_iter()
+            .filter_map(|id| {
+                self.metadata
+                    .get(id)
+                    .and_then(|m| m.get(field).cloned().map(|v| (id, v)))
+            })
+            .collect();
+
+        self.catalog.populate_field(field, rows);
     }
 
     /// Replay WAL records starting from `from` (inclusive) into the

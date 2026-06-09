@@ -121,6 +121,10 @@ where
                  (WAL has committed the record ; aborting so replay can reconcile)"
             );
         }
+        // Secondary indexes observe the row before metadata.put consumes
+        // the bag. Catalog updates are infallible (in-memory HashMap +
+        // RoaringTreemap), so no panic-guard is needed here.
+        self.catalog.on_insert(id, &metadata);
         if let Err(e) = self.metadata.put(id, metadata) {
             panic!(
                 "Shard::insert phase-3 apply failure on metadata.put: {e:?} \
@@ -229,13 +233,16 @@ where
         // -------- Phase 3 : apply, panic on failure --------
         // HNSW insertion is sequential by nature ; we just run it for
         // each. The wins for batching live in WAL + metadata, not here.
-        for (id, vector, _) in &items {
+        // Catalog updates ride along in the same loop while the &meta
+        // borrow is still cheap (before items.into_iter consumes them).
+        for (id, vector, meta) in &items {
             if let Err(e) = self.index.insert(*id, vector.clone()) {
                 panic!(
                     "Shard::insert_many phase-3 apply failure on index.insert ({id}): {e:?} \
                      (WAL has committed the batch ; aborting so replay can reconcile)"
                 );
             }
+            self.catalog.on_insert(*id, meta);
         }
 
         // ONE metadata flush for the whole batch.
