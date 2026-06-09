@@ -12,9 +12,11 @@ use std::path::{Path, PathBuf};
 
 use kova_core::Distance;
 use kova_index::{HnswIndex, HnswParams};
+use kova_meta_index::IndexCatalog;
 
 use crate::{FileMetadataStore, FileWal, Lsn, Manifest, MmapVectorStore};
 
+use super::checkpoint::catalog_filename;
 use super::{DEFAULT_SEED, Shard, ShardError};
 
 impl<D: Distance> Shard<D, MmapVectorStore, FileMetadataStore, FileWal> {
@@ -93,14 +95,30 @@ impl<D: Distance> Shard<D, MmapVectorStore, FileMetadataStore, FileWal> {
             (idx, 0, Lsn::ZERO, Lsn::ZERO)
         };
 
+        // ---- Catalog load ----
+        //
+        // `catalog.{snapshot_id}.bin` is generation-numbered the same
+        // way `graph.{snapshot_id}.snapshot` is, so the manifest's
+        // single atomic commit point covers both. If the file is
+        // missing (no checkpoint had registered indexes yet), the
+        // catalog starts empty and `add_*_index` calls rebuild from
+        // metadata.
+        let catalog =
+            IndexCatalog::load(&dir.join(catalog_filename(snapshot_id))).map_err(|e| {
+                ShardError::backend(std::io::Error::other(format!("catalog load: {e}")))
+            })?;
+
         // ---- One-shot orphan cleanup ----
-        // Best-effort ; failures are non-fatal.
+        // Best-effort ; failures are non-fatal. Sweeps stale graph
+        // AND stale catalog snapshots.
         cleanup_orphan_snapshots(dir, snapshot_id);
+        cleanup_orphan_catalogs(dir, snapshot_id);
 
         Self::from_parts_with_checkpoint_state(
             index,
             metadata,
             wal,
+            catalog,
             Some(dir.to_path_buf()),
             snapshot_id,
             checkpoint_lsn,
@@ -137,6 +155,36 @@ pub(super) fn cleanup_orphan_snapshots(dir: &Path, live_snapshot_id: u64) {
 fn parse_snapshot_id(name: &str) -> Option<u64> {
     let rest = name.strip_prefix("graph.")?;
     let id_str = rest.strip_suffix(".snapshot")?;
+    id_str.parse::<u64>().ok()
+}
+
+/// Scan `dir` for `catalog.{N}.bin` files where `N != live_snapshot_id`
+/// and delete them. Best-effort cleanup ; orphans are harmless but
+/// each checkpoint produces a new one to sweep on the following open.
+pub(super) fn cleanup_orphan_catalogs(dir: &Path, live_snapshot_id: u64) {
+    let Ok(read_dir) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in read_dir.flatten() {
+        let path: PathBuf = entry.path();
+        let Some(stem) = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(parse_catalog_id)
+        else {
+            continue;
+        };
+        if stem != live_snapshot_id {
+            let _ = fs::remove_file(&path);
+        }
+    }
+}
+
+/// Parse `catalog.{N}.bin` into `Some(N)`. Returns `None` for any
+/// other filename.
+fn parse_catalog_id(name: &str) -> Option<u64> {
+    let rest = name.strip_prefix("catalog.")?;
+    let id_str = rest.strip_suffix(".bin")?;
     id_str.parse::<u64>().ok()
 }
 

@@ -217,10 +217,18 @@ where
     /// state and a starting replay LSN. Called by the file-backed
     /// `Shard::open` after it loads a snapshot ; in-memory callers stick
     /// with `from_parts_seeded`.
+    ///
+    /// `catalog` is the secondary-index catalog loaded from
+    /// `catalog.{snapshot_id}.bin`, or `None` if the file didn't
+    /// exist (no checkpoint had been taken with indexes
+    /// registered). Either way, replay forwards post-checkpoint
+    /// records into the catalog so it catches up with the present.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn from_parts_with_checkpoint_state(
         index: HnswIndex<D, V>,
         metadata: M,
         wal: W,
+        catalog: Option<IndexCatalog>,
         dir: Option<PathBuf>,
         snapshot_id: u64,
         checkpoint_lsn: Lsn,
@@ -230,7 +238,7 @@ where
             index,
             metadata,
             wal,
-            catalog: IndexCatalog::new(),
+            catalog: catalog.unwrap_or_default(),
             dir,
             snapshot_id,
             checkpoint_lsn,
@@ -279,6 +287,12 @@ where
     ///
     /// Idempotent-replace : calling this twice on the same field
     /// rebuilds the index from scratch.
+    ///
+    /// # Durability
+    /// The new index is **transient** until the next successful
+    /// [`Self::checkpoint`]. Indexes registered after the last
+    /// checkpoint are lost on close ; call `checkpoint` before
+    /// closing if you want them to survive reopen.
     pub fn add_hash_index(&mut self, field: &str) {
         self.catalog.add_hash_index(field);
         self.backfill_field(field);
@@ -286,7 +300,8 @@ where
 
     /// Register a [`BTreeIndex`](kova_meta_index::BTreeIndex) on
     /// `field` and backfill it from current metadata. See
-    /// [`Self::add_hash_index`] for the maintenance contract.
+    /// [`Self::add_hash_index`] for the maintenance and durability
+    /// contracts.
     pub fn add_btree_index(&mut self, field: &str) {
         self.catalog.add_btree_index(field);
         self.backfill_field(field);
@@ -294,7 +309,8 @@ where
 
     /// Register an [`InvertedIndex`](kova_meta_index::InvertedIndex)
     /// on `field` and backfill it from current metadata. See
-    /// [`Self::add_hash_index`] for the maintenance contract.
+    /// [`Self::add_hash_index`] for the maintenance and durability
+    /// contracts.
     pub fn add_inverted_index(&mut self, field: &str) {
         self.catalog.add_inverted_index(field);
         self.backfill_field(field);
@@ -348,38 +364,53 @@ where
                     metadata,
                 } => {
                     self.index.insert(id, vector)?;
+                    // Catalog observes the row before the store
+                    // consumes the bag (same ordering rule as the
+                    // live `Shard::insert` path).
+                    self.catalog.on_insert(id, &metadata);
                     self.metadata
                         .put(id, metadata)
                         .map_err(ShardError::backend)?;
                 }
-                Record::Delete { id } => {
+                Record::Delete { id, old_metadata } => {
                     // Tombstone in the index + drop from metadata. The
                     // graph node and vector bytes stay (vacuum reclaims).
                     //
-                    // Ordering matters : `Shard::insert` rejects duplicate
-                    // ids by graph-node presence, so the WAL never holds
-                    // `Delete{id}` without a prior `Insert{id}` in the
-                    // same log (the crash test inserts then dies, but
-                    // the matching Insert is in the same WAL).
+                    // The record carries the metadata bag from delete
+                    // time, so the catalog can clear the row from every
+                    // bucket without depending on the (eagerly-mutated)
+                    // metadata store still having it.
                     self.index.tombstone(id)?;
                     self.metadata.delete(id).map_err(ShardError::backend)?;
+                    self.catalog.on_delete(id, &old_metadata);
                 }
-                Record::DeleteMany { ids } => {
-                    // Same semantics as a sequence of `Delete{id}` records,
-                    // compacted into one frame at write time. Each id is
-                    // applied independently ; partial failure on one id
-                    // surfaces as a `ShardError` and aborts replay (same
-                    // policy as the singleton path).
-                    for id in ids {
+                Record::DeleteMany { items } => {
+                    // Same semantics as a sequence of `Delete{id, old}`
+                    // records, compacted into one frame at write time.
+                    // Each id is applied independently ; partial failure
+                    // on one id surfaces as a `ShardError` and aborts
+                    // replay (same policy as the singleton path).
+                    for (id, old_metadata) in items {
                         self.index.tombstone(id)?;
                         self.metadata.delete(id).map_err(ShardError::backend)?;
+                        self.catalog.on_delete(id, &old_metadata);
                     }
                 }
-                Record::UpdateMetadata { id, metadata } => {
+                Record::UpdateMetadata {
+                    id,
+                    old_metadata,
+                    metadata,
+                } => {
                     // Replace the metadata bag in full. The HNSW graph
                     // and vector store stay untouched. Idempotent : the
                     // bag is whatever the last `UpdateMetadata` record
                     // said it should be.
+                    //
+                    // Catalog uses the (old, new) pair carried in the
+                    // record so it doesn't depend on the live store
+                    // state, which has already been overwritten by
+                    // prior `put`s.
+                    self.catalog.on_update(id, &old_metadata, &metadata);
                     self.metadata
                         .put(id, metadata)
                         .map_err(ShardError::backend)?;
