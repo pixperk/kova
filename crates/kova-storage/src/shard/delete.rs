@@ -9,7 +9,7 @@
 //! commit ; the WAL still holds the `Delete` records, so the vacuum
 //! work is wasted on crash (recovered, just redone).
 
-use kova_core::{MetadataStore, VectorId, VectorStore};
+use kova_core::{Metadata, MetadataStore, VectorId, VectorStore};
 use kova_index::KovaIndexError;
 
 use crate::{Record, Wal};
@@ -58,18 +58,21 @@ where
             return Err(KovaIndexError::AlreadyDeleted { id }.into());
         }
 
+        // Snapshot the old metadata bag BEFORE the WAL commit so it
+        // can be embedded in the record. Replay needs it for catalog
+        // bucket cleanup ; the metadata store on disk doesn't carry
+        // the old bag because it persists eagerly.
+        let old_meta = self.metadata.get(id);
+
         // Phase 2 : commit.
-        let record = Record::Delete { id };
+        let record = Record::Delete {
+            id,
+            old_metadata: old_meta.clone().unwrap_or_default(),
+        };
         self.wal.append(&record).map_err(ShardError::backend)?;
         self.wal.sync().map_err(ShardError::backend)?;
 
         // Phase 3 : apply. Post-commit failures panic.
-        //
-        // Snapshot the old metadata bag before we drop it from the
-        // store ; the catalog needs it to remove the row from every
-        // bucket the value lived in. Missing bag (None) means the row
-        // had no metadata to index : on_delete becomes a no-op.
-        let old_meta = self.metadata.get(id);
         if let Err(e) = self.index.tombstone(id) {
             panic!(
                 "Shard::delete phase-3 apply failure on index.tombstone: {e:?} \
@@ -130,10 +133,20 @@ where
             }
         }
 
+        // Snapshot every old metadata bag before WAL commit so each
+        // bag rides along in the record for the catalog's benefit at
+        // replay time.
+        let items: Vec<(VectorId, Metadata)> = ids
+            .iter()
+            .map(|id| (*id, self.metadata.get(*id).unwrap_or_default()))
+            .collect();
+
         // Phase 2 : group-commit. One DeleteMany frame for the whole
         // batch instead of N Delete frames ; replay applies each id
         // independently so the on-disk effect is identical.
-        let record = Record::DeleteMany { ids: ids.clone() };
+        let record = Record::DeleteMany {
+            items: items.clone(),
+        };
         self.wal.append(&record).map_err(ShardError::backend)?;
         self.wal.sync().map_err(ShardError::backend)?;
 

@@ -9,6 +9,13 @@ use serde::{Deserialize, Serialize};
 use crate::KovaStorageError;
 
 /// A single mutation applied to a shard. Persisted in the WAL.
+///
+/// `Delete` and `UpdateMetadata` carry the OLD metadata bag in
+/// addition to the affected id. The catalog (secondary indexes)
+/// needs the bag at replay time to clear the row from its buckets,
+/// but the metadata store has already mutated by the time replay
+/// runs (it persists eagerly). Stashing the bag in the record
+/// itself is the simplest way to keep the WAL self-sufficient.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Record {
     /// Insert a new vector with the given id.
@@ -20,19 +27,25 @@ pub enum Record {
         /// Metadata to associate with the vector.
         metadata: Metadata,
     },
-    /// Delete the vector with the given id.
+    /// Delete the vector with the given id. Carries the row's
+    /// metadata bag as it was at delete time so replay can drive
+    /// the catalog without re-fetching from the (mutated) store.
     Delete {
         /// Identifier to remove.
         id: VectorId,
+        /// Metadata bag the row had at delete time. Empty if the
+        /// row had no metadata stored. Used only by the catalog ;
+        /// the metadata store ignores it (the row is being removed).
+        old_metadata: Metadata,
     },
     /// Delete a batch of ids in one record. Semantically equivalent
     /// to N `Delete { id }` records on replay ; the compact form
     /// keeps the WAL smaller and lets a batched DELETE-by-predicate
     /// land as a single frame.
     DeleteMany {
-        /// Identifiers to remove. Order isn't preserved through
-        /// replay (each id is applied independently).
-        ids: Vec<VectorId>,
+        /// Per-id `(id, old_metadata)` pairs. Order isn't preserved
+        /// through replay (each id is applied independently).
+        items: Vec<(VectorId, Metadata)>,
     },
     /// Replace the metadata bag attached to `id`. The vector and
     /// graph node are untouched ; only the metadata store mutates.
@@ -40,6 +53,9 @@ pub enum Record {
     UpdateMetadata {
         /// Target identifier.
         id: VectorId,
+        /// Metadata bag the row had pre-update. Used only by the
+        /// catalog to clear stale buckets at replay time.
+        old_metadata: Metadata,
         /// New metadata bag (replaces the old one in full).
         metadata: Metadata,
     },
@@ -181,6 +197,7 @@ mod tests {
     fn sample_delete() -> Record {
         Record::Delete {
             id: VectorId::new(7),
+            old_metadata: Metadata::new(),
         }
     }
 

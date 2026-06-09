@@ -61,12 +61,21 @@ where
             }
         }
 
+        // Snapshot the old bag for every update before the WAL commit,
+        // so each record carries (old, new) for the catalog to consume
+        // at replay time.
+        let olds: Vec<Metadata> = updates
+            .iter()
+            .map(|(id, _)| self.metadata.get(*id).unwrap_or_default())
+            .collect();
+
         // Phase 2 : group-commit. One `UpdateMetadata` frame per id ;
         // a future Record::UpdateMetadataMany would compact further,
         // mirroring the Delete -> DeleteMany compaction already done.
-        for (id, metadata) in &updates {
+        for ((id, metadata), old) in updates.iter().zip(olds.iter()) {
             let record = Record::UpdateMetadata {
                 id: *id,
+                old_metadata: old.clone(),
                 metadata: metadata.clone(),
             };
             self.wal.append(&record).map_err(ShardError::backend)?;
@@ -77,16 +86,8 @@ where
         // store (the optimisation `insert_many` uses too) ; failure
         // here panics because the WAL has already committed.
         //
-        // Catalog hooks run BEFORE put_many consumes `updates` : we
-        // snapshot every row's old metadata, then call on_update with
-        // (old, new) refs in one pass. on_update internally handles
-        // each field's four presence cases (both / old-only /
-        // new-only / neither). Empty-bag fallback covers ids that
-        // had no metadata stored at all.
-        let olds: Vec<Metadata> = updates
-            .iter()
-            .map(|(id, _)| self.metadata.get(*id).unwrap_or_default())
-            .collect();
+        // Catalog hooks reuse the `olds` snapshot already taken
+        // pre-commit ; runs BEFORE put_many consumes `updates`.
         for ((id, new), old) in updates.iter().zip(olds.iter()) {
             self.catalog.on_update(*id, old, new);
         }
