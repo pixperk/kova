@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/kova-core",
     "crates/kova-index",
+    "crates/kova-meta-index",
     "crates/kova-storage",
     "crates/kova-query",
     # Crates below are added at the start of their phase. See todo.md.

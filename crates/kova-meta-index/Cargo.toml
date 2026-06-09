@@ -1,0 +1,19 @@
+[package]
+name = "kova-meta-index"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Secondary indexes for Kova metadata predicates : Hash / BTree / Inverted with RoaringBitmap composition."
+
+[dependencies]
+kova-core = { path = "../kova-core" }
+roaring = "0.10"
+thiserror.workspace = true
+
+[dev-dependencies]
+# none yet
+
+[lints]
+workspace = true
