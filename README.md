@@ -17,10 +17,11 @@ with gRPC between nodes. Every byte, every index, every network call is ours.
 | `kova-index`   | shipped     | `Index` trait, `FlatIndex` baseline, `HnswIndex` (insert + search + two-pass vacuum + streaming snapshot) |
 | `kova-storage` | shipped     | Segmented WAL, `MmapVectorStore` (free-list slot reuse, crash-mid-init recovery), `FileMetadataStore`, `atomic_write` (+ streaming variant), `Manifest` commit point, `Shard` (log-then-mutate, batched inserts, logical delete, vacuum, checkpoint + WAL truncate, generation-numbered snapshots). SIGKILL-tested across 55,697 acks and 962 checkpoints. |
 | `kova-query`   | Phase 1 shipped | KQL end to end : parser (Pest grammar, all 8 statements), binder (typed `LogicalStatement` with hard semantic rejections), planner (three SELECT strategies dispatched by predicate selectivity, plus radius, COUNT and scan-and-limit bypasses), executor wired to `Shard` for both read and write paths, full DML (INSERT / UPDATE / DELETE including subscripted, radius, and param-bound shapes), `Value::Map` for nested metadata, probabilistic query fuzzer with reference-impl correctness check, recall regression sweep across kNN / filtered / radius. See [`docs/query.md`](docs/query.md). |
+| `kova-meta-index` | shipped | Secondary indexes on metadata fields : `HashIndex` (equality), `BTreeIndex` (range, with float-ordering gate), `InvertedIndex` (array containment). `RoaringTreemap`-backed bitmaps compose for AND / OR / NOT in microseconds. `IndexCatalog` orchestrates per-field bundles, routes lookups by priority, exposes exact cardinality for the planner. Catalog persists alongside the graph snapshot, generation-numbered like `graph.{N}.snapshot`. WAL records carry `old_metadata` so replay rebuilds the catalog without depending on the (eagerly-mutated) metadata store. See [`docs/meta-index.md`](docs/meta-index.md). |
 | `kova-cluster` | not started | Consistent hashing, quorum replication, coordinator                    |
 | `kova-server`  | not started | gRPC node binary                                                       |
 
-544 lib tests + 9 fuzz tests passing across the workspace. The full fuzz long-run pushes 12k+ correctness-checked queries and 32k+ no-panic queries per CI cycle. `cargo clippy --workspace --all-targets -- -D warnings` clean.
+645 lib + integration tests passing across the workspace (covering meta-index unit tests, catalog round-trip + persistence + post-checkpoint replay, plus the existing HNSW / WAL / shard / query suites). The full fuzz long-run pushes 12k+ correctness-checked queries and 32k+ no-panic queries per CI cycle. `cargo clippy --workspace --all-targets -- -D warnings` clean.
 
 ## Build
 
@@ -665,6 +666,142 @@ data (what tables exist, what indexes are built) belongs at the
 runtime layer. Catching this early saves a multi-week refactor in
 month 6.
 
+### Three index types, not one universal index
+
+`HashIndex` covers equality (`=`, `IN`, `IS NOT NULL`, `!=`). `BTreeIndex`
+covers ranges plus everything `HashIndex` does. `InvertedIndex` covers
+array containment. Three separate concrete types behind a shared
+`MetaIndex` trait, instead of one universal index that handles every
+atom shape.
+
+The pull toward unification is real. One index type would mean one
+backfill path, one persistence format, one set of tests. The pull is
+wrong because the three shapes have **incompatible storage choices** :
+
+- Hash buckets are random access, no ordering. Cheapest for equality
+  because no comparison is needed past hash lookup.
+- BTree buckets are sorted, walked via range cursor. Necessary for
+  ranges but unnecessary overhead for pure equality (`HashIndex::Eq`
+  is faster than `BTreeIndex::Eq`).
+- Inverted index threads one row into N buckets per array element.
+  Insert cost is O(array_length), unlike the others which are O(1).
+  Different cost model means different design constraints.
+
+Putting all three behind one type means picking one storage strategy
+and degrading the other two. The trait split keeps each index optimal
+for its atom set. The catalog routes atoms to the right index via
+priority order, so the caller never has to think about which type
+answers which query.
+
+### `NormalizedKey` solves three problems at once
+
+`Value` (from `kova-core`) is not a usable map key out of the box.
+`Value::F64` contains `f64`, which is not `Eq` (NaN ≠ NaN), so
+`HashMap<Value, _>` and `BTreeMap<Value, _>` both fail to derive.
+`Value::Array` and `Value::Map` have no canonical single-key shape
+because they're composite.
+
+`NormalizedKey` is the bridge. Floats become `u64` via `f64::to_bits`
+(total ordering, hashable bits). Strings, ints, bools pass through.
+Arrays and maps return `None` from `from_value` ; the index silently
+skips non-keyable values rather than erroring. That last choice keeps
+batch inserts robust : one mistyped row doesn't reject the whole
+batch.
+
+The trade : `f64::to_bits` ordering matches numeric ordering only for
+positive finite floats. `BTreeIndex` therefore rejects ranged queries
+on floats via `supports`. Equality on floats works (bit-pattern match
+is what users expect). Sortable-float encoding would lift the
+restriction later if benchmarks justify it.
+
+### `IndexCatalog::lookup` returns `Option<RoaringTreemap>`, not `Result`
+
+The catalog has three return states for `(field, atom)` : "here's the
+bitmap", "no index can answer this, fall back to scan", and "the field
+isn't indexed at all." The first is `Some(bitmap)` ; the last two
+collapse to `None`.
+
+Collapsing them is deliberate. From the executor's perspective, both
+mean "I have to scan myself" ; distinguishing "field unindexed" from
+"atom unsupported" gives the planner no useful action. Both fall
+through to the same fallback path.
+
+Using `Result` would mean errors propagate up : "I can't answer this"
+becomes an exception the caller has to handle. But "I can't answer
+this" is the **normal case** for any predicate the planner hasn't
+indexed yet. `None` keeps the fallback fluent ; you write
+`catalog.lookup(...).unwrap_or_else(|| scan_metadata(field, atom))`
+and the planner stays linear.
+
+### WAL records carry `old_metadata` for replay coherence
+
+`Record::Delete` and `Record::UpdateMetadata` carry the row's old
+metadata bag in addition to the affected id. This is more bytes per
+record than the minimum needed for the metadata store (which just
+needs the id to delete, or the new bag to update).
+
+The asymmetry the field plugs : `FileMetadataStore` persists eagerly.
+By the time `Shard::open` runs WAL replay on a post-checkpoint Delete
+record, the bag is already gone from disk. The catalog's replay
+forwarding (`catalog.on_delete(id, &old_meta)`) needs the bag to
+clear the right buckets, and the store can no longer provide it.
+
+The honest answer is to ship the bag in the WAL record. Live `delete`
+captures it pre-WAL-commit, embeds it ; replay reads it back from the
+record. Both paths use the same `(id, old_meta)` pair. The cost is a
+few extra hundred bytes per record (typical bag sizes), which is
+small next to the vector payload an Insert already carries.
+
+This is a WAL format change. Pre-revision WAL files won't deserialize.
+For pre-release the breaking change is acceptable ; v1 will gate
+with a version field on the `Record` framing for migration.
+
+### Catalog persistence is checkpoint-gated, not write-through
+
+The catalog file is generation-numbered alongside the graph snapshot
+(`catalog.{snapshot_id}.bin` next to `graph.{snapshot_id}.snapshot`)
+and written **only at `Shard::checkpoint`**. Between checkpoints, the
+catalog lives in memory only.
+
+This means indexes registered with `add_*_index` after the last
+checkpoint are transient : close-without-checkpoint loses them. The
+metadata store survives (data isn't lost), but `add_*_index` has to
+be called again to rebuild from the live data.
+
+The pull toward write-through ("save catalog on every `add_*_index`")
+is real but creates an LSN mismatch problem. The catalog file is
+named by `snapshot_id`, which only changes at checkpoint ; if you
+overwrite `catalog.{N}.bin` between checkpoints, it carries state
+past `checkpoint_lsn`, and reopen's WAL replay (from
+`checkpoint_lsn + 1`) double-counts the records the catalog already
+saw. A watermark LSN inside the catalog file would fix this but
+means a third atomic commit point (catalog + graph + manifest) the
+manifest swap has to coordinate.
+
+Not worth the complexity. Same contract `vacuum()` already has :
+"transient until the next checkpoint locks it in." Operators are
+told to checkpoint after `add_*_index` if durability matters.
+
+### `RoaringTreemap`, not `RoaringBitmap`
+
+`VectorId` is a `u64` newtype, so the bitmap type that carries id sets
+is `RoaringTreemap`, not `RoaringBitmap`. The two differ in addressing
+range : `RoaringBitmap` handles `u32` (~4B ids), `RoaringTreemap`
+handles `u64` (the full id space).
+
+`RoaringTreemap` is implemented as `BTreeMap<u32, RoaringBitmap>` :
+the upper 32 bits of each id pick an inner bitmap, the lower 32 bits
+get stored inside it. Every set operation decomposes : intersection
+walks both treemaps in sync, intersecting matching inner bitmaps for
+each shared upper-32 chunk. The chunk-level pruning that makes
+roaring fast at the `u32` level still applies at the `u64` level ;
+just one extra btree layer.
+
+The cost is one more pointer chase per operation. The win is that
+the indexes never have to worry about id range exhaustion. At Kova's
+scale that doesn't matter, but coding to `u64` from the start means
+no migration when shards get large enough that it does.
+
 ## `kova-query` : KQL (Phase 1 shipped)
 
 KQL is the SQL-shaped query language Kova uses for hybrid vector +
@@ -810,17 +947,144 @@ evaluate, manifesting as a fake "engine deleted 0, expected 10"
 mismatch. The fix was harness discipline, not engine code, but the
 mode of failure is the kind of methodology Phase 2 inherits.
 
+## `kova-meta-index` : secondary indexes
+
+Meta-indexes are Kova's secondary-index layer for metadata
+predicates. **Three index types behind one `MetaIndex` trait,
+`RoaringTreemap` for composition, an `IndexCatalog` that orchestrates
+per-field bundles, persistence alongside the graph snapshot.** Wires
+into every `Shard::insert / delete / update` so the catalog stays in
+sync without operator effort. That is the pitch ; the rest of this
+section unpacks it.
+
+This is the README view. Full architecture, atom dispatch table, the
+persistence story, and the WAL coherence rules live in
+[`docs/meta-index.md`](docs/meta-index.md).
+
+### The three index types
+
+Each index type covers a slice of the predicate space. The catalog
+routes each atom to whichever index supports it cheapest.
+
+| Index | Atoms supported | Cost |
+|-------|-----------------|------|
+| `HashIndex` | `Eq`, `In`, `IsNotNull`, `Cmp(Ne, _)` | O(1) lookup, O(matches) clone |
+| `BTreeIndex` | Everything `HashIndex` does + `Cmp(Lt/Le/Gt/Ge, _)` and `Between` (rejected on float values) | O(log N) cursor + O(buckets in range) union |
+| `InvertedIndex` | `ArrayContains`, `IsNotNull` | O(1) lookup ; insert is O(array length) |
+
+A single field can carry multiple index types. `add_hash_index("year") +
+add_btree_index("year")` makes both available ; the catalog routes
+`Eq(2024)` to the hash and `Cmp(Gt, 2022)` to the btree.
+
+### What a registration + query looks like
+
+```rust
+let mut shard = Shard::open("/tmp/my-shard", 768, L2, HnswParams::default())?;
+
+shard.add_hash_index("category");
+shard.add_btree_index("year");
+shard.add_inverted_index("tags");
+
+// ... inserts, deletes, updates : indexes update synchronously ...
+
+// WHERE category = 'docs' AND year > 2022 AND tags @> 'rust'
+let docs   = shard.catalog().lookup("category", &IndexAtom::Eq(s("docs"))).unwrap();
+let recent = shard.catalog().lookup("year",     &IndexAtom::Cmp(CmpOp::Gt, i(2022))).unwrap();
+let rust   = shard.catalog().lookup("tags",     &IndexAtom::ArrayContains(s("rust"))).unwrap();
+
+let candidates = docs & recent & rust;  // roaring bitmap intersection
+
+shard.checkpoint()?;  // catalog now durable across reopen
+```
+
+The intersection at the end runs in microseconds on a million-row
+shard because roaring prunes entire 65,536-id chunks at a time when
+they're absent from any input.
+
+### Persistence at a glance
+
+| Where things live | When they're written |
+|-------------------|----------------------|
+| Catalog buckets + `all_indexed_ids` (in memory) | Mutated synchronously by every `insert/delete/update` |
+| `catalog.{snapshot_id}.bin` (on disk) | Written atomically at every `Shard::checkpoint`, alongside `graph.{snapshot_id}.snapshot` |
+| WAL records (on disk) | Now carry `old_metadata` for `Delete` / `DeleteMany` / `UpdateMetadata` so replay can drive the catalog |
+| Live catalog on reopen | Loaded from `catalog.{snapshot_id}.bin` ; WAL records from `checkpoint_lsn + 1` replay through `catalog.on_*` hooks to catch up |
+
+The manifest is still the single durable commit point ; catalog and
+graph snapshots are committed together by the manifest swap. Crash
+analysis is identical to the graph snapshot story : kill before
+manifest commit leaves the old generation live, kill after leaves the
+new one live, orphan files get swept on next open.
+
+### What ships strong
+
+| Test surface | Count | What it asserts |
+|--------------|-------|-----------------|
+| `kova-meta-index` unit tests | 58 | Atom dispatch, supports/query symmetry, cardinality matches `lookup.len()`, persistence round-trip, magic/version/truncation rejections |
+| `meta_index_integration.rs` | 12 | Catalog hooks survive every mutation path : insert / insert_many / delete / delete_many / update_metadata / backfill / multi-field composition |
+| `meta_index_persistence.rs` | 8 | Close-reopen survival, post-checkpoint replay catch-up, transient indexes don't persist without checkpoint, orphan catalog sweep, all three types persist together |
+| All-targets clippy `-D warnings` | clean | Including all the serde derives, the float-bit cast, the from-impls on `VectorId` |
+
+### The engineering decisions worth knowing
+
+If you are reading the code, these are the calls that shape what you
+see. Each one paid off enough to be worth keeping.
+
+**Three index types behind one trait.** `HashIndex`, `BTreeIndex`,
+`InvertedIndex` share the `MetaIndex` surface but pick the storage
+strategy that fits their atom set. Unifying them would mean degrading
+one for the sake of another ; the trait split keeps each optimal.
+
+**`NormalizedKey` is the bridge from `Value` to map keys.** `Value`
+can't derive `Hash + Eq` (NaN in `F64`) or `Ord` (same reason).
+`NormalizedKey` stores floats via `f64::to_bits`, excludes non-scalar
+variants (`Array`, `Map`) by returning `None` from `from_value`, and
+flags the float-ordering caveat for `BTreeIndex::supports` to gate.
+
+**`IndexCatalog::lookup` returns `Option`, not `Result`.** "No index
+can answer this atom" is the **normal case** for any predicate that
+isn't covered yet ; the fallback is "scan." Collapsing it to `None`
+keeps the planner's path linear instead of forcing it to translate
+errors into fallback branches.
+
+**WAL `Delete` and `UpdateMetadata` carry `old_metadata`.** The
+metadata store persists eagerly, so by the time replay runs the bag
+is gone from disk. Embedding it in the WAL record makes the record
+self-sufficient : live ops capture the bag pre-commit, replay reads
+it back, both paths use the same `(id, old, new)` data.
+
+**Catalog persistence is checkpoint-gated.** Same contract as
+`vacuum()` : indexes added without a subsequent `checkpoint()` are
+transient. Saving on every `add_*_index` would create an LSN mismatch
+between the catalog file and the WAL replay range. Operators
+checkpoint after registration if durability matters.
+
+**`RoaringTreemap`, not `RoaringBitmap`.** `VectorId` is u64.
+`Treemap` is a `BTreeMap<u32, RoaringBitmap>` ; chunk-level pruning
+still applies, one more pointer chase per operation. Sized for the
+full id space from day one.
+
+**Priority routing, not selectivity routing.** The catalog asks each
+index on a field in fixed order : hash > btree > inverted. All
+supporting indexes return the same bitmap ; picking the cheapest by
+lookup cost minimises overhead. Selectivity-driven routing is for the
+cost-model rework, not today.
+
 ## Longer-term scope
 
-Beyond Phase 1 of `kova-query` :
+Beyond what `kova-query` ships today :
 
-- **`kova-query` Phase 2** : real metadata indexes (hash / btree /
-  inverted), `RoaringBitmap` predicate composition, `CREATE INDEX` /
-  `DROP INDEX` DDL unrejected at the binder, histogram-backed
-  statistics, cost-model planner replacing the hardcoded 0.05 / 0.5
-  selectivity bands. Every milestone is a trait-impl swap behind a
-  stable interface : same KQL grammar, same operators, same fuzzer.
-  See [`docs/query.md`](docs/query.md) for the full plan.
+- **`kova-query` next steps** : meta-indexes are in (three index
+  types, `RoaringTreemap` composition, `IndexCatalog`, persistence
+  across reopen ; see [`docs/meta-index.md`](docs/meta-index.md)).
+  Still to come : `CREATE INDEX` / `DROP INDEX` DDL unrejected at
+  the binder, column statistics for unindexed predicates, the
+  executor's `MetadataScan` consulting `shard.catalog().lookup`
+  first, and a cost-model planner replacing the hardcoded 0.05 /
+  0.5 selectivity bands. Every remaining step is a trait-impl swap
+  behind a stable interface : same KQL grammar, same operators,
+  same fuzzer. See [`docs/query.md`](docs/query.md) for the full
+  plan.
 - **`kova-cluster` + `kova-server`** : the distribution layer. Consistent
   hashing with virtual nodes, quorum replication, a coordinator that
   fans out queries and merges results across shards via gRPC. `openraft`
