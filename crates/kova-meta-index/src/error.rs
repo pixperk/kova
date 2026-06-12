@@ -82,4 +82,18 @@ pub enum KovaMetaIndexError {
         /// Name the DDL asked to drop.
         name: String,
     },
+
+    /// Attempted to register a new index of `kind` on `field` when
+    /// the catalog already holds one. Each `(field, kind)` slot
+    /// holds at most one index — re-registering would either
+    /// silently lose state or leave two names pointing at the same
+    /// bucket. The strict rule rejects loudly so callers explicitly
+    /// drop before re-adding.
+    #[error("an index of kind {kind:?} already exists on field '{field}'")]
+    IndexAlreadyExists {
+        /// Field the duplicate registration targeted.
+        field: String,
+        /// Kind of the index the slot already holds.
+        kind: crate::catalog::IndexKind,
+    },
 }

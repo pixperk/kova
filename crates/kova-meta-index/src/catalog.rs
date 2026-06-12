@@ -176,23 +176,54 @@ impl IndexCatalog {
         Self::default()
     }
 
-    /// Register a new [`HashIndex`] on `field`, replacing any
-    /// existing hash index on that field. The new index is empty ;
-    /// use [`Self::populate_field`] to backfill from existing data.
-    pub fn add_hash_index(&mut self, field: &str) {
+    /// Register a new empty [`HashIndex`] on `field`. The new
+    /// index is empty ; use [`Self::populate_field`] to backfill
+    /// from existing data.
+    ///
+    /// # Errors
+    /// Returns [`KovaMetaIndexError::IndexAlreadyExists`] if a
+    /// hash index already exists on `field`. Each `(field, kind)`
+    /// slot holds at most one index ; callers that want to rebuild
+    /// must drop the existing one explicitly first.
+    pub fn add_hash_index(&mut self, field: &str) -> Result<(), KovaMetaIndexError> {
+        if self.has_kind_on(field, IndexKind::Hash) {
+            return Err(KovaMetaIndexError::IndexAlreadyExists {
+                field: field.to_string(),
+                kind: IndexKind::Hash,
+            });
+        }
         self.fields.entry(field.to_string()).or_default().hash = Some(HashIndex::new());
+        Ok(())
     }
 
-    /// Register a new [`BTreeIndex`] on `field`, replacing any
-    /// existing btree index on that field.
-    pub fn add_btree_index(&mut self, field: &str) {
+    /// Register a new empty [`BTreeIndex`] on `field`.
+    ///
+    /// # Errors
+    /// See [`Self::add_hash_index`].
+    pub fn add_btree_index(&mut self, field: &str) -> Result<(), KovaMetaIndexError> {
+        if self.has_kind_on(field, IndexKind::Btree) {
+            return Err(KovaMetaIndexError::IndexAlreadyExists {
+                field: field.to_string(),
+                kind: IndexKind::Btree,
+            });
+        }
         self.fields.entry(field.to_string()).or_default().btree = Some(BTreeIndex::new());
+        Ok(())
     }
 
-    /// Register a new [`InvertedIndex`] on `field`, replacing any
-    /// existing inverted index on that field.
-    pub fn add_inverted_index(&mut self, field: &str) {
+    /// Register a new empty [`InvertedIndex`] on `field`.
+    ///
+    /// # Errors
+    /// See [`Self::add_hash_index`].
+    pub fn add_inverted_index(&mut self, field: &str) -> Result<(), KovaMetaIndexError> {
+        if self.has_kind_on(field, IndexKind::Inverted) {
+            return Err(KovaMetaIndexError::IndexAlreadyExists {
+                field: field.to_string(),
+                kind: IndexKind::Inverted,
+            });
+        }
         self.fields.entry(field.to_string()).or_default().inverted = Some(InvertedIndex::new());
+        Ok(())
     }
 
     /// Bulk-load every index attached to `field` from a fresh row
@@ -315,17 +346,21 @@ impl IndexCatalog {
     /// ON tbl (col)`) ; the programmatic
     /// [`Self::add_hash_index`] family stays anonymous.
     ///
-    /// # Errors
-    /// Returns [`KovaMetaIndexError::IndexNameInUse`] if `name` is
-    /// already registered.
+    /// Strict on **both** axes :
     ///
-    /// # Notes
-    /// Idempotent on the index layer the way the anonymous adders
-    /// are : if a hash index already exists on `field`, registering
-    /// a new name pointing at hash on the same field replaces the
-    /// underlying index with a fresh empty one. Callers that need
-    /// to preserve existing bucket state should check
-    /// [`Self::has_kind_on`] first.
+    /// - the name registry must not already hold `name`
+    /// - the `(field, kind)` slot must not already hold an index
+    ///
+    /// Callers that want to rebuild must
+    /// [`Self::drop_named_index`] (or [`Self::drop_hash_index`]
+    /// etc.) before re-adding. Idempotent-replace was the v1
+    /// behaviour ; it caused silent state loss and was removed.
+    ///
+    /// # Errors
+    /// - [`KovaMetaIndexError::IndexNameInUse`] if `name` is
+    ///   already registered.
+    /// - [`KovaMetaIndexError::IndexAlreadyExists`] if an index of
+    ///   `kind` already exists on `field`.
     pub fn create_named_index(
         &mut self,
         name: &str,
@@ -337,10 +372,15 @@ impl IndexCatalog {
                 name: name.to_string(),
             });
         }
+        // The strict `add_*_index` methods enforce the slot check
+        // themselves, but we run it here too so the error mentions
+        // both `name` and `(field, kind)` in the right order : the
+        // duplicate-name case is more common at the DDL surface, so
+        // it should win when both fire.
         match kind {
-            IndexKind::Hash => self.add_hash_index(field),
-            IndexKind::Btree => self.add_btree_index(field),
-            IndexKind::Inverted => self.add_inverted_index(field),
+            IndexKind::Hash => self.add_hash_index(field)?,
+            IndexKind::Btree => self.add_btree_index(field)?,
+            IndexKind::Inverted => self.add_inverted_index(field)?,
         }
         self.named_indexes
             .insert(name.to_string(), (field.to_string(), kind));
@@ -531,7 +571,7 @@ mod tests {
     #[test]
     fn hash_index_basic_round_trip() {
         let mut cat = IndexCatalog::new();
-        cat.add_hash_index("category");
+        cat.add_hash_index("category").unwrap();
 
         cat.on_insert(id(0), &meta(&[("category", s("docs"))]));
         cat.on_insert(id(1), &meta(&[("category", s("blog"))]));
@@ -548,7 +588,7 @@ mod tests {
     #[test]
     fn missing_field_for_row_is_skipped() {
         let mut cat = IndexCatalog::new();
-        cat.add_hash_index("category");
+        cat.add_hash_index("category").unwrap();
 
         cat.on_insert(id(0), &meta(&[("category", s("docs"))]));
         // row 1 has no "category" field
@@ -562,8 +602,8 @@ mod tests {
     #[test]
     fn separate_indexes_on_different_fields_dont_cross_talk() {
         let mut cat = IndexCatalog::new();
-        cat.add_hash_index("a");
-        cat.add_hash_index("b");
+        cat.add_hash_index("a").unwrap();
+        cat.add_hash_index("b").unwrap();
 
         cat.on_insert(id(0), &meta(&[("a", s("x")), ("b", s("y"))]));
         cat.on_insert(id(1), &meta(&[("a", s("y")), ("b", s("x"))]));
@@ -580,8 +620,8 @@ mod tests {
     #[test]
     fn two_indexes_on_same_field_route_by_atom() {
         let mut cat = IndexCatalog::new();
-        cat.add_hash_index("year");
-        cat.add_btree_index("year");
+        cat.add_hash_index("year").unwrap();
+        cat.add_btree_index("year").unwrap();
 
         for n in 0u64..10 {
             cat.on_insert(
@@ -609,7 +649,7 @@ mod tests {
     #[test]
     fn inverted_index_round_trip() {
         let mut cat = IndexCatalog::new();
-        cat.add_inverted_index("tags");
+        cat.add_inverted_index("tags").unwrap();
 
         cat.on_insert(id(0), &meta(&[("tags", arr(&["rust", "async"]))]));
         cat.on_insert(id(1), &meta(&[("tags", arr(&["rust", "sync"]))]));
@@ -626,7 +666,7 @@ mod tests {
     #[test]
     fn on_delete_removes_from_indexes() {
         let mut cat = IndexCatalog::new();
-        cat.add_hash_index("category");
+        cat.add_hash_index("category").unwrap();
 
         let m0 = meta(&[("category", s("docs"))]);
         cat.on_insert(id(0), &m0);
@@ -641,7 +681,7 @@ mod tests {
     #[test]
     fn on_update_field_present_in_both_calls_update() {
         let mut cat = IndexCatalog::new();
-        cat.add_hash_index("category");
+        cat.add_hash_index("category").unwrap();
 
         let old_m = meta(&[("category", s("docs"))]);
         let new_m = meta(&[("category", s("blog"))]);
@@ -661,7 +701,7 @@ mod tests {
     #[test]
     fn on_update_field_dropped_calls_delete() {
         let mut cat = IndexCatalog::new();
-        cat.add_hash_index("category");
+        cat.add_hash_index("category").unwrap();
 
         let old_m = meta(&[("category", s("docs"))]);
         let new_m = meta(&[("other", s("x"))]);
@@ -683,7 +723,7 @@ mod tests {
     #[test]
     fn on_update_field_added_calls_insert() {
         let mut cat = IndexCatalog::new();
-        cat.add_hash_index("category");
+        cat.add_hash_index("category").unwrap();
 
         let old_m = meta(&[("other", s("x"))]);
         let new_m = meta(&[("category", s("docs"))]);
@@ -698,8 +738,8 @@ mod tests {
     #[test]
     fn populate_field_bulk_loads_all_indexes_on_field() {
         let mut cat = IndexCatalog::new();
-        cat.add_hash_index("year");
-        cat.add_btree_index("year");
+        cat.add_hash_index("year").unwrap();
+        cat.add_btree_index("year").unwrap();
 
         let rows: Vec<_> = (0u64..10)
             .map(|n| (id(n), i(2020 + i64::try_from(n).unwrap())))
@@ -735,7 +775,7 @@ mod tests {
     #[test]
     fn lookup_returns_none_for_unsupported_atom() {
         let mut cat = IndexCatalog::new();
-        cat.add_hash_index("category");
+        cat.add_hash_index("category").unwrap();
         cat.on_insert(id(0), &meta(&[("category", s("docs"))]));
 
         // Hash index doesn't support Lt ; no other index on this field ; lookup returns None.
@@ -748,7 +788,7 @@ mod tests {
     #[test]
     fn estimate_matches_lookup_len() {
         let mut cat = IndexCatalog::new();
-        cat.add_hash_index("category");
+        cat.add_hash_index("category").unwrap();
         for n in 0u64..50 {
             let v = if n % 5 == 0 { s("hot") } else { s("cold") };
             cat.on_insert(id(n), &meta(&[("category", v)]));
@@ -767,26 +807,44 @@ mod tests {
     }
 
     #[test]
-    fn add_index_is_idempotent_replace() {
+    fn add_index_is_strict_no_replace() {
         let mut cat = IndexCatalog::new();
-        cat.add_hash_index("category");
+        cat.add_hash_index("category").unwrap();
         cat.on_insert(id(0), &meta(&[("category", s("docs"))]));
 
-        // Re-register : previous index state is discarded.
-        cat.add_hash_index("category");
+        // Re-registering the same kind on the same field is now
+        // rejected loudly. Callers that want to rebuild must
+        // explicitly drop first.
+        let err = cat.add_hash_index("category").unwrap_err();
         assert!(
-            cat.lookup("category", &IndexAtom::Eq(s("docs")))
-                .unwrap()
-                .is_empty()
+            matches!(
+                err,
+                KovaMetaIndexError::IndexAlreadyExists { ref field, kind: IndexKind::Hash } if field == "category"
+            ),
+            "got {err:?}"
         );
+
+        // Original bucket state is intact.
+        let bm = cat.lookup("category", &IndexAtom::Eq(s("docs"))).unwrap();
+        assert_eq!(bm.len(), 1);
+        assert!(bm.contains(0));
+    }
+
+    #[test]
+    fn add_index_after_drop_works() {
+        let mut cat = IndexCatalog::new();
+        cat.add_hash_index("category").unwrap();
+        cat.drop_hash_index("category");
+        // Slot's vacant again, re-adding succeeds.
+        cat.add_hash_index("category").unwrap();
     }
 
     #[test]
     fn indexed_fields_lists_registered_fields() {
         let mut cat = IndexCatalog::new();
-        cat.add_hash_index("a");
-        cat.add_btree_index("b");
-        cat.add_inverted_index("c");
+        cat.add_hash_index("a").unwrap();
+        cat.add_btree_index("b").unwrap();
+        cat.add_inverted_index("c").unwrap();
 
         let mut fields: Vec<_> = cat.indexed_fields().collect();
         fields.sort_unstable();
@@ -796,9 +854,9 @@ mod tests {
     #[test]
     fn encode_decode_round_trip_preserves_buckets() {
         let mut cat = IndexCatalog::new();
-        cat.add_hash_index("category");
-        cat.add_btree_index("year");
-        cat.add_inverted_index("tags");
+        cat.add_hash_index("category").unwrap();
+        cat.add_btree_index("year").unwrap();
+        cat.add_inverted_index("tags").unwrap();
 
         for n in 0u64..20 {
             cat.on_insert(
@@ -959,9 +1017,9 @@ mod tests {
     #[test]
     fn programmatic_drop_hash_btree_inverted() {
         let mut cat = IndexCatalog::new();
-        cat.add_hash_index("a");
-        cat.add_btree_index("b");
-        cat.add_inverted_index("c");
+        cat.add_hash_index("a").unwrap();
+        cat.add_btree_index("b").unwrap();
+        cat.add_inverted_index("c").unwrap();
 
         cat.drop_hash_index("a");
         cat.drop_btree_index("b");
@@ -994,9 +1052,9 @@ mod tests {
         // Smoke test of the executor-style three-index AND :
         //   WHERE category = 'docs' AND year > 2022 AND tags @> 'rust'
         let mut cat = IndexCatalog::new();
-        cat.add_hash_index("category");
-        cat.add_btree_index("year");
-        cat.add_inverted_index("tags");
+        cat.add_hash_index("category").unwrap();
+        cat.add_btree_index("year").unwrap();
+        cat.add_inverted_index("tags").unwrap();
 
         for n in 0u64..20 {
             let category = if n % 2 == 0 { "docs" } else { "blog" };

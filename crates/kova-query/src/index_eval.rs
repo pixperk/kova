@@ -319,7 +319,7 @@ mod tests {
 
     fn fresh_catalog(field: &str) -> IndexCatalog {
         let mut cat = IndexCatalog::new();
-        cat.add_hash_index(field);
+        cat.add_hash_index(field).unwrap();
         cat
     }
 
@@ -389,8 +389,8 @@ mod tests {
     #[test]
     fn and_of_two_indexed_atoms_is_full() {
         let mut cat = IndexCatalog::new();
-        cat.add_hash_index("category");
-        cat.add_btree_index("year");
+        cat.add_hash_index("category").unwrap();
+        cat.add_btree_index("year").unwrap();
         cat.on_insert(
             id(0),
             &meta_with(&[("category", s("docs")), ("year", i(2024))]),
