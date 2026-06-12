@@ -130,6 +130,34 @@ pub trait MetadataStore {
     where
         F: FnMut(&Metadata) -> bool,
         Self: Sized;
+
+    /// Walk every row that has a value at top-level `field`, calling
+    /// `callback(id, &value)` for each. The intended use is secondary-
+    /// index backfill : a single pass over the store produces the
+    /// `(id, value)` stream the index needs, no per-row re-fetches.
+    ///
+    /// Default impl composes [`Self::scan_ids`] with [`Self::get`] so
+    /// existing impls work without overriding ; concrete stores should
+    /// override to walk their internal map directly and skip the
+    /// double-traversal.
+    ///
+    /// # Object safety
+    /// Same constraint as [`Self::scan_ids`] : the generic closure
+    /// makes this `Self: Sized` only.
+    fn walk_field<F>(&self, field: &str, mut callback: F)
+    where
+        F: FnMut(VectorId, &Value),
+        Self: Sized,
+    {
+        let ids = self.scan_ids(|m| m.contains_key(field));
+        for id in ids {
+            if let Some(bag) = self.get(id)
+                && let Some(v) = bag.get(field)
+            {
+                callback(id, v);
+            }
+        }
+    }
 }
 
 /// Trivial in-memory [`MetadataStore`] backed by a `HashMap`.
@@ -179,6 +207,21 @@ impl MetadataStore for InMemoryMetadataStore {
             .filter(|(_, m)| pred(m))
             .map(|(id, _)| *id)
             .collect()
+    }
+
+    /// Single-pass override of the default trait impl : iterate the
+    /// in-memory `HashMap` once, calling `callback` for every row
+    /// that has the field. Skips the predicate-then-`get` double
+    /// traversal.
+    fn walk_field<F>(&self, field: &str, mut callback: F)
+    where
+        F: FnMut(VectorId, &Value),
+    {
+        for (id, meta) in &self.entries {
+            if let Some(v) = meta.get(field) {
+                callback(*id, v);
+            }
+        }
     }
 }
 
@@ -321,6 +364,53 @@ mod tests {
         let mut store = InMemoryMetadataStore::new();
         store.put(id(1), sample_meta()).unwrap();
         let _ = store.scan_ids(|_| true);
+        assert!(store.contains(id(1)));
+    }
+
+    #[test]
+    fn walk_field_visits_only_rows_with_the_field() {
+        let mut store = InMemoryMetadataStore::new();
+        store.put(id(1), sample_meta()).unwrap(); // has "count"
+        store.put(id(2), sample_meta()).unwrap(); // has "count"
+        let mut m_no_count = Metadata::new();
+        m_no_count.insert("category".into(), Value::String("docs".into()));
+        store.put(id(3), m_no_count).unwrap(); // no "count"
+
+        let mut visited: Vec<(VectorId, Value)> = Vec::new();
+        store.walk_field("count", |i, v| visited.push((i, v.clone())));
+        visited.sort_by_key(|(i, _)| i.get());
+
+        // ids 1 and 2 ; id 3 lacks the field.
+        assert_eq!(visited.len(), 2);
+        assert_eq!(visited[0].0, id(1));
+        assert_eq!(visited[1].0, id(2));
+        // Both have the same I64(42) from sample_meta.
+        assert_eq!(visited[0].1, Value::I64(42));
+        assert_eq!(visited[1].1, Value::I64(42));
+    }
+
+    #[test]
+    fn walk_field_skips_rows_whose_value_is_at_other_keys() {
+        // Defensive : `field` is the top-level key. If a row has
+        // {"other": ...} but no "category", the walk skips it.
+        let mut store = InMemoryMetadataStore::new();
+        let mut m = Metadata::new();
+        m.insert("other".into(), Value::String("docs".into()));
+        store.put(id(1), m).unwrap();
+
+        let mut visited = 0;
+        store.walk_field("category", |_, _| visited += 1);
+        assert_eq!(visited, 0);
+    }
+
+    #[test]
+    fn walk_field_passes_owned_value_via_reference() {
+        // The callback gets `&Value` ; we can clone or borrow.
+        let mut store = InMemoryMetadataStore::new();
+        store.put(id(1), sample_meta()).unwrap();
+        let mut seen: Option<Value> = None;
+        store.walk_field("active", |_, v| seen = Some(v.clone()));
+        assert_eq!(seen, Some(Value::Bool(true)));
         assert!(store.contains(id(1)));
     }
 }

@@ -36,7 +36,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use kova_core::{Metadata, MetadataStore, VectorId};
+use kova_core::{Metadata, MetadataStore, Value, VectorId};
 
 use crate::KovaStorageError;
 use crate::atomic::atomic_write;
@@ -174,6 +174,22 @@ impl MetadataStore for FileMetadataStore {
             .filter(|(_, m)| pred(m))
             .map(|(id, _)| *id)
             .collect()
+    }
+
+    /// Single-pass override : iterate the in-memory `HashMap` once,
+    /// emitting `(id, &value)` for every row that has the field.
+    /// Mirrors the [`kova_core::InMemoryMetadataStore`] override ;
+    /// both impls use `HashMap<VectorId, Metadata>` internally, so
+    /// the body is identical.
+    fn walk_field<F>(&self, field: &str, mut callback: F)
+    where
+        F: FnMut(VectorId, &Value),
+    {
+        for (id, meta) in &self.entries {
+            if let Some(v) = meta.get(field) {
+                callback(*id, v);
+            }
+        }
     }
 
     /// Apply many puts as a single flush.

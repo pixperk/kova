@@ -309,7 +309,7 @@ where
         self.catalog
             .add_hash_index(field)
             .map_err(ShardError::backend)?;
-        self.backfill_field(field);
+        self.backfill_kind(field, kova_meta_index::IndexKind::Hash);
         Ok(())
     }
 
@@ -322,7 +322,7 @@ where
         self.catalog
             .add_btree_index(field)
             .map_err(ShardError::backend)?;
-        self.backfill_field(field);
+        self.backfill_kind(field, kova_meta_index::IndexKind::Btree);
         Ok(())
     }
 
@@ -336,7 +336,7 @@ where
         self.catalog
             .add_inverted_index(field)
             .map_err(ShardError::backend)?;
-        self.backfill_field(field);
+        self.backfill_kind(field, kova_meta_index::IndexKind::Inverted);
         Ok(())
     }
 
@@ -405,7 +405,7 @@ where
                  (WAL has committed the record ; aborting so replay can reconcile)"
             );
         }
-        self.backfill_field(field);
+        self.backfill_kind(field, kind);
         Ok(())
     }
 
@@ -449,23 +449,24 @@ where
         Ok(())
     }
 
-    /// Scan the metadata store for rows that have `field`, pull the
-    /// value for each, and bulk-load every index attached to that
-    /// field. The catalog handles the broadcast to the per-field
-    /// index bundle.
-    fn backfill_field(&mut self, field: &str) {
-        let ids = self.metadata.scan_ids(|m| m.contains_key(field));
-
-        let rows: Vec<(VectorId, Value)> = ids
-            .into_iter()
-            .filter_map(|id| {
-                self.metadata
-                    .get(id)
-                    .and_then(|m| m.get(field).cloned().map(|v| (id, v)))
-            })
-            .collect();
-
-        self.catalog.populate_field(field, rows);
+    /// Bulk-load **one specific index** (of `kind` on `field`) from
+    /// the metadata store's current contents.
+    ///
+    /// Single-pass walk via [`MetadataStore::walk_field`] : one
+    /// iteration of the in-memory map, no per-row re-fetches.
+    /// Targeted insert via [`IndexCatalog::populate_kind`] : the
+    /// rows only land in the index just registered, not in
+    /// pre-existing indexes on the same field.
+    ///
+    /// Every caller (the three `add_*_index` arms, `create_index`,
+    /// and the replay-side `Record::CreateIndex` arm) knows the
+    /// kind ahead of time, so the targeted version replaces the
+    /// older broadcast-style `backfill_field` entirely.
+    fn backfill_kind(&mut self, field: &str, kind: kova_meta_index::IndexKind) {
+        let mut rows: Vec<(VectorId, Value)> = Vec::new();
+        self.metadata
+            .walk_field(field, |id, value| rows.push((id, value.clone())));
+        self.catalog.populate_kind(field, kind, rows);
     }
 
     /// Replay WAL records starting from `from` (inclusive) into the
@@ -551,8 +552,9 @@ where
                 Record::CreateIndex { name, field, kind } => {
                     // Replay-time index registration. Mirrors the
                     // live path's phase-3 apply : catalog gets the
-                    // new index, then `backfill_field` walks the
-                    // metadata store to populate it.
+                    // new index, then `backfill_kind` walks the
+                    // metadata store and populates the specific
+                    // index just registered.
                     //
                     // Backfill correctness during replay relies on
                     // every preceding `Insert` / `Delete` /
@@ -563,7 +565,7 @@ where
                     self.catalog
                         .create_named_index(&name, &field, kind)
                         .map_err(ShardError::backend)?;
-                    self.backfill_field(&field);
+                    self.backfill_kind(&field, kind);
                 }
                 Record::DropIndex { name } => {
                     self.catalog

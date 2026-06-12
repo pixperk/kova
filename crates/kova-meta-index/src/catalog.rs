@@ -258,6 +258,46 @@ impl IndexCatalog {
         }
     }
 
+    /// Targeted variant of [`Self::populate_field`] : insert each
+    /// `(id, value)` row into ONLY the index of `kind` on `field`.
+    /// Used by backfill when we know exactly which index we're
+    /// populating (every call site does — `Shard::add_*_index`
+    /// names the kind, `Shard::create_index` carries it, and the
+    /// `Record::CreateIndex` replay arm has it in the record).
+    ///
+    /// No-op when the targeted slot is empty.
+    pub fn populate_kind<I>(&mut self, field: &str, kind: IndexKind, rows: I)
+    where
+        I: IntoIterator<Item = (VectorId, Value)>,
+    {
+        let Some(fi) = self.fields.get_mut(field) else {
+            return;
+        };
+        match kind {
+            IndexKind::Hash => {
+                if let Some(h) = fi.hash.as_mut() {
+                    for (id, v) in rows {
+                        h.insert(id, &v);
+                    }
+                }
+            }
+            IndexKind::Btree => {
+                if let Some(b) = fi.btree.as_mut() {
+                    for (id, v) in rows {
+                        b.insert(id, &v);
+                    }
+                }
+            }
+            IndexKind::Inverted => {
+                if let Some(i) = fi.inverted.as_mut() {
+                    for (id, v) in rows {
+                        i.insert(id, &v);
+                    }
+                }
+            }
+        }
+    }
+
     /// Forward a row insertion to every index that watches a field
     /// present in `metadata`. Fields not in `metadata` are skipped
     /// for this row.
@@ -837,6 +877,38 @@ mod tests {
         cat.drop_hash_index("category");
         // Slot's vacant again, re-adding succeeds.
         cat.add_hash_index("category").unwrap();
+    }
+
+    #[test]
+    fn populate_kind_only_touches_targeted_index() {
+        let mut cat = IndexCatalog::new();
+        cat.add_hash_index("year").unwrap();
+        cat.add_btree_index("year").unwrap();
+
+        // Populate only the btree side.
+        cat.populate_kind(
+            "year",
+            IndexKind::Btree,
+            vec![(id(0), i(2024)), (id(1), i(2020))],
+        );
+
+        // BTree sees both rows ; hash side stays empty.
+        let range = cat
+            .lookup("year", &IndexAtom::Cmp(CmpOp::Ge, i(2020)))
+            .unwrap();
+        assert_eq!(range.len(), 2);
+
+        // Hash bucket is empty because populate_kind didn't broadcast.
+        let eq = cat.lookup("year", &IndexAtom::Eq(i(2024))).unwrap();
+        assert_eq!(eq.len(), 0);
+    }
+
+    #[test]
+    fn populate_kind_noop_for_unregistered_field() {
+        let mut cat = IndexCatalog::new();
+        // No index on "year" registered.
+        cat.populate_kind("year", IndexKind::Hash, vec![(id(0), i(2024))]);
+        assert!(!cat.has_index_on("year"));
     }
 
     #[test]
