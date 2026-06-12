@@ -8,11 +8,10 @@
 //!
 //! See [`crate::binder`] for the AST -> `LogicalStatement` conversion.
 
-use crate::ast::{CmpOp, DistanceOp, ParamRef};
+use crate::ast::{CmpOp, DistanceOp, IndexMethod, ParamRef};
 
 /// Top-level logical statement. One variant per AST statement, with
-/// the contents resolved and normalised. CREATE / DROP INDEX have no
-/// variants here because the binder rejects them in v1.
+/// the contents resolved and normalised.
 #[derive(Debug, Clone, PartialEq)]
 pub enum LogicalStatement {
     /// `SELECT ...`
@@ -27,6 +26,37 @@ pub enum LogicalStatement {
     Vacuum(LogicalVacuum),
     /// `CHECKPOINT`
     Checkpoint,
+    /// `CREATE INDEX <name> ON <table> USING <method> (<field>)`
+    CreateIndex(LogicalCreateIndex),
+    /// `DROP INDEX <name> ON <table>`
+    DropIndex(LogicalDropIndex),
+}
+
+/// CREATE INDEX statement after binding. The grammar's optional
+/// `name` slot is materialised here : an absent name is synthesised
+/// by the binder so downstream code can assume one is always set.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LogicalCreateIndex {
+    /// Resolved index name. Either the user-supplied identifier or
+    /// the binder's synthesised default.
+    pub name: String,
+    /// Target table from the `ON` clause.
+    pub table: String,
+    /// Index method (HASH / BTREE / INVERTED).
+    pub method: IndexMethod,
+    /// Indexed field name.
+    pub field: String,
+}
+
+/// DROP INDEX statement after binding. Carries the name and table
+/// through ; the executor resolves the name against the shard's
+/// catalog at execute time.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LogicalDropIndex {
+    /// Name the user asked to drop.
+    pub name: String,
+    /// Target table from the `ON` clause.
+    pub table: String,
 }
 
 /// VACUUM statement after binding. Carries the target table name

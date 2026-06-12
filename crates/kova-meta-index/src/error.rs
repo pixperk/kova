@@ -65,4 +65,21 @@ pub enum KovaMetaIndexError {
         /// Static label for the offending atom variant.
         atom_kind: &'static str,
     },
+
+    /// Attempted to create a named index whose name is already in
+    /// the catalog's name registry. DDL only ; the programmatic
+    /// `add_*_index(field)` API is anonymous and never hits this.
+    #[error("index named '{name}' already exists")]
+    IndexNameInUse {
+        /// Name the DDL asked to create.
+        name: String,
+    },
+
+    /// Attempted to drop a named index by a name that was never
+    /// registered.
+    #[error("no index named '{name}'")]
+    UnknownIndexName {
+        /// Name the DDL asked to drop.
+        name: String,
+    },
 }

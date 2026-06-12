@@ -12,9 +12,10 @@ use crate::ast::{
 };
 use crate::error::KovaQueryError;
 use crate::logical::{
-    BoundExpr, BoundLiteral, BoundProjection, FieldRef, IdHint, LogicalAssignment, LogicalDelete,
-    LogicalInsert, LogicalInsertSource, LogicalQuery, LogicalStatement, LogicalUpdate,
-    LogicalVacuum, OrderDir, OrderingSpec, PredAtom, PredicateExpr, ProjectionSpec,
+    BoundExpr, BoundLiteral, BoundProjection, FieldRef, IdHint, LogicalAssignment,
+    LogicalCreateIndex, LogicalDelete, LogicalDropIndex, LogicalInsert, LogicalInsertSource,
+    LogicalQuery, LogicalStatement, LogicalUpdate, LogicalVacuum, OrderDir, OrderingSpec, PredAtom,
+    PredicateExpr, ProjectionSpec,
 };
 
 /// Canonical INSERT column shape. v1 accepts these three names, in
@@ -37,8 +38,8 @@ pub fn bind(ast: AstStatement) -> Result<LogicalStatement, KovaQueryError> {
         AstStatement::Update(u) => bind_update(u),
         AstStatement::Delete(d) => bind_delete(d),
         AstStatement::Select(q) => bind_select(q),
-        AstStatement::CreateIndex(c) => bind_create_index(c),
-        AstStatement::DropIndex(d) => bind_drop_index(d),
+        AstStatement::CreateIndex(c) => Ok(bind_create_index(c)),
+        AstStatement::DropIndex(d) => Ok(bind_drop_index(d)),
     }
 }
 
@@ -469,22 +470,44 @@ fn bind_order_dir(d: AstOrderDir) -> OrderDir {
 // V2-only DDL
 // =========================================================================
 
-/// `CREATE INDEX` is a v2 feature ; v1 doesn't ship the index
-/// machinery (`Hash` / `BTree` / `Inverted`) or the executor support
-/// to build them. The parser accepts the syntax so v2 doesn't need a
-/// grammar change ; the binder is where the rejection lives.
-fn bind_create_index(_c: AstCreateIndex) -> Result<LogicalStatement, KovaQueryError> {
-    Err(KovaQueryError::Bind(
-        "CREATE INDEX is a v2 feature ; v1 doesn't support secondary indexes".into(),
-    ))
+/// `CREATE INDEX [name] ON <table> USING <method> (<field>)`.
+///
+/// Synthesises a default name when the user omitted one : the
+/// pattern is `idx_{field}_{method_short}` where `method_short` is
+/// `hash` / `btree` / `inv`. Anonymous-by-default would mean the
+/// catalog has nothing to register under, and DROP INDEX couldn't
+/// resolve back.
+///
+/// Field-level rejections (subscripted field name, distance-shaped
+/// pseudo-field) aren't possible at this layer because the grammar
+/// already restricts `field` in `CREATE INDEX (field)` to bare
+/// identifiers.
+fn bind_create_index(c: AstCreateIndex) -> LogicalStatement {
+    let name = c.name.unwrap_or_else(|| {
+        let short = match c.method {
+            crate::ast::IndexMethod::Hash => "hash",
+            crate::ast::IndexMethod::Btree => "btree",
+            crate::ast::IndexMethod::Inverted => "inv",
+        };
+        format!("idx_{}_{}", c.field, short)
+    });
+    LogicalStatement::CreateIndex(LogicalCreateIndex {
+        name,
+        table: c.table,
+        method: c.method,
+        field: c.field,
+    })
 }
 
-/// `DROP INDEX` is the symmetric v2-only operation. Same rejection
-/// for the same reason.
-fn bind_drop_index(_d: AstDropIndex) -> Result<LogicalStatement, KovaQueryError> {
-    Err(KovaQueryError::Bind(
-        "DROP INDEX is a v2 feature ; v1 doesn't support secondary indexes".into(),
-    ))
+/// `DROP INDEX <name> ON <table>` : no-op binder transformation,
+/// just carries the fields through. The executor resolves the name
+/// against the live catalog at execute time and errors loudly on a
+/// missing index.
+fn bind_drop_index(d: AstDropIndex) -> LogicalStatement {
+    LogicalStatement::DropIndex(LogicalDropIndex {
+        name: d.name,
+        table: d.table,
+    })
 }
 
 #[cfg(test)]
@@ -511,38 +534,56 @@ mod tests {
         assert_eq!(bind(ast).expect("bind Ok"), LogicalStatement::Checkpoint);
     }
 
-    // ----- CREATE INDEX / DROP INDEX : v2-only -----
+    // ----- CREATE INDEX / DROP INDEX -----
 
     #[test]
-    fn rejects_create_index_in_v1() {
+    fn binds_create_index_with_explicit_name() {
+        use crate::ast::IndexMethod;
         let ast = parse_str("CREATE INDEX idx ON vectors USING HASH (category)").expect("parse Ok");
-        let err = bind(ast).expect_err("expected Bind error");
-        let KovaQueryError::Bind(msg) = err else {
-            panic!("expected Bind, got {err:?}");
+        let stmt = bind(ast).unwrap();
+        let LogicalStatement::CreateIndex(c) = stmt else {
+            panic!("expected CreateIndex, got something else");
         };
-        assert!(
-            msg.contains("v2"),
-            "message should call out v2-only : {msg}"
-        );
+        assert_eq!(c.name, "idx");
+        assert_eq!(c.table, "vectors");
+        assert_eq!(c.field, "category");
+        assert_eq!(c.method, IndexMethod::Hash);
     }
 
     #[test]
-    fn rejects_create_index_without_name_in_v1() {
+    fn binds_create_index_synthesises_name_when_absent() {
+        use crate::ast::IndexMethod;
         let ast = parse_str("CREATE INDEX ON vectors USING BTREE (year)").expect("parse Ok");
-        assert!(matches!(bind(ast), Err(KovaQueryError::Bind(_))));
+        let stmt = bind(ast).unwrap();
+        let LogicalStatement::CreateIndex(c) = stmt else {
+            panic!("expected CreateIndex");
+        };
+        assert_eq!(c.name, "idx_year_btree");
+        assert_eq!(c.field, "year");
+        assert_eq!(c.method, IndexMethod::Btree);
     }
 
     #[test]
-    fn rejects_drop_index_in_v1() {
-        let ast = parse_str("DROP INDEX idx ON vectors").expect("parse Ok");
-        let err = bind(ast).expect_err("expected Bind error");
-        let KovaQueryError::Bind(msg) = err else {
-            panic!("expected Bind, got {err:?}");
+    fn binds_create_index_inverted_synthesised_name() {
+        use crate::ast::IndexMethod;
+        let ast = parse_str("CREATE INDEX ON vectors USING INVERTED (tags)").expect("parse Ok");
+        let stmt = bind(ast).unwrap();
+        let LogicalStatement::CreateIndex(c) = stmt else {
+            panic!("expected CreateIndex");
         };
-        assert!(
-            msg.contains("v2"),
-            "message should call out v2-only : {msg}"
-        );
+        assert_eq!(c.name, "idx_tags_inv");
+        assert_eq!(c.method, IndexMethod::Inverted);
+    }
+
+    #[test]
+    fn binds_drop_index() {
+        let ast = parse_str("DROP INDEX idx ON vectors").expect("parse Ok");
+        let stmt = bind(ast).unwrap();
+        let LogicalStatement::DropIndex(d) = stmt else {
+            panic!("expected DropIndex");
+        };
+        assert_eq!(d.name, "idx");
+        assert_eq!(d.table, "vectors");
     }
 
     // ----- VACUUM -----

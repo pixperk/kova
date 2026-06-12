@@ -176,6 +176,22 @@ pub enum ExecutionResult {
         /// Output rows.
         rows: Vec<Row>,
     },
+    /// CREATE INDEX completed ; the named index was registered on
+    /// `table` and backfilled from current metadata.
+    CreateIndex {
+        /// Target table the operation ran against.
+        table: String,
+        /// Name the index registered under (synthesised by the
+        /// binder when the user omitted one).
+        name: String,
+    },
+    /// DROP INDEX completed ; the named index was unregistered.
+    DropIndex {
+        /// Target table the operation ran against.
+        table: String,
+        /// Name of the index that was dropped.
+        name: String,
+    },
 }
 
 /// One output row from a SELECT result. Cell values are positional
@@ -288,7 +304,7 @@ impl<D: Distance> Engine<D> {
     // taken by value : every arm that carries payload data moves
     // fields out of the operator (the `table` strings, the `ParamRef`s,
     // etc.).
-    #[allow(clippy::needless_pass_by_value)]
+    #[allow(clippy::needless_pass_by_value, clippy::too_many_lines)]
     fn execute(
         &mut self,
         plan: PhysicalPlan,
@@ -309,6 +325,30 @@ impl<D: Distance> Engine<D> {
                     .vacuum()
                     .map_err(|e| KovaQueryError::Backend(Box::new(e)))?;
                 Ok(ExecutionResult::Vacuum { table, removed })
+            }
+            PhysicalPlan::CreateIndex {
+                table,
+                name,
+                method,
+                field,
+            } => {
+                self.assert_table(&table)?;
+                let kind = match method {
+                    crate::ast::IndexMethod::Hash => kova_meta_index::IndexKind::Hash,
+                    crate::ast::IndexMethod::Btree => kova_meta_index::IndexKind::Btree,
+                    crate::ast::IndexMethod::Inverted => kova_meta_index::IndexKind::Inverted,
+                };
+                self.shard
+                    .create_index(&name, &field, kind)
+                    .map_err(|e| KovaQueryError::Backend(Box::new(e)))?;
+                Ok(ExecutionResult::CreateIndex { table, name })
+            }
+            PhysicalPlan::DropIndex { table, name } => {
+                self.assert_table(&table)?;
+                self.shard
+                    .drop_index(&name)
+                    .map_err(|e| KovaQueryError::Backend(Box::new(e)))?;
+                Ok(ExecutionResult::DropIndex { table, name })
             }
             PhysicalPlan::InsertOne {
                 table,
@@ -1244,6 +1284,8 @@ fn physical_kind(plan: &PhysicalPlan) -> &'static str {
     match plan {
         PhysicalPlan::Checkpoint => "Checkpoint",
         PhysicalPlan::Vacuum { .. } => "Vacuum",
+        PhysicalPlan::CreateIndex { .. } => "CreateIndex",
+        PhysicalPlan::DropIndex { .. } => "DropIndex",
         PhysicalPlan::InsertOne { .. } => "InsertOne",
         PhysicalPlan::InsertMany { .. } => "InsertMany",
         PhysicalPlan::DeleteById { .. } => "DeleteById",

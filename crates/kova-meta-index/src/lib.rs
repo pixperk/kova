@@ -42,7 +42,7 @@ use roaring::RoaringTreemap;
 use serde::{Deserialize, Serialize};
 
 pub use btree::BTreeIndex;
-pub use catalog::IndexCatalog;
+pub use catalog::{IndexCatalog, IndexKind};
 pub use error::KovaMetaIndexError;
 pub use hash::HashIndex;
 pub use inverted::InvertedIndex;

@@ -13,9 +13,9 @@ use crate::ast::{CmpOp, DistanceOp, ParamRef};
 use crate::error::KovaQueryError;
 use crate::executor::ParamBindings;
 use crate::logical::{
-    BoundProjection, IdHint, LogicalAssignment, LogicalDelete, LogicalInsert, LogicalInsertSource,
-    LogicalQuery, LogicalStatement, LogicalUpdate, LogicalVacuum, OrderingSpec, PredAtom,
-    PredicateExpr, ProjectionSpec,
+    BoundProjection, IdHint, LogicalAssignment, LogicalCreateIndex, LogicalDelete,
+    LogicalDropIndex, LogicalInsert, LogicalInsertSource, LogicalQuery, LogicalStatement,
+    LogicalUpdate, LogicalVacuum, OrderingSpec, PredAtom, PredicateExpr, ProjectionSpec,
 };
 use crate::physical::PhysicalPlan;
 
@@ -98,6 +98,20 @@ pub fn plan_with_estimator<E: SelectivityEstimator>(
     match stmt {
         LogicalStatement::Checkpoint => Ok(PhysicalPlan::Checkpoint),
         LogicalStatement::Vacuum(LogicalVacuum { table }) => Ok(PhysicalPlan::Vacuum { table }),
+        LogicalStatement::CreateIndex(LogicalCreateIndex {
+            name,
+            table,
+            method,
+            field,
+        }) => Ok(PhysicalPlan::CreateIndex {
+            table,
+            name,
+            method,
+            field,
+        }),
+        LogicalStatement::DropIndex(LogicalDropIndex { name, table }) => {
+            Ok(PhysicalPlan::DropIndex { table, name })
+        }
         LogicalStatement::Insert(LogicalInsert { table, rows }) => match rows {
             LogicalInsertSource::Single {
                 id,

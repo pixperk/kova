@@ -30,6 +30,28 @@ pub enum PhysicalPlan {
         /// Target table name (validated against the engine's shard).
         table: String,
     },
+    /// Register a named secondary index on `field` of method `method`
+    /// against `table`. Dispatches to `Shard::create_index`. Returns
+    /// the index name in the result.
+    CreateIndex {
+        /// Target table (validated against the engine's shard).
+        table: String,
+        /// Resolved index name (the binder synthesises one when
+        /// the user omitted it).
+        name: String,
+        /// Index method (HASH / BTREE / INVERTED).
+        method: crate::ast::IndexMethod,
+        /// Indexed field name (top-level bag key).
+        field: String,
+    },
+    /// Drop the named secondary index on `table`. Dispatches to
+    /// `Shard::drop_index`. Returns the index name in the result.
+    DropIndex {
+        /// Target table (validated against the engine's shard).
+        table: String,
+        /// Index name as the user supplied it.
+        name: String,
+    },
     /// Single-row INSERT. Three parameter slots ; the executor
     /// resolves each one against the caller's [`crate::executor::ParamBindings`]
     /// and dispatches to `Shard::insert`.

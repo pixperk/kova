@@ -50,10 +50,31 @@ const CATALOG_FORMAT_VERSION: u32 = 1;
 /// Fixed header bytes : magic + version.
 const CATALOG_HEADER_LEN: usize = CATALOG_MAGIC.len() + std::mem::size_of::<u32>();
 
+/// Which of the three index types a particular registration refers
+/// to. Used by the named-index registry (see
+/// [`IndexCatalog::create_named_index`]) to remember what kind of
+/// index a name binds to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum IndexKind {
+    /// [`HashIndex`].
+    Hash,
+    /// [`BTreeIndex`].
+    Btree,
+    /// [`InvertedIndex`].
+    Inverted,
+}
+
 /// Catalog of meta-indexes for one shard. See [module-level docs](self).
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct IndexCatalog {
     fields: HashMap<String, FieldIndexes>,
+    /// Named-index registry, populated by DDL
+    /// (`CREATE INDEX <name> ...`). Programmatic
+    /// `add_*_index(field)` calls leave the underlying index
+    /// anonymous : they don't add an entry here. DROP INDEX by name
+    /// only resolves named entries.
+    #[serde(default)]
+    named_indexes: HashMap<String, (String, IndexKind)>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -61,6 +82,15 @@ struct FieldIndexes {
     hash: Option<HashIndex>,
     btree: Option<BTreeIndex>,
     inverted: Option<InvertedIndex>,
+}
+
+impl FieldIndexes {
+    /// True if every index type slot is empty. Used by the catalog
+    /// to garbage-collect the field entry after the last index on
+    /// it is dropped.
+    fn is_empty(&self) -> bool {
+        self.hash.is_none() && self.btree.is_none() && self.inverted.is_none()
+    }
 }
 
 impl FieldIndexes {
@@ -266,6 +296,125 @@ impl IndexCatalog {
         self.fields.keys().map(String::as_str)
     }
 
+    /// True if an index of `kind` is registered on `field`.
+    #[must_use]
+    pub fn has_kind_on(&self, field: &str, kind: IndexKind) -> bool {
+        let Some(fi) = self.fields.get(field) else {
+            return false;
+        };
+        match kind {
+            IndexKind::Hash => fi.hash.is_some(),
+            IndexKind::Btree => fi.btree.is_some(),
+            IndexKind::Inverted => fi.inverted.is_some(),
+        }
+    }
+
+    /// Register a named index in the catalog's name registry and
+    /// add the underlying index of the requested kind on `field`.
+    /// Use this when DDL gives an index a name (`CREATE INDEX foo
+    /// ON tbl (col)`) ; the programmatic
+    /// [`Self::add_hash_index`] family stays anonymous.
+    ///
+    /// # Errors
+    /// Returns [`KovaMetaIndexError::IndexNameInUse`] if `name` is
+    /// already registered.
+    ///
+    /// # Notes
+    /// Idempotent on the index layer the way the anonymous adders
+    /// are : if a hash index already exists on `field`, registering
+    /// a new name pointing at hash on the same field replaces the
+    /// underlying index with a fresh empty one. Callers that need
+    /// to preserve existing bucket state should check
+    /// [`Self::has_kind_on`] first.
+    pub fn create_named_index(
+        &mut self,
+        name: &str,
+        field: &str,
+        kind: IndexKind,
+    ) -> Result<(), KovaMetaIndexError> {
+        if self.named_indexes.contains_key(name) {
+            return Err(KovaMetaIndexError::IndexNameInUse {
+                name: name.to_string(),
+            });
+        }
+        match kind {
+            IndexKind::Hash => self.add_hash_index(field),
+            IndexKind::Btree => self.add_btree_index(field),
+            IndexKind::Inverted => self.add_inverted_index(field),
+        }
+        self.named_indexes
+            .insert(name.to_string(), (field.to_string(), kind));
+        Ok(())
+    }
+
+    /// Drop a named index : unregister `name` and remove the
+    /// underlying index of the kind it pointed to.
+    ///
+    /// # Errors
+    /// Returns [`KovaMetaIndexError::UnknownIndexName`] if `name`
+    /// was never registered.
+    pub fn drop_named_index(&mut self, name: &str) -> Result<(), KovaMetaIndexError> {
+        let Some((field, kind)) = self.named_indexes.remove(name) else {
+            return Err(KovaMetaIndexError::UnknownIndexName {
+                name: name.to_string(),
+            });
+        };
+        self.drop_kind(&field, kind);
+        Ok(())
+    }
+
+    /// Resolve a registered index name to `(field, kind)`. Returns
+    /// `None` if the name was never registered.
+    #[must_use]
+    pub fn resolve_name(&self, name: &str) -> Option<(&str, IndexKind)> {
+        self.named_indexes.get(name).map(|(f, k)| (f.as_str(), *k))
+    }
+
+    /// Iterate every (name, field, kind) the registry knows about.
+    pub fn named_index_entries(&self) -> impl Iterator<Item = (&str, &str, IndexKind)> {
+        self.named_indexes
+            .iter()
+            .map(|(n, (f, k))| (n.as_str(), f.as_str(), *k))
+    }
+
+    /// Remove the index of `kind` on `field`. Safe to call when no
+    /// such index exists (no-op). Drops the `FieldIndexes` entry
+    /// itself once every kind slot is empty so `has_index_on`
+    /// stays accurate.
+    fn drop_kind(&mut self, field: &str, kind: IndexKind) {
+        let Some(fi) = self.fields.get_mut(field) else {
+            return;
+        };
+        match kind {
+            IndexKind::Hash => fi.hash = None,
+            IndexKind::Btree => fi.btree = None,
+            IndexKind::Inverted => fi.inverted = None,
+        }
+        if fi.is_empty() {
+            self.fields.remove(field);
+        }
+    }
+
+    /// Programmatic drop of the hash index on `field`. Anonymous
+    /// counterpart to [`Self::drop_named_index`] for code paths
+    /// that registered with [`Self::add_hash_index`] and didn't
+    /// give it a name. No-op when no hash index is registered.
+    pub fn drop_hash_index(&mut self, field: &str) {
+        self.drop_kind(field, IndexKind::Hash);
+    }
+
+    /// Programmatic drop of the btree index on `field`. See
+    /// [`Self::drop_hash_index`].
+    pub fn drop_btree_index(&mut self, field: &str) {
+        self.drop_kind(field, IndexKind::Btree);
+    }
+
+    /// Programmatic drop of the inverted index on `field`. See
+    /// [`Self::drop_hash_index`].
+    pub fn drop_inverted_index(&mut self, field: &str) {
+        self.drop_kind(field, IndexKind::Inverted);
+    }
+
     /// Encode the catalog into a self-describing byte buffer :
     ///
     /// ```text
@@ -352,7 +501,7 @@ mod tests {
 
     use kova_core::{Metadata, Value, VectorId};
 
-    use super::{CATALOG_MAGIC, IndexCatalog};
+    use super::{CATALOG_MAGIC, IndexCatalog, IndexKind};
     use crate::{CmpOp, IndexAtom, KovaMetaIndexError};
 
     fn s(x: &str) -> Value {
@@ -723,6 +872,121 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("nonexistent.bin");
         assert!(IndexCatalog::load(&path).unwrap().is_none());
+    }
+
+    // ---- Named-index DDL surface ----
+
+    #[test]
+    fn create_named_index_then_lookup_works() {
+        let mut cat = IndexCatalog::new();
+        cat.create_named_index("idx_cat", "category", IndexKind::Hash)
+            .unwrap();
+        cat.on_insert(id(0), &meta(&[("category", s("docs"))]));
+
+        // The named index is reachable via the same lookup that
+        // anonymous registrations would use.
+        let bm = cat.lookup("category", &IndexAtom::Eq(s("docs"))).unwrap();
+        assert_eq!(bm.len(), 1);
+        assert!(bm.contains(0));
+
+        // The registry tracks the name.
+        assert_eq!(
+            cat.resolve_name("idx_cat"),
+            Some(("category", IndexKind::Hash))
+        );
+        assert!(cat.has_kind_on("category", IndexKind::Hash));
+    }
+
+    #[test]
+    fn create_named_index_rejects_duplicate_name() {
+        let mut cat = IndexCatalog::new();
+        cat.create_named_index("idx_a", "category", IndexKind::Hash)
+            .unwrap();
+        let err = cat
+            .create_named_index("idx_a", "tags", IndexKind::Inverted)
+            .unwrap_err();
+        assert!(
+            matches!(err, KovaMetaIndexError::IndexNameInUse { ref name } if name == "idx_a"),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn drop_named_index_unregisters_and_removes_underlying() {
+        let mut cat = IndexCatalog::new();
+        cat.create_named_index("idx_cat", "category", IndexKind::Hash)
+            .unwrap();
+        cat.on_insert(id(0), &meta(&[("category", s("docs"))]));
+        assert!(cat.has_kind_on("category", IndexKind::Hash));
+
+        cat.drop_named_index("idx_cat").unwrap();
+        assert!(cat.resolve_name("idx_cat").is_none());
+        assert!(!cat.has_kind_on("category", IndexKind::Hash));
+        // Field entry is GC'd once empty so lookup also goes to None.
+        assert!(cat.lookup("category", &IndexAtom::Eq(s("docs"))).is_none());
+    }
+
+    #[test]
+    fn drop_named_index_unknown_name_errors() {
+        let mut cat = IndexCatalog::new();
+        let err = cat.drop_named_index("nope").unwrap_err();
+        assert!(
+            matches!(err, KovaMetaIndexError::UnknownIndexName { ref name } if name == "nope"),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn drop_named_keeps_other_kinds_on_same_field() {
+        let mut cat = IndexCatalog::new();
+        cat.create_named_index("idx_eq", "year", IndexKind::Hash)
+            .unwrap();
+        cat.create_named_index("idx_range", "year", IndexKind::Btree)
+            .unwrap();
+        cat.on_insert(id(0), &meta(&[("year", i(2024))]));
+
+        cat.drop_named_index("idx_eq").unwrap();
+        // Btree on year is still there.
+        assert!(cat.has_kind_on("year", IndexKind::Btree));
+        assert!(!cat.has_kind_on("year", IndexKind::Hash));
+        // Range lookup still routes to btree.
+        let bm = cat
+            .lookup("year", &IndexAtom::Cmp(CmpOp::Ge, i(2020)))
+            .unwrap();
+        assert_eq!(bm.len(), 1);
+    }
+
+    #[test]
+    fn programmatic_drop_hash_btree_inverted() {
+        let mut cat = IndexCatalog::new();
+        cat.add_hash_index("a");
+        cat.add_btree_index("b");
+        cat.add_inverted_index("c");
+
+        cat.drop_hash_index("a");
+        cat.drop_btree_index("b");
+        cat.drop_inverted_index("c");
+
+        assert!(!cat.has_index_on("a"));
+        assert!(!cat.has_index_on("b"));
+        assert!(!cat.has_index_on("c"));
+    }
+
+    #[test]
+    fn named_index_round_trips_through_encode_decode() {
+        let mut cat = IndexCatalog::new();
+        cat.create_named_index("idx_cat", "category", IndexKind::Hash)
+            .unwrap();
+        cat.on_insert(id(0), &meta(&[("category", s("docs"))]));
+
+        let bytes = cat.encode().unwrap();
+        let back = IndexCatalog::decode(&bytes).unwrap();
+        assert_eq!(
+            back.resolve_name("idx_cat"),
+            Some(("category", IndexKind::Hash))
+        );
+        let bm = back.lookup("category", &IndexAtom::Eq(s("docs"))).unwrap();
+        assert!(bm.contains(0));
     }
 
     #[test]

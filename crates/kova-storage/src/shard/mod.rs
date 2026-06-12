@@ -44,7 +44,7 @@ use std::path::PathBuf;
 
 use kova_core::{Distance, Metadata, MetadataStore, Value, VectorId, VectorStore};
 use kova_index::{HnswIndex, HnswParams, Index, KovaIndexError};
-use kova_meta_index::IndexCatalog;
+use kova_meta_index::{IndexCatalog, IndexKind};
 use thiserror::Error;
 
 use crate::{Lsn, Record, Wal};
@@ -314,6 +314,60 @@ where
     pub fn add_inverted_index(&mut self, field: &str) {
         self.catalog.add_inverted_index(field);
         self.backfill_field(field);
+    }
+
+    /// DDL : register a **named** secondary index of `kind` on
+    /// `field` and backfill it from current metadata. The mutation
+    /// hooks ([`Self::add_hash_index`] et al.) handle live ops from
+    /// here on out.
+    ///
+    /// Distinct from the anonymous [`Self::add_hash_index`] family
+    /// in two ways :
+    ///
+    /// - The catalog remembers the `name` so
+    ///   [`Self::drop_index`] can resolve it later.
+    /// - Duplicate names are rejected loudly via
+    ///   [`KovaMetaIndexError::IndexNameInUse`].
+    ///
+    /// # Durability
+    /// Same checkpoint-gated contract as
+    /// [`Self::add_hash_index`] : the index is transient until the
+    /// next [`Self::checkpoint`].
+    ///
+    /// # Errors
+    /// Returns [`ShardError::Backend`] wrapping
+    /// [`KovaMetaIndexError::IndexNameInUse`] when `name` is
+    /// already registered in the catalog.
+    pub fn create_index(
+        &mut self,
+        name: &str,
+        field: &str,
+        kind: IndexKind,
+    ) -> Result<(), ShardError> {
+        self.catalog
+            .create_named_index(name, field, kind)
+            .map_err(ShardError::backend)?;
+        self.backfill_field(field);
+        Ok(())
+    }
+
+    /// DDL : drop the named secondary index. Removes both the name
+    /// registration and the underlying index of the kind it
+    /// pointed to.
+    ///
+    /// # Durability
+    /// Like [`Self::create_index`] : the drop only persists when
+    /// the next [`Self::checkpoint`] writes the catalog out. Before
+    /// that, a reopen still sees the index.
+    ///
+    /// # Errors
+    /// Returns [`ShardError::Backend`] wrapping
+    /// [`KovaMetaIndexError::UnknownIndexName`] when `name` was
+    /// never registered.
+    pub fn drop_index(&mut self, name: &str) -> Result<(), ShardError> {
+        self.catalog
+            .drop_named_index(name)
+            .map_err(ShardError::backend)
     }
 
     /// Scan the metadata store for rows that have `field`, pull the
