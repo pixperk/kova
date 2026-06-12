@@ -1088,6 +1088,38 @@ struct ShardEstimator<'a, D: Distance> {
 impl<D: Distance> SelectivityEstimator for ShardEstimator<'_, D> {
     fn estimate(&self, pred: &PredicateExpr, params: &ParamBindings) -> SelectivityEstimate {
         let total = self.shard.len();
+        if total == 0 {
+            return SelectivityEstimate { matches: 0, total };
+        }
+
+        // Try the catalog + stats walker. It returns a fraction
+        // by consulting `catalog.estimate` (exact) for indexed
+        // atoms, `stats.selectivity` (approximate) for atoms
+        // covered by column statistics, and composes via standard
+        // independence-assumption AND / OR / NOT formulas.
+        if let Some(s) = crate::index_eval::try_estimate_selectivity(
+            pred,
+            self.shard.catalog(),
+            self.shard.stats(),
+            total,
+            params,
+        ) {
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                clippy::cast_precision_loss
+            )]
+            let matches = (s * total as f64).round() as usize;
+            return SelectivityEstimate {
+                matches: matches.min(total),
+                total,
+            };
+        }
+
+        // Some atom in the tree had neither an index nor stats.
+        // Fall back to the existing count_matching path (which
+        // itself dispatches Full / Hybrid / Fallback via the
+        // bitmap eval).
         let matches = count_matching_with_predicate(self.shard, pred, params).unwrap_or(0);
         SelectivityEstimate { matches, total }
     }
@@ -4143,5 +4175,106 @@ mod tests {
         let est = estimator.estimate(&pred, &ParamBindings::empty());
         assert_eq!(est.total, 0);
         assert_eq!(est.matches, 0);
+    }
+
+    #[test]
+    fn estimator_uses_stats_when_no_index_but_stats_present() {
+        // Seed rows + checkpoint → stats populated for `category`.
+        // No index registered. Estimator should consult stats and
+        // return a close approximation without scanning.
+        let dir = tempdir().unwrap();
+        let shard = Shard::open(dir.path(), 4, L2, HnswParams::default()).unwrap();
+        let mut engine = Engine::new(shard, "vectors");
+        seed_categorised_rows(&mut engine, 7, 3);
+        engine.shard_mut().checkpoint().unwrap();
+
+        let pred = build_predicate_category_docs();
+        let estimator = ShardEstimator {
+            shard: engine.shard(),
+        };
+        let est = estimator.estimate(&pred, &ParamBindings::empty());
+        assert_eq!(est.total, 10);
+        // String top-K captures "docs" exactly : 7 matches expected.
+        assert_eq!(est.matches, 7);
+    }
+
+    #[test]
+    fn estimator_combines_catalog_and_stats_in_and_chain() {
+        // `category` indexed (catalog gives exact 7), `priority`
+        // not indexed but has stats (top-K gives ~5 of 10 with
+        // priority `5`).
+        // Composed via independence : 0.7 * 0.5 = 0.35 → ~3.5 → 3 or 4.
+        let dir = tempdir().unwrap();
+        let shard = Shard::open(dir.path(), 4, L2, HnswParams::default()).unwrap();
+        let mut engine = Engine::new(shard, "vectors");
+        for n in 0..10u16 {
+            let cat = if n < 7 { "docs" } else { "blog" };
+            engine
+                .execute_str(
+                    "INSERT INTO vectors (id, embedding, metadata) VALUES ($1, $2, $3)",
+                    ParamBindings::empty()
+                        .with_positional(ParamValue::Id(VectorId::new(u64::from(n))))
+                        .with_positional(ParamValue::Vector(
+                            kova_core::Vector::try_new(vec![f32::from(n), 0.0, 0.0, 0.0]).unwrap(),
+                        ))
+                        .with_positional(ParamValue::Metadata({
+                            let mut m = Metadata::new();
+                            m.insert("category".into(), Value::String(cat.into()));
+                            m.insert("priority".into(), Value::I64(i64::from(n % 2)));
+                            m
+                        })),
+                )
+                .unwrap();
+        }
+        // Register a hash index on `category` and checkpoint so
+        // stats fill in for `priority`.
+        engine
+            .execute_str(
+                "CREATE INDEX idx_cat ON vectors USING HASH (category)",
+                ParamBindings::empty(),
+            )
+            .unwrap();
+        engine.shard_mut().checkpoint().unwrap();
+
+        // Build AND : category = 'docs' AND priority = 1
+        let pred = PredicateExpr::And(vec![
+            PredicateExpr::Atom(PredAtom::Eq {
+                field: crate::logical::FieldRef::plain("category"),
+                value: BoundExpr::Literal(crate::logical::BoundLiteral::String("docs".into())),
+            }),
+            PredicateExpr::Atom(PredAtom::Eq {
+                field: crate::logical::FieldRef::plain("priority"),
+                value: BoundExpr::Literal(crate::logical::BoundLiteral::I64(1)),
+            }),
+        ]);
+        let estimator = ShardEstimator {
+            shard: engine.shard(),
+        };
+        let est = estimator.estimate(&pred, &ParamBindings::empty());
+        assert_eq!(est.total, 10);
+        // Loose bound : we just want non-degenerate behaviour.
+        // The composition can land anywhere in [1, 7] depending on
+        // how stats approximate `priority = 1`.
+        assert!(
+            est.matches > 0 && est.matches < 10,
+            "expected mid-range estimate, got {}",
+            est.matches
+        );
+    }
+
+    #[test]
+    fn estimator_returns_zero_for_false_predicate() {
+        let dir = tempdir().unwrap();
+        let shard = Shard::open(dir.path(), 4, L2, HnswParams::default()).unwrap();
+        let mut engine = Engine::new(shard, "vectors");
+        seed_categorised_rows(&mut engine, 5, 5);
+        engine.shard_mut().checkpoint().unwrap();
+
+        let estimator = ShardEstimator {
+            shard: engine.shard(),
+        };
+        let est = estimator.estimate(&PredicateExpr::False, &ParamBindings::empty());
+        assert_eq!(est.matches, 0);
+        assert_eq!(est.total, 10);
     }
 }

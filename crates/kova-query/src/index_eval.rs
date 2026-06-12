@@ -32,7 +32,7 @@
 //!   surface ; not in this slice.
 
 use kova_core::Value;
-use kova_meta_index::{CmpOp as IdxCmpOp, IndexAtom, IndexCatalog};
+use kova_meta_index::{CmpOp as IdxCmpOp, IndexAtom, IndexCatalog, StatsCatalog};
 use roaring::RoaringTreemap;
 
 use crate::ast::CmpOp as AstCmpOp;
@@ -284,6 +284,104 @@ fn intersect(prev: Option<RoaringTreemap>, next: RoaringTreemap) -> RoaringTreem
         Some(p) => p & next,
         None => next,
     }
+}
+
+// =========================================================================
+// Selectivity walker
+//
+// `try_index_eval` above produces a bitmap (used by the executor's
+// hot paths to enumerate matching ids). The walker below produces a
+// selectivity fraction in `[0.0, 1.0]` (used by the planner's
+// `ShardEstimator` to decide between plans A / B / C without
+// actually running the query).
+//
+// At each leaf the walker consults two sources :
+//
+//   1. `catalog.estimate(field, atom)` : exact count when the field
+//      is indexed. Convert to selectivity via `count / total`.
+//   2. `stats.selectivity(field, atom)` : approximate selectivity
+//      from per-column histograms / top-K / counts. Used when no
+//      index covers the atom.
+//
+// Composition at the joins :
+//
+//   - `AND` : multiply child selectivities (independence assumption)
+//   - `OR`  : `1 - product(1 - child_selectivity)` (inclusion-exclusion)
+//   - `NOT` : `1 - child_selectivity`
+//   - `True` / `False` : `1.0` / `0.0`
+//
+// Returns `None` when any leaf has neither an index nor stats for
+// its field. The caller (planner) treats `None` as "fall back to
+// `count_matching_with_predicate`," which scans.
+// =========================================================================
+
+/// Walk `pred` and produce a single `[0.0, 1.0]` selectivity, or
+/// `None` if any leaf can't be answered from catalog or stats.
+///
+/// `total` is the shard's live row count, used to convert exact
+/// catalog counts to fractions.
+#[allow(clippy::cast_precision_loss)]
+pub(crate) fn try_estimate_selectivity(
+    pred: &PredicateExpr,
+    catalog: &IndexCatalog,
+    stats: &StatsCatalog,
+    total: usize,
+    params: &ParamBindings,
+) -> Option<f64> {
+    if total == 0 {
+        return Some(0.0);
+    }
+    match pred {
+        PredicateExpr::Atom(a) => atom_selectivity(a, catalog, stats, total, params),
+        PredicateExpr::And(children) => {
+            // AND : product of child selectivities. Assumes
+            // independence between fields, which is wrong but
+            // standard ; cost model can correct with column
+            // correlations later.
+            let mut acc = 1.0_f64;
+            for child in children {
+                let s = try_estimate_selectivity(child, catalog, stats, total, params)?;
+                acc *= s;
+            }
+            Some(acc.clamp(0.0, 1.0))
+        }
+        PredicateExpr::Or(children) => {
+            // OR : `1 - product(1 - s)` ; the textbook inclusion-
+            // exclusion formula under independence.
+            let mut acc_not = 1.0_f64;
+            for child in children {
+                let s = try_estimate_selectivity(child, catalog, stats, total, params)?;
+                acc_not *= (1.0 - s).max(0.0);
+            }
+            Some((1.0 - acc_not).clamp(0.0, 1.0))
+        }
+        PredicateExpr::Not(inner) => {
+            let s = try_estimate_selectivity(inner, catalog, stats, total, params)?;
+            Some((1.0 - s).clamp(0.0, 1.0))
+        }
+        PredicateExpr::True => Some(1.0),
+        PredicateExpr::False => Some(0.0),
+    }
+}
+
+/// Per-atom selectivity : catalog first (exact), then stats
+/// (approximate), then `None` (caller scans).
+#[allow(clippy::cast_precision_loss)]
+fn atom_selectivity(
+    a: &PredAtom,
+    catalog: &IndexCatalog,
+    stats: &StatsCatalog,
+    total: usize,
+    params: &ParamBindings,
+) -> Option<f64> {
+    let (field, idx_atom) = translate_atom(a, params)?;
+    // Catalog : exact cardinality from the indexed atom.
+    if let Some(count) = catalog.estimate(field, &idx_atom) {
+        let frac = count as f64 / total as f64;
+        return Some(frac.clamp(0.0, 1.0));
+    }
+    // Stats : per-column summary.
+    stats.selectivity(field, &idx_atom)
 }
 
 #[cfg(test)]
