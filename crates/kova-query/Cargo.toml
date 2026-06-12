@@ -10,6 +10,8 @@ description = "KQL : query language for Kova. Parser, binder, planner, executor.
 [dependencies]
 kova-core = { path = "../kova-core" }
 kova-storage = { path = "../kova-storage" }
+kova-meta-index = { path = "../kova-meta-index" }
+roaring = "0.10"
 thiserror.workspace = true
 pest = "2"
 pest_derive = "2"

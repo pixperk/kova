@@ -768,33 +768,67 @@ impl<D: Distance> Engine<D> {
         params: &ParamBindings,
     ) -> Result<Vec<InternalHit>, KovaQueryError> {
         self.assert_table(table)?;
-        let mut closure_err: Option<KovaQueryError> = None;
-        let ids = self.shard.scan_metadata(|m| {
-            if closure_err.is_some() {
-                return false;
-            }
-            match eval_predicate(predicate, m, params) {
-                Ok(b) => b,
-                Err(e) => {
-                    closure_err = Some(e);
-                    false
+
+        // Ask the catalog first. Three outcomes : the full predicate
+        // is index-evaluable (Full), part of it is (Hybrid, with a
+        // residue we still evaluate per-row), or none of it is
+        // (Fallback to the scan path below).
+        let catalog = self.shard.catalog();
+        match crate::index_eval::try_index_eval(predicate, catalog, params) {
+            crate::index_eval::IndexEval::Full(bitmap) => Ok(bitmap_to_hits(&self.shard, &bitmap)),
+            crate::index_eval::IndexEval::Hybrid {
+                candidates,
+                residue,
+            } => {
+                let mut out = Vec::new();
+                for raw_id in &candidates {
+                    let id = VectorId::from(raw_id);
+                    let Some(meta) = self.shard.get_metadata(id) else {
+                        // Tombstoned between catalog snapshot and now,
+                        // or never had metadata. Either way, skip.
+                        continue;
+                    };
+                    if !eval_predicate(&residue, &meta, params)? {
+                        continue;
+                    }
+                    out.push(InternalHit {
+                        id,
+                        distance: None,
+                        metadata: meta,
+                    });
                 }
+                Ok(out)
             }
-        });
-        if let Some(e) = closure_err {
-            return Err(e);
+            crate::index_eval::IndexEval::Fallback => {
+                let mut closure_err: Option<KovaQueryError> = None;
+                let ids = self.shard.scan_metadata(|m| {
+                    if closure_err.is_some() {
+                        return false;
+                    }
+                    match eval_predicate(predicate, m, params) {
+                        Ok(b) => b,
+                        Err(e) => {
+                            closure_err = Some(e);
+                            false
+                        }
+                    }
+                });
+                if let Some(e) = closure_err {
+                    return Err(e);
+                }
+                let hits = ids
+                    .into_iter()
+                    .filter_map(|id| {
+                        self.shard.get_metadata(id).map(|metadata| InternalHit {
+                            id,
+                            distance: None,
+                            metadata,
+                        })
+                    })
+                    .collect();
+                Ok(hits)
+            }
         }
-        let hits = ids
-            .into_iter()
-            .filter_map(|id| {
-                self.shard.get_metadata(id).map(|metadata| InternalHit {
-                    id,
-                    distance: None,
-                    metadata,
-                })
-            })
-            .collect();
-        Ok(hits)
     }
 
     /// Radius-search read-path arm. Drops boundary hits when the user
@@ -1043,6 +1077,29 @@ impl<D: Distance> SelectivityEstimator for ShardEstimator<'_, D> {
             .count_matching(|m| eval_predicate(pred, m, params).unwrap_or(false));
         SelectivityEstimate { matches, total }
     }
+}
+
+/// Materialise an id bitmap (from the catalog's `lookup`) into the
+/// `Vec<InternalHit>` shape `exec_metadata_scan` returns. Drops ids
+/// the metadata store no longer has a bag for (tombstoned between
+/// the catalog state and now), so the live-id semantics match the
+/// scan path.
+fn bitmap_to_hits<D: Distance>(
+    shard: &Shard<D, MmapVectorStore, FileMetadataStore, FileWal>,
+    bitmap: &roaring::RoaringTreemap,
+) -> Vec<InternalHit> {
+    let mut out = Vec::with_capacity(usize::try_from(bitmap.len()).unwrap_or(0));
+    for raw_id in bitmap {
+        let id = VectorId::from(raw_id);
+        if let Some(meta) = shard.get_metadata(id) {
+            out.push(InternalHit {
+                id,
+                distance: None,
+                metadata: meta,
+            });
+        }
+    }
+    out
 }
 
 /// Helper for `Count` and `MetadataScan` arms : count live rows

@@ -14,6 +14,8 @@ pub mod physical;
 pub mod planner;
 pub mod printer;
 
+mod index_eval;
+
 pub use ast::AstStatement;
 pub use binder::bind;
 pub use error::KovaQueryError;

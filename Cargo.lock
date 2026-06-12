@@ -517,10 +517,12 @@ version = "0.1.0"
 dependencies = [
  "kova-core",
  "kova-index",
+ "kova-meta-index",
  "kova-storage",
  "pest",
  "pest_derive",
  "rand 0.10.1",
+ "roaring",
  "tempfile",
  "thiserror",
 ]
