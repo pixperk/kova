@@ -219,7 +219,9 @@ fn main() {
     println!("Calibrating CostCoefficients on this machine.");
     println!();
 
-    println!("[1/3] c_distance_per_dim : L2 distance loop, dim={DIM_FOR_DIST}, {DIST_SAMPLES} samples");
+    println!(
+        "[1/3] c_distance_per_dim : L2 distance loop, dim={DIM_FOR_DIST}, {DIST_SAMPLES} samples"
+    );
     let c_dist = calibrate_distance_per_dim();
     println!("       -> {c_dist:.3} ns/dim");
     println!();
