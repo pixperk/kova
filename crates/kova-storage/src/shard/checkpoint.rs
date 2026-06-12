@@ -34,6 +34,12 @@ pub(super) fn catalog_filename(snapshot_id: u64) -> String {
     format!("catalog.{snapshot_id}.bin")
 }
 
+/// Build the filename for a column-stats snapshot at the given
+/// generation. Mirrors [`catalog_filename`].
+pub(super) fn stats_filename(snapshot_id: u64) -> String {
+    format!("stats.{snapshot_id}.bin")
+}
+
 /// Read-only thresholds for the [`Shard::should_checkpoint`] hint.
 ///
 /// All fields are `Option<...>` so callers can opt into the thresholds
@@ -189,6 +195,18 @@ impl<D: Distance> Shard<D, MmapVectorStore, FileMetadataStore, FileWal> {
         })?;
         atomic_write(&new_catalog_path, &catalog_bytes).map_err(ShardError::backend)?;
 
+        // -------- Phase 3c : rebuild + serialise the column stats --------
+        // Stats are derived state, so rebuild from the post-vacuum
+        // metadata store every checkpoint. Cost is O(N) walk of the
+        // metadata HashMap ; happens once per checkpoint, not per
+        // query.
+        self.rebuild_stats();
+        let new_stats_path = dir.join(stats_filename(new_snapshot_id));
+        let stats_bytes = self.stats.encode().map_err(|e| {
+            ShardError::backend(std::io::Error::other(format!("stats encode: {e}")))
+        })?;
+        atomic_write(&new_stats_path, &stats_bytes).map_err(ShardError::backend)?;
+
         // -------- Phase 4 : commit (the single atomic point) --------
         let manifest = Manifest {
             version: 1,
@@ -211,7 +229,7 @@ impl<D: Distance> Shard<D, MmapVectorStore, FileMetadataStore, FileWal> {
         // because the manifest's `checkpoint_lsn` covers them.
         let _ = self.wal.truncate_before(Lsn::new(checkpoint_lsn.get() + 1));
 
-        // -------- Phase 6 : delete old snapshot + old catalog --------
+        // -------- Phase 6 : delete old snapshot + old catalog + old stats --------
         // Best-effort. The orphan cleanup in `Shard::open` sweeps any
         // stragglers anyway.
         if old_snapshot_id != new_snapshot_id {
@@ -219,6 +237,8 @@ impl<D: Distance> Shard<D, MmapVectorStore, FileMetadataStore, FileWal> {
             let _ = fs::remove_file(&old_path);
             let old_catalog_path = dir.join(catalog_filename(old_snapshot_id));
             let _ = fs::remove_file(&old_catalog_path);
+            let old_stats_path = dir.join(stats_filename(old_snapshot_id));
+            let _ = fs::remove_file(&old_stats_path);
         }
 
         Ok(checkpoint_lsn)

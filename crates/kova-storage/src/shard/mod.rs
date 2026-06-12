@@ -44,7 +44,7 @@ use std::path::PathBuf;
 
 use kova_core::{Distance, Metadata, MetadataStore, Value, VectorId, VectorStore};
 use kova_index::{HnswIndex, HnswParams, Index, KovaIndexError};
-use kova_meta_index::{IndexCatalog, IndexKind};
+use kova_meta_index::{IndexCatalog, IndexKind, StatsBuilder, StatsCatalog};
 use thiserror::Error;
 
 use crate::{Lsn, Record, Wal};
@@ -146,6 +146,13 @@ where
     /// [`Shard::add_inverted_index`]. Maintained synchronously in
     /// phase 3 of every mutation, after the WAL commit.
     pub(super) catalog: IndexCatalog,
+    /// Per-shard column statistics. Refreshed at checkpoint time by
+    /// walking the metadata store, persisted as
+    /// `stats.{snapshot_id}.bin` alongside the catalog file.
+    /// Consulted by the planner's `ShardEstimator` for unindexed
+    /// predicates ; stays stale between checkpoints, which is fine
+    /// for selectivity estimation.
+    pub(super) stats: StatsCatalog,
     /// Data directory, populated by [`Shard::open`] for the file-backed
     /// combo. `None` for in-memory composition (`from_parts`) ; in that
     /// case checkpoint is a no-op (nothing to write to).
@@ -202,6 +209,7 @@ where
             metadata,
             wal,
             catalog: IndexCatalog::new(),
+            stats: StatsCatalog::new(),
             // In-memory composition has no on-disk directory and no
             // checkpoint state. The file-backed `Shard::open` populates
             // these via `Self::from_parts_with_checkpoint_state` below.
@@ -221,14 +229,19 @@ where
     /// `catalog` is the secondary-index catalog loaded from
     /// `catalog.{snapshot_id}.bin`, or `None` if the file didn't
     /// exist (no checkpoint had been taken with indexes
-    /// registered). Either way, replay forwards post-checkpoint
-    /// records into the catalog so it catches up with the present.
+    /// registered). `stats` is the analogous column-stats catalog
+    /// loaded from `stats.{snapshot_id}.bin`. Either may be
+    /// `None` ; replay forwards post-checkpoint records into the
+    /// index catalog so it catches up with the present, but the
+    /// stats catalog stays at its checkpointed values until the
+    /// next checkpoint rebuilds it.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn from_parts_with_checkpoint_state(
         index: HnswIndex<D, V>,
         metadata: M,
         wal: W,
         catalog: Option<IndexCatalog>,
+        stats: Option<StatsCatalog>,
         dir: Option<PathBuf>,
         snapshot_id: u64,
         checkpoint_lsn: Lsn,
@@ -239,6 +252,7 @@ where
             metadata,
             wal,
             catalog: catalog.unwrap_or_default(),
+            stats: stats.unwrap_or_default(),
             dir,
             snapshot_id,
             checkpoint_lsn,
@@ -269,6 +283,34 @@ where
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// Read-only access to the shard's column statistics. The stats
+    /// reflect the metadata store as it was at the last successful
+    /// checkpoint ; mutations between checkpoints are not visible
+    /// here. The planner reads these for selectivity estimates on
+    /// unindexed predicates.
+    #[must_use]
+    pub fn stats(&self) -> &StatsCatalog {
+        &self.stats
+    }
+
+    /// Walk the live metadata store and rebuild the stats catalog
+    /// from scratch. Called by [`Self::checkpoint`] after vacuum so
+    /// the persisted stats reflect the post-vacuum row set.
+    ///
+    /// O(N) walk of the metadata store. For million-row shards this
+    /// takes hundreds of milliseconds ; that's a one-time cost per
+    /// checkpoint, not per query.
+    fn rebuild_stats(&mut self) {
+        let mut builder = StatsBuilder::new();
+        let ids = self.metadata.scan_ids(|_| true);
+        for id in ids {
+            if let Some(meta) = self.metadata.get(id) {
+                builder.observe(&meta);
+            }
+        }
+        self.stats = builder.finish();
     }
 
     /// Read-only access to the shard's secondary-index catalog. Use

@@ -47,7 +47,7 @@ pub use catalog::{IndexCatalog, IndexKind};
 pub use error::KovaMetaIndexError;
 pub use hash::HashIndex;
 pub use inverted::InvertedIndex;
-pub use stats::{ColumnStats, ColumnStatsKind, HistogramBucket, StatsCatalog};
+pub use stats::{ColumnStats, ColumnStatsKind, HistogramBucket, StatsBuilder, StatsCatalog};
 
 /// Comparison operator for [`IndexAtom::Cmp`].
 ///

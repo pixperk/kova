@@ -12,11 +12,11 @@ use std::path::{Path, PathBuf};
 
 use kova_core::Distance;
 use kova_index::{HnswIndex, HnswParams};
-use kova_meta_index::IndexCatalog;
+use kova_meta_index::{IndexCatalog, StatsCatalog};
 
 use crate::{FileMetadataStore, FileWal, Lsn, Manifest, MmapVectorStore};
 
-use super::checkpoint::catalog_filename;
+use super::checkpoint::{catalog_filename, stats_filename};
 use super::{DEFAULT_SEED, Shard, ShardError};
 
 impl<D: Distance> Shard<D, MmapVectorStore, FileMetadataStore, FileWal> {
@@ -108,17 +108,28 @@ impl<D: Distance> Shard<D, MmapVectorStore, FileMetadataStore, FileWal> {
                 ShardError::backend(std::io::Error::other(format!("catalog load: {e}")))
             })?;
 
+        // ---- Stats load ----
+        //
+        // Same shape as the catalog : generation-numbered, missing
+        // file means "no stats persisted yet, start empty." The
+        // planner treats an empty stats catalog as "nothing to
+        // say" and falls back to the scan path.
+        let stats = StatsCatalog::load(&dir.join(stats_filename(snapshot_id)))
+            .map_err(|e| ShardError::backend(std::io::Error::other(format!("stats load: {e}"))))?;
+
         // ---- One-shot orphan cleanup ----
-        // Best-effort ; failures are non-fatal. Sweeps stale graph
-        // AND stale catalog snapshots.
+        // Best-effort ; failures are non-fatal. Sweeps stale graph,
+        // catalog, AND stats snapshots.
         cleanup_orphan_snapshots(dir, snapshot_id);
         cleanup_orphan_catalogs(dir, snapshot_id);
+        cleanup_orphan_stats(dir, snapshot_id);
 
         Self::from_parts_with_checkpoint_state(
             index,
             metadata,
             wal,
             catalog,
+            stats,
             Some(dir.to_path_buf()),
             snapshot_id,
             checkpoint_lsn,
@@ -184,6 +195,35 @@ pub(super) fn cleanup_orphan_catalogs(dir: &Path, live_snapshot_id: u64) {
 /// other filename.
 fn parse_catalog_id(name: &str) -> Option<u64> {
     let rest = name.strip_prefix("catalog.")?;
+    let id_str = rest.strip_suffix(".bin")?;
+    id_str.parse::<u64>().ok()
+}
+
+/// Scan `dir` for `stats.{N}.bin` files where `N != live_snapshot_id`
+/// and delete them. Same shape as [`cleanup_orphan_catalogs`].
+pub(super) fn cleanup_orphan_stats(dir: &Path, live_snapshot_id: u64) {
+    let Ok(read_dir) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in read_dir.flatten() {
+        let path: PathBuf = entry.path();
+        let Some(stem) = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(parse_stats_id)
+        else {
+            continue;
+        };
+        if stem != live_snapshot_id {
+            let _ = fs::remove_file(&path);
+        }
+    }
+}
+
+/// Parse `stats.{N}.bin` into `Some(N)`. Returns `None` for any
+/// other filename.
+fn parse_stats_id(name: &str) -> Option<u64> {
+    let rest = name.strip_prefix("stats.")?;
     let id_str = rest.strip_suffix(".bin")?;
     id_str.parse::<u64>().ok()
 }
