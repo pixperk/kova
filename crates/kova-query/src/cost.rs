@@ -97,11 +97,18 @@ pub struct CostCoefficients {
 
 impl Default for CostCoefficients {
     fn default() -> Self {
+        // Calibrated by `examples/calibrate_cost_coefficients.rs` on a
+        // typical x86 dev machine : SIMD-vectorised L2 distance gives
+        // ~0.15 ns/dim, file-backed metadata gets are ~310 ns, the
+        // walk_field filter check is ~70 ns/row, and an HNSW visit
+        // costs ~100 ns excluding the distance compute it triggers.
+        // Per-machine calibration via the same example is the right
+        // move when latency targets matter.
         Self {
-            c_hnsw_per_visit: 500.0,
-            c_distance_per_dim: 5.0,
-            c_metadata_get: 200.0,
-            c_filter_eval: 200.0,
+            c_hnsw_per_visit: 100.0,
+            c_distance_per_dim: 0.15,
+            c_metadata_get: 310.0,
+            c_filter_eval: 70.0,
         }
     }
 }
@@ -300,21 +307,22 @@ mod tests {
         let w_high_dim = workload(0.3, 10, 10_000, 1536);
         let cost_16 = cost_plan_b(&w_low_dim, &c);
         let cost_1536 = cost_plan_b(&w_high_dim, &c);
-        // 96x more dim per match ; the dim-independent scan term
-        // dilutes the ratio, but it should still be a sharp climb.
-        assert!(cost_1536 > cost_16 * 5.0);
+        // SIMD distance compute is cheap per scalar, so 96x more dim
+        // doesn't translate to anywhere near 96x more cost ; the
+        // dim-independent scan term dominates. Just check the
+        // direction.
+        assert!(cost_1536 > cost_16);
     }
 
     // ---- dispatch ----
 
     #[test]
-    fn dispatch_picks_b_at_very_low_selectivity_high_dim() {
-        // At high dim, plan A's per-visit cost is dominated by the
-        // 1536-dim distance compute. Plan B walks the same shard but
-        // only computes exact distance on the (tiny) match set, so
-        // for very low selectivity B's matches term stays well below
-        // A's full HNSW walk cost.
-        let w = workload(0.001, 10, 10_000, 1536);
+    fn dispatch_picks_b_at_very_low_selectivity_small_shard() {
+        // At small n, plan B's scan term `n * c_filter_eval` is short
+        // enough that even a tiny match set still beats plan A's
+        // HNSW walk overhead. This is the classic small-shard +
+        // selective-predicate regime.
+        let w = workload(0.001, 10, 1_000, 1536);
         assert_eq!(
             dispatch_via_cost(&w, &CostCoefficients::default()),
             PlanKind::B

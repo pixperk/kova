@@ -510,18 +510,30 @@ plan-builder reexports (`internal_bench::build_plan_a/b/c`) and the
 ```text
 Confusion matrix (rows=predicted, cols=actual)
                 A      B      C
-predicted A    12      0      0
-predicted B     4     13      1
+predicted A    14      5      1
+predicted B     1      9      0
 predicted C     0      0      0
 
-Mean regret = 1.116
+Mean regret = 1.055
 ```
 
-Predicted plan A is correct 12 of 12 times. Predicted plan B is
-correct 13 of 18 times ; the 5 misses are mostly at small `n`
-where plan A would have been within 1.0-1.7x. The single plan C
-miss is at dim=128 n=1000 s=0.5 where plan C was 1.67x faster than
-the dispatched plan B.
+Five of the seven disagreement cells are within 1.02-1.25x of the
+optimal plan (i.e. the dispatched plan is fine in practice). The
+two larger misses are both at dim=1536 n=10000 at very low
+selectivity, where the model picks plan A but plan B was 1.47-1.70x
+faster ; root cause is that `c_distance_per_dim` was calibrated
+at dim=128 and the per-scalar cost climbs at dim=1536 (cache
+effects on 6 KB vectors). A multi-dim calibration curve would
+fix it ; coefficient calibration at a single dim is good enough
+for first-cut dispatch.
+
+**The journey to 1.055 :**
+
+| Stage | Mean regret | What changed |
+|---|---|---|
+| Uncalibrated, model bugs present | 2.526 | Default coefficients, starvation term, missing scan term |
+| Model bugs fixed | 1.116 | Plan A starvation dropped, plan B scan term added |
+| Plus coefficient calibration | **1.055** | Defaults replaced with values measured by `calibrate_cost_coefficients` |
 
 **Two earlier model bugs the harness surfaced :**
 
@@ -547,7 +559,38 @@ Both bugs had the same shape : the model was scoring an
 *idealised* plan, not the plan the executor actually runs. The
 harness made the gap visible by forcing each plan and comparing
 predicted to measured ; the fixes followed mechanically from the
-disagreement cells. Mean regret went from 2.526 to 1.116.
+disagreement cells.
+
+### Per-machine coefficient calibration
+
+The four `CostCoefficients` ship with defaults measured on a
+typical x86 dev machine, but the actual values matter : SIMD
+distance compute alone can vary 5-10x across CPU generations. A
+companion runner at
+[`examples/calibrate_cost_coefficients.rs`](../crates/kova-query/examples/calibrate_cost_coefficients.rs)
+microbenches each coefficient on the target machine :
+
+- `c_distance_per_dim` : direct loop of `L2::distance` with
+  `black_box`-ed inputs (1M samples at dim=128). The shipped
+  default is 0.15 ns/dim ; older or non-SIMD machines might see
+  several times higher.
+- `c_metadata_get` : direct loop of `FileMetadataStore::get` on a
+  50k-row file-backed store. Default 310 ns/get.
+- `c_filter_eval` : derived from plan B's median latency at very
+  low selectivity (where the `n * c_filter_eval` scan term
+  dominates). Default 70 ns/row.
+- `c_hnsw_per_visit` : derived from plan A's median given the
+  other three. Default 100 ns/visit.
+
+Run with :
+
+```sh
+cargo run --release --example calibrate_cost_coefficients --features internal-bench
+```
+
+The runner prints a struct literal you can paste into
+`CostCoefficients::default()`. Re-run `validate_cost_model`
+afterwards to confirm the regret drop on the target machine.
 
 ### Radius operator
 
@@ -1424,19 +1467,17 @@ persisted alongside the catalog. Estimates that are currently
 O(N) become O(log buckets) ; estimates that are currently exact
 stay exact for indexed atoms.
 
-### Per-machine coefficient calibration
+### Multi-dim distance-cost curve
 
-The cost model ships with default coefficients tuned by hand
-against a 30-cell validation grid : mean regret 1.116. The
-remaining gap is mostly in the `c_hnsw_per_visit` value, which
-overestimates plan A's per-node cost at small `n` (where the
-graph fits in L2 cache and the modelled 500 ns drops to closer to
-100-200 ns in practice). A microbenchmark runner that times
-individual HNSW visits, individual metadata fetches, and
-individual filter evaluations on the target machine would let
-each Kova deployment pin its own `CostCoefficients`. The cost
-model already takes a `CostCoefficients` parameter ; the
-calibration runner is the missing piece.
+The shipped `c_distance_per_dim` is a single number (0.15 ns/dim),
+calibrated at dim=128. Reality at dim=1536 is ~2-3x higher because
+the working set no longer fits in L1, and the vector load itself
+costs more. The model under-prices plan A at very high dim as a
+result : two of the seven validation disagreement cells live in
+that regime (1.47-1.70x regret each). A follow-up calibration
+pass that measures distance cost at several dims and fits a
+linear-or-log curve would close that gap. The closed-form cost
+plumbing already passes `dim` ; the curve is the missing piece.
 
 ### External benchmarks
 
@@ -1501,4 +1542,5 @@ delete and re-insert.
 | Printer | [`printer.rs`](../crates/kova-query/src/printer.rs) |
 | Fuzzer | [`tests/fuzz_query.rs`](../crates/kova-query/tests/fuzz_query.rs) |
 | Cost model validation | [`examples/validate_cost_model.rs`](../crates/kova-query/examples/validate_cost_model.rs) |
+| Coefficient calibration | [`examples/calibrate_cost_coefficients.rs`](../crates/kova-query/examples/calibrate_cost_coefficients.rs) |
 | Recall sweep | [`hnsw/search.rs`](../crates/kova-index/src/hnsw/search.rs) |

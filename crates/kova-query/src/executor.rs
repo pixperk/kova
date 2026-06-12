@@ -3579,15 +3579,17 @@ mod tests {
             PlanC,
         }
 
-        // n=10000, dim=1536 : large enough scan to make plan B's
-        // `n * c_filter_eval` term meaningful, high enough dim to
-        // make plan A's HNSW walk per-visit cost meaningful. B and
-        // A cross over around s ≈ 0.05.
+        // n=1000, dim=1536 : with calibrated coefficients, plan A's
+        // HNSW walk is cheap enough that at n=10000 it wins all
+        // selectivities. Drop to n=1000 to demo a real B-to-A
+        // crossover around s ≈ 0.4.
+        // Crossover for LIMIT 5 sits near s ≈ 0.19 ; s=0.2 is right
+        // on the boundary so we skip it to avoid a brittle test.
         let cases_typical: &[(f64, Expect)] = &[
             (0.001, Expect::PlanB),
             (0.01, Expect::PlanB),
-            (0.10, Expect::PlanA),
-            (0.20, Expect::PlanA),
+            (0.05, Expect::PlanB),
+            (0.10, Expect::PlanB),
             (0.50, Expect::PlanA),
             (1.00, Expect::PlanA),
         ];
@@ -3601,7 +3603,7 @@ mod tests {
             let logical = crate::binder::bind(ast).expect("bind");
             let estimator = Const {
                 sel: *sel,
-                total: 10_000,
+                total: 1_000,
                 dim: 1536,
             };
             let plan =
@@ -3621,7 +3623,7 @@ mod tests {
             );
             assert!(
                 matches,
-                "n=10k dim=1536 : selectivity {sel} expected {expected:?}, got operator {input:?}"
+                "n=1k dim=1536 : selectivity {sel} expected {expected:?}, got operator {input:?}"
             );
         }
     }

@@ -868,11 +868,14 @@ latency estimates against four per-machine coefficients
 (`c_hnsw_per_visit`, `c_distance_per_dim`, `c_metadata_get`,
 `c_filter_eval`) and the planner picks the minimum. The model
 was validated against measured runs of each plan across a
-30-cell (dim, n, selectivity) grid : **mean regret 1.116** (the
-dispatched plan is on average 1.12x slower than the actually-best
+30-cell (dim, n, selectivity) grid : **mean regret 1.055** (the
+dispatched plan is on average 1.06x slower than the actually-best
 plan ; perfect would be 1.0). The validation harness ships behind
 the `internal-bench` feature at
-[`examples/validate_cost_model.rs`](crates/kova-query/examples/validate_cost_model.rs).
+[`examples/validate_cost_model.rs`](crates/kova-query/examples/validate_cost_model.rs),
+alongside a calibration runner
+([`examples/calibrate_cost_coefficients.rs`](crates/kova-query/examples/calibrate_cost_coefficients.rs))
+that microbenches each coefficient on the target machine.
 
 ### Coverage at a glance
 
@@ -926,15 +929,17 @@ scan only for predicates neither layer recognises.
 **Cost-based dispatch, validated against measured runs.** The
 planner picks plan A / B / C by computing closed-form latency
 estimates per plan against four per-machine coefficients, then
-dispatching the cheapest. The model was calibrated by forcing
-each plan and timing it across a (dim, n, selectivity) grid ;
-two earlier mistakes surfaced and were fixed (plan A had an
-invented "retry on starvation" term the executor never pays,
-plan B was missing its full-shard scan term). Mean regret across
-the grid dropped from 2.526 to **1.116** after the fix. The
-honesty discipline is structural : the harness lives in the
-repo, anyone can re-run it on their target machine to retune
-coefficients.
+dispatching the cheapest. Two earlier model mistakes surfaced
+during validation and were fixed (plan A had an invented "retry
+on starvation" term the executor never pays, plan B was missing
+its full-shard scan term). A separate calibration runner then
+microbenches each coefficient on the target machine and prints
+a tuned `CostCoefficients` struct ; the shipped defaults come
+from that runner. Mean regret across the 30-cell grid : **2.526
+(uncalibrated, model bugs) → 1.116 (model bugs fixed) → 1.055
+(plus coefficient calibration)**. The discipline is structural :
+the harness and the calibration runner both live in the repo,
+anyone can re-run them on their own machine.
 
 **Single-id hint instead of duplicate paths.** `DELETE WHERE id = 42`
 and `DELETE WHERE id = $1` both flow through the same `LogicalDelete

@@ -1,3 +1,16 @@
+// Validation harness : cast-heavy, loop-index-heavy, by-value-PhysicalPlan.
+// These lints are appropriate for the lib but noise here.
+#![allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap,
+    clippy::needless_pass_by_value,
+    clippy::needless_range_loop,
+    clippy::doc_markdown,
+    clippy::similar_names
+)]
+
 //! Cost model validation harness.
 //!
 //! Sweeps (dim, n, selectivity) and force-runs plans A / B / C on each

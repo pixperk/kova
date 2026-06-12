@@ -35,5 +35,9 @@ harness = false
 name = "validate_cost_model"
 required-features = ["internal-bench"]
 
+[[example]]
+name = "calibrate_cost_coefficients"
+required-features = ["internal-bench"]
+
 [lints]
 workspace = true
