@@ -486,7 +486,10 @@ fn delete_round_trip(sql: &str, params: ParamBindings, index_setup: fn(&mut Engi
 
     assert_eq!(del_a, del_b, "delete count diverged for: {sql}");
     assert_eq!(surv_a, surv_b, "survivor set diverged for: {sql}");
-    assert!(del_a > 0, "fixture should delete a non-zero count for {sql}");
+    assert!(
+        del_a > 0,
+        "fixture should delete a non-zero count for {sql}"
+    );
 }
 
 #[test]
@@ -565,8 +568,14 @@ fn update_round_trip(
     let (upd_b, after_b) = update_and_after_set(&mut engine_b, update_sql, follow_up_sql, params);
 
     assert_eq!(upd_a, upd_b, "update count diverged for: {update_sql}");
-    assert_eq!(after_a, after_b, "post-update id set diverged for: {update_sql}");
-    assert!(upd_a > 0, "fixture should update a non-zero count for {update_sql}");
+    assert_eq!(
+        after_a, after_b,
+        "post-update id set diverged for: {update_sql}"
+    );
+    assert!(
+        upd_a > 0,
+        "fixture should update a non-zero count for {update_sql}"
+    );
 }
 
 #[test]
