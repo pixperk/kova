@@ -587,22 +587,7 @@ impl<D: Distance> Engine<D> {
         params: &ParamBindings,
     ) -> Result<ExecutionResult, KovaQueryError> {
         self.assert_table(table)?;
-        let mut closure_err: Option<KovaQueryError> = None;
-        let ids = self.shard.scan_metadata(|m| {
-            if closure_err.is_some() {
-                return false;
-            }
-            match eval_predicate(predicate, m, params) {
-                Ok(b) => b,
-                Err(e) => {
-                    closure_err = Some(e);
-                    false
-                }
-            }
-        });
-        if let Some(e) = closure_err {
-            return Err(e);
-        }
+        let ids = ids_matching(&self.shard, predicate, params)?;
         let staged = self.build_updates_from_ids(&ids, assignments, params)?;
         let written = self
             .shard
@@ -730,22 +715,7 @@ impl<D: Distance> Engine<D> {
         params: &ParamBindings,
     ) -> Result<ExecutionResult, KovaQueryError> {
         self.assert_table(table)?;
-        let mut closure_err: Option<KovaQueryError> = None;
-        let ids = self.shard.scan_metadata(|m| {
-            if closure_err.is_some() {
-                return false;
-            }
-            match eval_predicate(predicate, m, params) {
-                Ok(b) => b,
-                Err(e) => {
-                    closure_err = Some(e);
-                    false
-                }
-            }
-        });
-        if let Some(e) = closure_err {
-            return Err(e);
-        }
+        let ids = ids_matching(&self.shard, predicate, params)?;
         let deleted = self
             .shard
             .delete_many(ids)
@@ -1102,31 +1072,116 @@ fn bitmap_to_hits<D: Distance>(
     out
 }
 
-/// Helper for `Count` and `MetadataScan` arms : count live rows
-/// matching a predicate, propagating any predicate-evaluation error
-/// instead of silently dropping rows.
+/// Helper for `Count` : count live rows matching a predicate. Asks
+/// the catalog first ; Full hits return cardinality in O(1) without
+/// touching any metadata bag, Hybrid hits walk only the indexed
+/// candidates and evaluate the residue per-row, Fallback runs the
+/// original closure-driven scan.
 fn count_matching_with_predicate<D: Distance>(
     shard: &Shard<D, MmapVectorStore, FileMetadataStore, FileWal>,
     pred: &PredicateExpr,
     params: &ParamBindings,
 ) -> Result<usize, KovaQueryError> {
-    let mut closure_err: Option<KovaQueryError> = None;
-    let count = shard.count_matching(|m| {
-        if closure_err.is_some() {
-            return false;
+    match crate::index_eval::try_index_eval(pred, shard.catalog(), params) {
+        crate::index_eval::IndexEval::Full(bitmap) => {
+            // Catalog tracks every mutation synchronously, so the
+            // bitmap's cardinality IS the exact count of live
+            // matching rows. No per-row work needed.
+            Ok(usize::try_from(bitmap.len()).unwrap_or(usize::MAX))
         }
-        match eval_predicate(pred, m, params) {
-            Ok(b) => b,
-            Err(e) => {
-                closure_err = Some(e);
-                false
+        crate::index_eval::IndexEval::Hybrid {
+            candidates,
+            residue,
+        } => {
+            let mut count: usize = 0;
+            for raw_id in &candidates {
+                let id = VectorId::from(raw_id);
+                let Some(meta) = shard.get_metadata(id) else {
+                    continue;
+                };
+                if eval_predicate(&residue, &meta, params)? {
+                    count += 1;
+                }
             }
+            Ok(count)
         }
-    });
-    if let Some(e) = closure_err {
-        return Err(e);
+        crate::index_eval::IndexEval::Fallback => {
+            let mut closure_err: Option<KovaQueryError> = None;
+            let count = shard.count_matching(|m| {
+                if closure_err.is_some() {
+                    return false;
+                }
+                match eval_predicate(pred, m, params) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        closure_err = Some(e);
+                        false
+                    }
+                }
+            });
+            if let Some(e) = closure_err {
+                return Err(e);
+            }
+            Ok(count)
+        }
     }
-    Ok(count)
+}
+
+/// Helper for the predicate-driven write paths
+/// (DELETE-by-predicate, UPDATE-by-predicate) : produce the live id
+/// set the predicate matches. Same three-way dispatch as
+/// [`count_matching_with_predicate`] ; the difference is the return
+/// type. Full hits materialise the bitmap into a `Vec<VectorId>`,
+/// Hybrid hits iterate candidates and residue-filter, Fallback runs
+/// the closure-driven `scan_metadata` path.
+fn ids_matching<D: Distance>(
+    shard: &Shard<D, MmapVectorStore, FileMetadataStore, FileWal>,
+    pred: &PredicateExpr,
+    params: &ParamBindings,
+) -> Result<Vec<VectorId>, KovaQueryError> {
+    match crate::index_eval::try_index_eval(pred, shard.catalog(), params) {
+        crate::index_eval::IndexEval::Full(bitmap) => {
+            // Bitmap holds only live ids the indexes have observed,
+            // matching the predicate exactly. Materialise to the
+            // shape `delete_many` / `update_metadata` expect.
+            Ok(bitmap.iter().map(VectorId::from).collect())
+        }
+        crate::index_eval::IndexEval::Hybrid {
+            candidates,
+            residue,
+        } => {
+            let mut out = Vec::new();
+            for raw_id in &candidates {
+                let id = VectorId::from(raw_id);
+                let Some(meta) = shard.get_metadata(id) else {
+                    continue;
+                };
+                if eval_predicate(&residue, &meta, params)? {
+                    out.push(id);
+                }
+            }
+            Ok(out)
+        }
+        crate::index_eval::IndexEval::Fallback => {
+            let mut closure_err: Option<KovaQueryError> = None;
+            let ids = shard.scan_metadata(|m| {
+                if closure_err.is_some() {
+                    return false;
+                }
+                match eval_predicate(pred, m, params) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        closure_err = Some(e);
+                        false
+                    }
+                }
+            });
+            if let Some(e) = closure_err {
+                return Err(e);
+            }
+            Ok(ids)
+        }
+    }
 }
 
 /// Borrowed bundle of the radius-shape fields shared between the

@@ -345,3 +345,260 @@ fn no_match_on_indexed_field_returns_empty() {
     };
     assert!(rows.is_empty());
 }
+
+// ---- COUNT round-trip ----
+
+/// Extract a `COUNT(*)` result as `i64`.
+fn count_value(result: ExecutionResult) -> i64 {
+    let ExecutionResult::Rows { rows, .. } = result else {
+        panic!("expected Rows, got {result:?}");
+    };
+    assert_eq!(rows.len(), 1, "COUNT must return exactly one row");
+    let RowValue::Field(Value::I64(n)) = &rows[0].values[0] else {
+        panic!("expected I64 count cell, got {:?}", rows[0].values[0]);
+    };
+    *n
+}
+
+/// Run the same COUNT query with and without indexes registered.
+/// Assert the count is identical.
+fn count_round_trip(sql: &str, params: ParamBindings, index_setup: fn(&mut Engine<L2>)) {
+    let dir_a = tempdir().unwrap();
+    let mut engine_a = Engine::new(open_shard(dir_a.path()), "vectors");
+    seed(&mut engine_a);
+    let a = count_value(engine_a.execute_str(sql, params.clone()).unwrap());
+
+    let dir_b = tempdir().unwrap();
+    let mut engine_b = Engine::new(open_shard(dir_b.path()), "vectors");
+    seed(&mut engine_b);
+    index_setup(&mut engine_b);
+    let b = count_value(engine_b.execute_str(sql, params).unwrap());
+
+    assert_eq!(a, b, "scan path vs index path diverged for COUNT: {sql}");
+    assert!(a > 0, "fixture should produce non-zero count for {sql}");
+}
+
+#[test]
+fn count_eq_on_hash_index_matches_fallback() {
+    count_round_trip(
+        "SELECT COUNT(*) FROM vectors WHERE category = 'docs'",
+        ParamBindings::empty(),
+        install_hash_on_category,
+    );
+}
+
+#[test]
+fn count_range_on_btree_index_matches_fallback() {
+    count_round_trip(
+        "SELECT COUNT(*) FROM vectors WHERE year >= 2024",
+        ParamBindings::empty(),
+        install_btree_on_year,
+    );
+}
+
+#[test]
+fn count_array_contains_on_inverted_index_matches_fallback() {
+    count_round_trip(
+        "SELECT COUNT(*) FROM vectors WHERE tags @> 'rust'",
+        ParamBindings::empty(),
+        install_inverted_on_tags,
+    );
+}
+
+#[test]
+fn count_and_chain_full_path_matches_fallback() {
+    count_round_trip(
+        "SELECT COUNT(*) FROM vectors WHERE category = 'docs' AND year >= 2022 AND tags @> 'rust'",
+        ParamBindings::empty(),
+        install_all_three,
+    );
+}
+
+#[test]
+fn count_hybrid_path_matches_fallback() {
+    // year indexed ; category isn't -> Hybrid in the count helper.
+    count_round_trip(
+        "SELECT COUNT(*) FROM vectors WHERE year > 2022 AND category = 'docs'",
+        ParamBindings::empty(),
+        install_btree_on_year,
+    );
+}
+
+#[test]
+fn count_no_predicate_unchanged_with_indexes() {
+    // `COUNT(*)` with no WHERE goes through `shard.len()` directly,
+    // not through count_matching_with_predicate. The index install
+    // is a no-op for this path ; we test it anyway to pin the
+    // behaviour against future refactors.
+    count_round_trip(
+        "SELECT COUNT(*) FROM vectors",
+        ParamBindings::empty(),
+        install_all_three,
+    );
+}
+
+// ---- DELETE-by-predicate round-trip ----
+
+/// Extract a DELETE result as the deleted count + the surviving id
+/// set (via a follow-up SELECT). Returns `(deleted_count,
+/// surviving_ids)`.
+fn delete_and_survivors(
+    engine: &mut Engine<L2>,
+    delete_sql: &str,
+    params: ParamBindings,
+) -> (u64, BTreeSet<u64>) {
+    let result = engine.execute_str(delete_sql, params).unwrap();
+    let ExecutionResult::Delete { deleted, .. } = result else {
+        panic!("expected Delete result, got {result:?}");
+    };
+    let survivors = id_set(
+        engine
+            .execute_str(
+                "SELECT id FROM vectors WHERE id IS NOT NULL LIMIT 1000",
+                ParamBindings::empty(),
+            )
+            .unwrap_or_else(|_| {
+                // `id IS NOT NULL` isn't a thing ; use a scan-and-limit
+                // bypass via a different shape. We fall back to walking
+                // every id by listing all categories the fixture knows.
+                engine
+                    .execute_str(
+                        "SELECT id FROM vectors WHERE category IN ('docs', 'blog') LIMIT 1000",
+                        ParamBindings::empty(),
+                    )
+                    .unwrap()
+            }),
+    );
+    (deleted, survivors)
+}
+
+fn delete_round_trip(sql: &str, params: ParamBindings, index_setup: fn(&mut Engine<L2>)) {
+    let dir_a = tempdir().unwrap();
+    let mut engine_a = Engine::new(open_shard(dir_a.path()), "vectors");
+    seed(&mut engine_a);
+    let (del_a, surv_a) = delete_and_survivors(&mut engine_a, sql, params.clone());
+
+    let dir_b = tempdir().unwrap();
+    let mut engine_b = Engine::new(open_shard(dir_b.path()), "vectors");
+    seed(&mut engine_b);
+    index_setup(&mut engine_b);
+    let (del_b, surv_b) = delete_and_survivors(&mut engine_b, sql, params);
+
+    assert_eq!(del_a, del_b, "delete count diverged for: {sql}");
+    assert_eq!(surv_a, surv_b, "survivor set diverged for: {sql}");
+    assert!(del_a > 0, "fixture should delete a non-zero count for {sql}");
+}
+
+#[test]
+fn delete_eq_on_hash_index_matches_fallback() {
+    delete_round_trip(
+        "DELETE FROM vectors WHERE category = 'docs'",
+        ParamBindings::empty(),
+        install_hash_on_category,
+    );
+}
+
+#[test]
+fn delete_range_on_btree_index_matches_fallback() {
+    delete_round_trip(
+        "DELETE FROM vectors WHERE year >= 2024",
+        ParamBindings::empty(),
+        install_btree_on_year,
+    );
+}
+
+#[test]
+fn delete_and_chain_full_path_matches_fallback() {
+    delete_round_trip(
+        "DELETE FROM vectors WHERE category = 'blog' AND year < 2023",
+        ParamBindings::empty(),
+        |e| {
+            e.shard_mut().add_hash_index("category");
+            e.shard_mut().add_btree_index("year");
+        },
+    );
+}
+
+#[test]
+fn delete_hybrid_path_matches_fallback() {
+    delete_round_trip(
+        "DELETE FROM vectors WHERE year < 2023 AND category = 'docs'",
+        ParamBindings::empty(),
+        install_btree_on_year,
+    );
+}
+
+// ---- UPDATE-by-predicate round-trip ----
+
+/// After an UPDATE, query the rows where the assigned value lives
+/// and return their id set. Tests that the right ids got mutated.
+fn update_and_after_set(
+    engine: &mut Engine<L2>,
+    update_sql: &str,
+    follow_up_sql: &str,
+    params: ParamBindings,
+) -> (u64, BTreeSet<u64>) {
+    let result = engine.execute_str(update_sql, params.clone()).unwrap();
+    let ExecutionResult::Update { updated, .. } = result else {
+        panic!("expected Update result, got {result:?}");
+    };
+    let after = id_set(engine.execute_str(follow_up_sql, params).unwrap());
+    (updated, after)
+}
+
+fn update_round_trip(
+    update_sql: &str,
+    follow_up_sql: &str,
+    params: ParamBindings,
+    index_setup: fn(&mut Engine<L2>),
+) {
+    let dir_a = tempdir().unwrap();
+    let mut engine_a = Engine::new(open_shard(dir_a.path()), "vectors");
+    seed(&mut engine_a);
+    let (upd_a, after_a) =
+        update_and_after_set(&mut engine_a, update_sql, follow_up_sql, params.clone());
+
+    let dir_b = tempdir().unwrap();
+    let mut engine_b = Engine::new(open_shard(dir_b.path()), "vectors");
+    seed(&mut engine_b);
+    index_setup(&mut engine_b);
+    let (upd_b, after_b) = update_and_after_set(&mut engine_b, update_sql, follow_up_sql, params);
+
+    assert_eq!(upd_a, upd_b, "update count diverged for: {update_sql}");
+    assert_eq!(after_a, after_b, "post-update id set diverged for: {update_sql}");
+    assert!(upd_a > 0, "fixture should update a non-zero count for {update_sql}");
+}
+
+#[test]
+fn update_eq_on_hash_index_matches_fallback() {
+    update_round_trip(
+        // Update : reassign category for all blogs to a fresh value.
+        "UPDATE vectors SET category = 'updated' WHERE category = 'blog'",
+        // Follow-up : list ids that now have category = 'updated'.
+        "SELECT id FROM vectors WHERE category = 'updated' LIMIT 100",
+        ParamBindings::empty(),
+        install_hash_on_category,
+    );
+}
+
+#[test]
+fn update_range_on_btree_index_matches_fallback() {
+    update_round_trip(
+        "UPDATE vectors SET priority = 9 WHERE year >= 2024",
+        // priority isn't a fixture field ; use scan-and-limit via the
+        // year predicate to recover the affected ids.
+        "SELECT id FROM vectors WHERE year >= 2024 LIMIT 100",
+        ParamBindings::empty(),
+        install_btree_on_year,
+    );
+}
+
+#[test]
+fn update_hybrid_path_matches_fallback() {
+    update_round_trip(
+        "UPDATE vectors SET reviewed = 1 WHERE year >= 2023 AND category = 'docs'",
+        "SELECT id FROM vectors WHERE year >= 2023 AND category = 'docs' LIMIT 100",
+        ParamBindings::empty(),
+        install_btree_on_year,
+    );
+}
