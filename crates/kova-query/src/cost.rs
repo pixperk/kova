@@ -43,10 +43,14 @@
 //!
 //! ## What this model captures
 //!
-//! - Plan A's overfetch starvation when `selectivity * k_eff < k`,
-//!   modelled as `k_eff = max(k * overfetch, k / s)`.
-//! - Plan B's linear-in-matches distance compute cost, dominant
-//!   when dim is high.
+//! - Plan A's fixed overfetch cost. The executor walks the HNSW for
+//!   exactly `k * KNN_OVERFETCH` candidates and returns however
+//!   many survive post-filter, possibly fewer than `k`. This is a
+//!   recall trade-off, not a latency one, so cost A is independent
+//!   of selectivity.
+//! - Plan B's full-shard metadata scan plus linear-in-matches
+//!   distance compute. Dominant scan term `n * c_filter_eval` is
+//!   what makes plan B expensive at large `n`.
 //! - Plan C's filter overhead per visit, with visit count scaling
 //!   by `1/s` (worst-case linear filter rejection rate).
 //!
@@ -155,40 +159,38 @@ fn hnsw_visits(k: usize, n: usize) -> f64 {
 
 /// Cost of plan A : overfetched kNN + post-filter.
 ///
-/// The overfetch is `k * KNN_OVERFETCH`. When selectivity is low
-/// enough that the overfetch can't deliver `k` survivors, `k_eff`
-/// grows to `k / selectivity` (the model's retry estimate).
+/// The executor walks the HNSW for exactly `k * KNN_OVERFETCH`
+/// candidates, post-filters them, and returns whatever survives.
+/// No retry on starvation : if selectivity is low, the result set
+/// may be smaller than `k`. That is a recall trade-off the planner
+/// surfaces separately ; cost A is independent of selectivity.
 #[must_use]
 pub fn cost_plan_a(w: &Workload, c: &CostCoefficients) -> f64 {
-    let overfetch = (w.user_k * KNN_OVERFETCH) as f64;
-    let k_eff = if w.selectivity > 0.0 {
-        // Need at least k / s candidates to find k matches.
-        let by_retry = w.user_k as f64 / w.selectivity;
-        overfetch.max(by_retry)
-    } else {
-        overfetch
-    };
-    // Cap k_eff at the shard size : we can't ask for more
-    // candidates than exist.
-    let k_eff = k_eff.min(w.total_rows as f64).max(1.0);
+    let overfetch = ((w.user_k * KNN_OVERFETCH) as f64)
+        .min(w.total_rows as f64)
+        .max(1.0);
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let visits = hnsw_visits(k_eff as usize, w.total_rows);
+    let visits = hnsw_visits(overfetch as usize, w.total_rows);
     let per_visit = c.c_hnsw_per_visit + c.c_distance_per_dim * w.dim as f64;
     let walk = visits * per_visit;
-    let post_filter = k_eff * (c.c_metadata_get + c.c_filter_eval);
+    let post_filter = overfetch * (c.c_metadata_get + c.c_filter_eval);
     walk + post_filter
 }
 
-/// Cost of plan B : iterate matching ids, exact distance per match.
+/// Cost of plan B : metadata scan + exact distance on matches.
 ///
-/// Assumes the catalog gives the matching id set in O(1) (the
-/// `try_index_eval` `Full` case) ; otherwise the upstream scan
-/// cost would be modelled separately.
+/// The scan walks all `n` rows of the metadata store, paying
+/// `c_filter_eval` per row to test the predicate (the
+/// `walk_field` path is field-targeted, so we skip the full bag
+/// fetch on non-matching rows). For matching rows, we then fetch
+/// the bag and compute exact distance against the query vector.
 #[must_use]
 pub fn cost_plan_b(w: &Workload, c: &CostCoefficients) -> f64 {
-    let matches = (w.selectivity * w.total_rows as f64).max(1.0);
+    let n = w.total_rows as f64;
+    let scan = n * c.c_filter_eval;
+    let matches = (w.selectivity * n).max(1.0);
     let per_match = c.c_metadata_get + c.c_distance_per_dim * w.dim as f64;
-    matches * per_match
+    scan + matches * per_match
 }
 
 /// Cost of plan C : filtered HNSW walk.
@@ -242,29 +244,42 @@ mod tests {
     // ---- cost functions ----
 
     #[test]
-    fn cost_plan_b_grows_linearly_in_selectivity() {
+    fn cost_plan_b_grows_with_selectivity() {
         let c = CostCoefficients::default();
         let w_low = workload(0.1, 10, 10_000, 16);
         let w_high = workload(0.5, 10, 10_000, 16);
         let cost_low = cost_plan_b(&w_low, &c);
         let cost_high = cost_plan_b(&w_high, &c);
-        // 5x more matches → 5x more cost.
-        assert!((cost_high / cost_low - 5.0).abs() < 0.01);
+        // Both pay the same scan term ; the matches term grows by 5x
+        // so total cost grows but by less than 5x.
+        assert!(cost_high > cost_low);
+        assert!(cost_high < cost_low * 5.0);
     }
 
     #[test]
-    fn cost_plan_a_grows_with_low_selectivity_retry() {
+    fn cost_plan_a_independent_of_selectivity() {
         let c = CostCoefficients::default();
         let w_mid = workload(0.5, 10, 10_000, 16);
         let w_tight = workload(0.05, 10, 10_000, 16);
-        // Tight predicate → k_eff = k/s = 200, much bigger than
-        // the overfetch=40 baseline, so visits grow.
+        // Plan A's overfetch is fixed at `k * KNN_OVERFETCH` ; the
+        // executor returns however many candidates survive the
+        // post-filter. Cost should not depend on selectivity.
         let cost_mid = cost_plan_a(&w_mid, &c);
         let cost_tight = cost_plan_a(&w_tight, &c);
-        assert!(
-            cost_tight > cost_mid,
-            "tight predicate should be more expensive"
-        );
+        assert!((cost_mid - cost_tight).abs() < 0.01);
+    }
+
+    #[test]
+    fn cost_plan_b_includes_scan_term() {
+        let c = CostCoefficients::default();
+        // At very low selectivity, the scan term dominates : cost
+        // should be roughly n * c_filter_eval regardless of how
+        // few matches there are.
+        let w = workload(0.0001, 10, 100_000, 16);
+        let cost = cost_plan_b(&w, &c);
+        let scan_only = 100_000.0 * c.c_filter_eval;
+        // Within 10% of pure scan cost (one match adds negligible).
+        assert!((cost / scan_only - 1.0).abs() < 0.1);
     }
 
     #[test]
@@ -285,18 +300,21 @@ mod tests {
         let w_high_dim = workload(0.3, 10, 10_000, 1536);
         let cost_16 = cost_plan_b(&w_low_dim, &c);
         let cost_1536 = cost_plan_b(&w_high_dim, &c);
-        // 96x more dimensions → way more cost.
-        assert!(cost_1536 > cost_16 * 10.0);
+        // 96x more dim per match ; the dim-independent scan term
+        // dilutes the ratio, but it should still be a sharp climb.
+        assert!(cost_1536 > cost_16 * 5.0);
     }
 
     // ---- dispatch ----
 
     #[test]
-    fn dispatch_picks_b_at_very_low_selectivity_typical_workload() {
-        // Tiny match set : plan B's `matches * dim_cost` is cheap,
-        // plan A's HNSW walk is wasted on candidates that mostly
-        // fail the filter.
-        let w = workload(0.001, 10, 10_000, 16);
+    fn dispatch_picks_b_at_very_low_selectivity_high_dim() {
+        // At high dim, plan A's per-visit cost is dominated by the
+        // 1536-dim distance compute. Plan B walks the same shard but
+        // only computes exact distance on the (tiny) match set, so
+        // for very low selectivity B's matches term stays well below
+        // A's full HNSW walk cost.
+        let w = workload(0.001, 10, 10_000, 1536);
         assert_eq!(
             dispatch_via_cost(&w, &CostCoefficients::default()),
             PlanKind::B
@@ -315,16 +333,17 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_picks_c_at_high_dim_moderate_selectivity() {
-        // The case the cost model surfaces that hardcoded bands
-        // miss : at dim=1536, plan B's distance compute dominates,
-        // plan A's overfetch retries are expensive ; plan C threads
-        // a smaller visit budget through the index with cheap
-        // filter eval per node.
+    fn dispatch_picks_a_at_high_dim_low_selectivity_large_n() {
+        // With the starvation term removed, plan A's HNSW walk is
+        // cheap even at very low selectivity : the executor just
+        // returns however many candidates pass the post-filter.
+        // At n=1M, plan B's scan term `n * c_filter_eval` makes it
+        // expensive ; plan C's filter overhead at low s is worse
+        // still. Plan A wins.
         let w = workload(0.02, 10, 1_000_000, 1536);
         assert_eq!(
             dispatch_via_cost(&w, &CostCoefficients::default()),
-            PlanKind::C
+            PlanKind::A
         );
     }
 

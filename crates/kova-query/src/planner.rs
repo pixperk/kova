@@ -759,3 +759,54 @@ fn reject_or_with_distance_threshold(pred: &PredicateExpr) -> Result<(), KovaQue
     }
     walk(pred)
 }
+
+/// Public wrappers around the private plan builders, gated behind
+/// the `internal-bench` feature. The cost model validation example
+/// uses these to force a specific plan shape without going through
+/// `dispatch_knn_plan`. Not part of the normal-build public API.
+#[cfg(feature = "internal-bench")]
+pub mod internal_bench {
+    use super::{
+        DistanceOp, ParamRef, PhysicalPlan, PredicateExpr, build_plan_a as inner_a,
+        build_plan_b as inner_b, build_plan_c as inner_c,
+    };
+
+    /// Plan A : overfetched kNN with optional post-filter.
+    #[must_use]
+    pub fn build_plan_a(
+        table: String,
+        query: ParamRef,
+        metric: DistanceOp,
+        user_k: usize,
+        post_filter: Option<PredicateExpr>,
+        user_limit: u64,
+    ) -> PhysicalPlan {
+        inner_a(table, query, metric, user_k, post_filter, user_limit)
+    }
+
+    /// Plan B : metadata scan + exact distance + limit.
+    #[must_use]
+    pub fn build_plan_b(
+        table: String,
+        predicate: PredicateExpr,
+        query: ParamRef,
+        metric: DistanceOp,
+        user_k: usize,
+        user_limit: u64,
+    ) -> PhysicalPlan {
+        inner_b(table, predicate, query, metric, user_k, user_limit)
+    }
+
+    /// Plan C : filtered HNSW walk + limit.
+    #[must_use]
+    pub fn build_plan_c(
+        table: String,
+        filter: PredicateExpr,
+        query: ParamRef,
+        metric: DistanceOp,
+        user_k: usize,
+        user_limit: u64,
+    ) -> PhysicalPlan {
+        inner_c(table, filter, query, metric, user_k, user_limit)
+    }
+}

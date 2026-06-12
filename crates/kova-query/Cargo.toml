@@ -16,6 +16,11 @@ thiserror.workspace = true
 pest = "2"
 pest_derive = "2"
 
+[features]
+# Exposes plan A/B/C builders and Engine::execute_plan for the
+# cost model validation example. Off in normal builds.
+internal-bench = []
+
 [dev-dependencies]
 kova-index = { path = "../kova-index" }
 tempfile = "3"
@@ -25,6 +30,10 @@ criterion = "0.5"
 [[bench]]
 name = "meta_index"
 harness = false
+
+[[example]]
+name = "validate_cost_model"
+required-features = ["internal-bench"]
 
 [lints]
 workspace = true

@@ -374,58 +374,180 @@ the read side.
 flowchart TD
     Q["SELECT with kNN ORDER BY<br/>and a WHERE predicate"]
     Q -.-> Est["SelectivityEstimator<br/>fraction = matches / total"]
-    Est -.-> Branch{"selectivity<br/>fraction"}
-    Branch -. "tight, below 0.05" .-> B["Plan B<br/>MetadataScan, then<br/>ExactDistance on the small set<br/>(bypasses ANN entirely)"]
-    Branch -. "middle, 0.05 to 0.5" .-> C["Plan C<br/>FilteredKnnSearch<br/>predicate INSIDE the HNSW walk"]
-    Branch -. "loose, 0.5 or higher" .-> A["Plan A<br/>KnnSearch with k * 4 overfetch<br/>plus a cheap post_filter"]
+    Est -.-> Cost["Cost model<br/>cost_plan_a/b/c"]
+    Cost -.-> Pick{"argmin"}
+    Pick -.-> B["Plan B<br/>MetadataScan, then<br/>ExactDistance on the small set<br/>(bypasses ANN entirely)"]
+    Pick -.-> C["Plan C<br/>FilteredKnnSearch<br/>predicate INSIDE the HNSW walk"]
+    Pick -.-> A["Plan A<br/>KnnSearch with k * 4 overfetch<br/>plus a cheap post_filter"]
 ```
 
-Three strategies, chosen by **estimated predicate selectivity**.
+Three strategies, chosen by a **closed-form cost model** that
+computes a predicted latency per plan and dispatches the cheapest.
 
 **Plan A : overfetched kNN + post-filter.** Run an unfiltered kNN
 with `k = user_limit * 4`, then walk the candidates and drop the ones
-that fail the WHERE clause. Wins when most rows match the predicate,
-so the post-filter rarely drops anything and the overfetch cheaply
-saturates the LIMIT.
+that fail the WHERE clause. The executor returns whatever survives,
+possibly fewer than `k` items if the filter is very tight. That's a
+recall trade-off, not a latency one : cost A is independent of
+selectivity and bounded by the fixed overfetch.
 
 **Plan B : metadata scan + exact distance.** Walk the metadata store
 for ids matching the predicate, then compute exact distance for each.
-Bypasses the ANN entirely. Wins when the predicate matches very few
-rows : an O(matches × dim) exact distance loop beats running the full
-ANN walk.
+Bypasses the ANN entirely. Cost is `n * c_filter_eval` (scan everything)
+plus `matches * (c_metadata_get + dim * c_distance_per_dim)` (exact
+distance per match).
 
 **Plan C : filtered ANN.** Run an HNSW search where the predicate is
 consulted **during** the graph walk. Out-of-filter nodes still route
-traversal but never enter the results heap. Wins in the middle :
-tight enough that plan A's overfetch would starve, loose enough that
-plan B's scan would be wasteful.
+traversal but never enter the results heap. Visit count scales by
+`1 + 4 * (1 - selectivity)` to account for the filter rejection rate.
 
-The bands :
-
-| Selectivity | Plan |
-|-------------|------|
-| `< 0.05` | B |
-| `[0.05, 0.5)` | C |
-| `>= 0.5` | A |
-| no predicate | A |
-
-The estimator that picks is a trait :
+The estimator that feeds the cost model is a trait :
 
 ```rust
 trait SelectivityEstimator {
     fn estimate(&self, pred: &PredicateExpr, params: &ParamBindings)
         -> SelectivityEstimate;
+
+    fn dim(&self) -> usize;  // vector dim, weights distance cost
 }
 ```
 
-The shipped implementation (`ShardEstimator`) consults the
-secondary-index catalog first via the same three-way dispatch the
-executor uses : pure-index hits return cardinality in O(1),
-hybrid hits walk only the indexed candidates and evaluate the
-residue per row, and predicates the catalog can't touch fall
-back to a metadata scan. A histogram-backed selectivity estimator
-for unindexed columns is what's still in flight ; the trait stays
-the same, the dispatch stays the same.
+The shipped `ShardEstimator` consults the secondary-index catalog
+first (pure-index hits return cardinality in O(1) ; hybrid hits walk
+only the indexed candidates and evaluate the residue per row), then
+the column-statistics catalog for atoms covered by histograms or
+top-K bags, and falls back to a metadata scan for predicates neither
+layer recognises.
+
+### Cost-based dispatch
+
+The cost model lives in
+[`cost.rs`](../crates/kova-query/src/cost.rs) and reads two
+inputs : a `Workload` (selectivity, k, total_rows, dim) the planner
+assembles per query, and `CostCoefficients` (four per-machine
+nanosecond rates) shipped as defaults.
+
+**The coefficients :**
+
+| Coefficient | Meaning | Default |
+|---|---|---|
+| `c_hnsw_per_visit` | Cost of visiting one HNSW node (heap ops + neighbour walk, exclusive of distance) | 500 ns |
+| `c_distance_per_dim` | Per-scalar distance cost. A `dim`-vector distance costs `dim * c_distance_per_dim`. | 5 ns |
+| `c_metadata_get` | Fetching one metadata bag from the store | 200 ns |
+| `c_filter_eval` | Evaluating one predicate atom on a fetched bag | 200 ns |
+
+**The closed-form costs :**
+
+```text
+hnsw_visits(k, n) = ef * log2(n),  ef = max(2*k, 50).min(n)
+
+cost_A = visits_A * (c_hnsw_per_visit + dim * c_distance_per_dim)
+       + k_overfetch * (c_metadata_get + c_filter_eval)
+   where visits_A = hnsw_visits(k * 4, n), k_overfetch = k * 4
+
+cost_B = n * c_filter_eval                                    # scan
+       + matches * (c_metadata_get + dim * c_distance_per_dim)  # exact
+   where matches = max(1, selectivity * n)
+
+cost_C = visits_C * (c_hnsw_per_visit + dim * c_distance_per_dim
+                   + c_metadata_get + c_filter_eval)
+   where visits_C = hnsw_visits(k, n) * (1 + 4 * (1 - selectivity))
+```
+
+`dispatch_via_cost` returns the plan with the smallest cost. Ties
+break A > B > C.
+
+**What the model captures :**
+
+- Plan A's bounded overfetch (no starvation retry term ; the executor
+  doesn't retry).
+- Plan B's full-shard scan term, which is what makes B expensive at
+  large `n` even when the match set is tiny.
+- Plan C's visit-count overhead at low selectivity, modelled as a
+  linear `1/s` rejection rate.
+- Vector dim weighting on plan A's per-visit cost and plan B's
+  per-match cost.
+
+**What the model deliberately omits :**
+
+- HNSW visit count is approximated as `ef * log2(n)`. Real HNSW
+  visit counts depend on `M`, `ef_construction`, and the data
+  distribution. The approximation is correct to within a small
+  constant.
+- Cache, NUMA, prefetching effects. Coefficients are flat.
+- Column correlation in compound predicates ; the model inherits the
+  independence assumption from the selectivity estimator.
+
+### Cost model validation
+
+The cost model isn't trusted on faith. A harness at
+[`examples/validate_cost_model.rs`](../crates/kova-query/examples/validate_cost_model.rs)
+sweeps a `(dim, n, selectivity)` grid, forces each plan A / B / C
+on every cell, and times the executor end-to-end. It reports a
+confusion matrix (predicted winner vs measured winner) and a
+**regret** metric :
+
+```text
+regret = mean(measured[predicted] / measured[actually-best])
+```
+
+Regret 1.0 means the model is perfect. Regret 2.0 means the model's
+dispatched plan is on average 2x slower than the optimal plan for
+that cell. Run with :
+
+```sh
+cargo run --release --example validate_cost_model --features internal-bench
+```
+
+The harness ships behind the `internal-bench` feature so the
+plan-builder reexports (`internal_bench::build_plan_a/b/c`) and the
+`Engine::execute_plan` bypass don't widen the regular public API.
+
+**Current results :** 30 cells (dim in {16, 128, 1536}, n in {1k,
+10k}, s in {0.001, 0.01, 0.05, 0.2, 0.5}), k=10, 25 samples per cell.
+
+```text
+Confusion matrix (rows=predicted, cols=actual)
+                A      B      C
+predicted A    12      0      0
+predicted B     4     13      1
+predicted C     0      0      0
+
+Mean regret = 1.116
+```
+
+Predicted plan A is correct 12 of 12 times. Predicted plan B is
+correct 13 of 18 times ; the 5 misses are mostly at small `n`
+where plan A would have been within 1.0-1.7x. The single plan C
+miss is at dim=128 n=1000 s=0.5 where plan C was 1.67x faster than
+the dispatched plan B.
+
+**Two earlier model bugs the harness surfaced :**
+
+1. **Plan A starvation term.** The first model added a
+   `k_eff = max(k * overfetch, k / selectivity)` term to plan A's
+   cost, reasoning that at low selectivity plan A would need to
+   "retry until k results." The executor doesn't retry : it walks
+   the HNSW for `k * 4` candidates and returns whatever survives,
+   possibly fewer than `k`. That's a recall trade-off the planner
+   can surface separately ; treating it as a latency cost made the
+   model dispatch plan B in 11 cells where plan A was 8-14x faster.
+   Fix : drop the term, make cost A flat in selectivity.
+
+2. **Plan B missing the scan term.** The first model assumed plan
+   B's matching id set came from an O(1) catalog lookup, so cost was
+   `matches * per_match` only. The actual executor's `MetadataScan`
+   walks all `n` rows, paying `c_filter_eval` per row before
+   reaching the matches. Fix : add `n * c_filter_eval` upfront ;
+   plan B's cost now grows linearly in `n` regardless of the match
+   set size, which is what the data shows.
+
+Both bugs had the same shape : the model was scoring an
+*idealised* plan, not the plan the executor actually runs. The
+harness made the gap visible by forcing each plan and comparing
+predicted to measured ; the fixes followed mechanically from the
+disagreement cells. Mean regret went from 2.526 to 1.116.
 
 ### Radius operator
 
@@ -1302,16 +1424,19 @@ persisted alongside the catalog. Estimates that are currently
 O(N) become O(log buckets) ; estimates that are currently exact
 stay exact for indexed atoms.
 
-### A real cost model
+### Per-machine coefficient calibration
 
-The planner picks plan A / B / C based on a single number :
-selectivity fraction. Today the bands are hardcoded constants
-(`PLAN_B_UPPER = 0.05`, `PLAN_A_LOWER = 0.5`). A cost model would
-make those bands a function of `k`, target recall, shard size,
-and the selectivity estimate, with cost coefficients measured on
-the target machine. The decision-grid test keeps protecting the
-boundary behaviour ; it just becomes parametric over the cost
-coefficients instead of fixed.
+The cost model ships with default coefficients tuned by hand
+against a 30-cell validation grid : mean regret 1.116. The
+remaining gap is mostly in the `c_hnsw_per_visit` value, which
+overestimates plan A's per-node cost at small `n` (where the
+graph fits in L2 cache and the modelled 500 ns drops to closer to
+100-200 ns in practice). A microbenchmark runner that times
+individual HNSW visits, individual metadata fetches, and
+individual filter evaluations on the target machine would let
+each Kova deployment pin its own `CostCoefficients`. The cost
+model already takes a `CostCoefficients` parameter ; the
+calibration runner is the missing piece.
 
 ### External benchmarks
 
@@ -1370,8 +1495,10 @@ delete and re-insert.
 | Binder | [`binder.rs`](../crates/kova-query/src/binder.rs) |
 | LogicalStatement | [`logical.rs`](../crates/kova-query/src/logical.rs) |
 | Planner | [`planner.rs`](../crates/kova-query/src/planner.rs) |
+| Cost model | [`cost.rs`](../crates/kova-query/src/cost.rs) |
 | PhysicalPlan | [`physical.rs`](../crates/kova-query/src/physical.rs) |
 | Executor | [`executor.rs`](../crates/kova-query/src/executor.rs) |
 | Printer | [`printer.rs`](../crates/kova-query/src/printer.rs) |
 | Fuzzer | [`tests/fuzz_query.rs`](../crates/kova-query/tests/fuzz_query.rs) |
+| Cost model validation | [`examples/validate_cost_model.rs`](../crates/kova-query/examples/validate_cost_model.rs) |
 | Recall sweep | [`hnsw/search.rs`](../crates/kova-index/src/hnsw/search.rs) |

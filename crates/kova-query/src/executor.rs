@@ -430,6 +430,24 @@ impl<D: Distance> Engine<D> {
         }
     }
 
+    /// Run a pre built [`PhysicalPlan`] against the engine's shard,
+    /// bypassing parser / binder / planner. Gated behind
+    /// `internal-bench` so the cost model validation example can
+    /// force a specific plan shape without polluting the public API.
+    ///
+    /// # Errors
+    ///
+    /// Propagates any [`KovaQueryError`] the executor would surface
+    /// during normal execution.
+    #[cfg(feature = "internal-bench")]
+    pub fn execute_plan(
+        &mut self,
+        plan: PhysicalPlan,
+        params: &ParamBindings,
+    ) -> Result<ExecutionResult, KovaQueryError> {
+        self.execute(plan, params)
+    }
+
     /// Single-row INSERT : resolve the three parameter slots into
     /// concrete values and dispatch to `Shard::insert`.
     fn exec_insert_one(
@@ -3557,19 +3575,20 @@ mod tests {
         enum Expect {
             PlanA,
             PlanB,
-            #[allow(dead_code)] // grid below currently only exercises A and B at dim=16
+            #[allow(dead_code)] // C rarely wins under the calibrated cost model
             PlanC,
         }
 
-        // n=10000, dim=16 : plan A and B handle the dispatch.
+        // n=10000, dim=1536 : large enough scan to make plan B's
+        // `n * c_filter_eval` term meaningful, high enough dim to
+        // make plan A's HNSW walk per-visit cost meaningful. B and
+        // A cross over around s ≈ 0.05.
         let cases_typical: &[(f64, Expect)] = &[
             (0.001, Expect::PlanB),
-            (0.04, Expect::PlanB),
-            (0.10, Expect::PlanB),
-            (0.13, Expect::PlanB),
+            (0.01, Expect::PlanB),
+            (0.10, Expect::PlanA),
             (0.20, Expect::PlanA),
             (0.50, Expect::PlanA),
-            (0.80, Expect::PlanA),
             (1.00, Expect::PlanA),
         ];
 
@@ -3583,7 +3602,7 @@ mod tests {
             let estimator = Const {
                 sel: *sel,
                 total: 10_000,
-                dim: 16,
+                dim: 1536,
             };
             let plan =
                 crate::planner::plan_with_estimator(logical, &estimator, &ParamBindings::empty())
@@ -3602,68 +3621,20 @@ mod tests {
             );
             assert!(
                 matches,
-                "typical n=10k dim=16 : selectivity {sel} expected {expected:?}, got operator {input:?}"
+                "n=10k dim=1536 : selectivity {sel} expected {expected:?}, got operator {input:?}"
             );
         }
     }
 
-    /// At very high dim (e.g. 1536 for `OpenAI` embeddings) plan B's
-    /// distance compute dominates and plan A's overfetch retries
-    /// get expensive at low selectivity. The cost model picks
-    /// plan C in the middle band : the hardcoded bands picked C
-    /// at this selectivity by accident ; the cost model picks C
-    /// here for principled reasons.
-    #[test]
-    fn planner_picks_plan_c_at_high_dim_low_selectivity() {
-        use crate::physical::PhysicalPlan;
-        use crate::planner::{SelectivityEstimate, SelectivityEstimator};
-
-        struct HighDim {
-            sel: f64,
-        }
-        impl SelectivityEstimator for HighDim {
-            fn estimate(
-                &self,
-                _pred: &crate::logical::PredicateExpr,
-                _params: &ParamBindings,
-            ) -> SelectivityEstimate {
-                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-                let matches = (self.sel * 1_000_000.0) as usize;
-                SelectivityEstimate {
-                    matches,
-                    total: 1_000_000,
-                }
-            }
-            fn dim(&self) -> usize {
-                1536
-            }
-        }
-
-        let ast = parse_str(
-            "SELECT id FROM vectors WHERE category = 'docs' \
-             ORDER BY embedding <-> $1 LIMIT 10",
-        )
-        .expect("parse");
-        let logical = crate::binder::bind(ast).expect("bind");
-        // s=0.02 at dim=1536, n=1M : plan A's retries blow up,
-        // plan B's per-match distance is huge ; plan C wins.
-        let plan = crate::planner::plan_with_estimator(
-            logical,
-            &HighDim { sel: 0.02 },
-            &ParamBindings::empty(),
-        )
-        .expect("plan");
-        let PhysicalPlan::Projection { input, .. } = plan else {
-            panic!("expected Projection");
-        };
-        let PhysicalPlan::Limit { input, .. } = *input else {
-            panic!("expected Limit");
-        };
-        assert!(
-            matches!(input.as_ref(), PhysicalPlan::FilteredKnnSearch { .. }),
-            "high-dim low-sel should pick FilteredKnnSearch, got {input:?}"
-        );
-    }
+    // The previous `planner_picks_plan_c_at_high_dim_low_selectivity`
+    // test pinned plan C dispatch at dim=1536 n=1M s=0.02. Under the
+    // calibrated honest cost model plan A wins at that workload
+    // because the executor's plan A doesn't retry on starvation, so
+    // its cost is bounded by the fixed overfetch. Plan C survives in
+    // the cost model and remains a correct dispatch target, but it
+    // rarely beats A in practice at our tested scales. The decision
+    // grid above already covers A and B ; specific C-wins regressions
+    // can be reintroduced if a future workload demonstrates one.
 
     /// and check the returned ids actually pass the predicate. This
     /// hits the filter-threaded HNSW walk via `Shard::search_filtered`.

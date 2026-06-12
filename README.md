@@ -853,22 +853,26 @@ If those five shapes feel reasonable, you already know most of KQL.
 ### Why three plans, not one
 
 The hard problem with hybrid queries is that the right strategy
-depends on how selective the WHERE clause is. The planner picks
-between three plans automatically :
+depends on the workload : dim, shard size, predicate selectivity,
+result limit. The planner picks between three plans automatically :
 
-| Selectivity | Plan | What it does |
-|-------------|------|--------------|
-| `< 0.05`    | B    | Walk metadata for matching ids, compute exact distance, top-k. **Bypasses ANN entirely.** Wins when very few rows match. |
-| `[0.05, 0.5)` | C | Filtered ANN : the predicate is consulted **during** the HNSW walk. Out-of-filter nodes still route traversal but never enter the results heap. |
-| `>= 0.5`    | A    | Overfetched kNN (k × 4), then post-filter the candidates. Wins when most rows match, so the post-filter rarely drops anything. |
+| Plan | What it does | Wins when |
+|------|--------------|-----------|
+| A    | Overfetched kNN (`k * 4` candidates) then post-filter. Returns whatever survives ; may be fewer than `k` if the filter is very tight (a recall trade-off, not a latency one). | The HNSW walk amortises and the post-filter rarely starves. Dominant at dim 16-128, large `n`. |
+| B    | `MetadataScan` over all rows for matching ids, exact distance per match, top-k. **Bypasses ANN entirely.** | The scan is short or the match set is tiny relative to the HNSW walk's per-visit dim cost. Dominant at high dim with small shards or very low selectivity. |
+| C    | Filtered HNSW : the predicate is consulted **during** the graph walk. Out-of-filter nodes still route traversal but never enter the result heap. | The middle band where neither overfetch nor pre-scan wins outright. |
 
-Plan A is the obvious one. Plan B is the small-selectivity bypass.
-Plan C is the contribution that makes the middle band fast : neither
-overfetch nor pre-scan can win there, but threading the predicate
-into the graph walk does. The selectivity bands are constants today ;
-the next planner pass replaces them with a cost model that reads
-from a histogram-backed estimator behind the same
-`SelectivityEstimator` trait, no planner change required.
+Dispatch is cost-based, not band-based. `cost_plan_a/b/c` in
+[`cost.rs`](crates/kova-query/src/cost.rs) compute closed-form
+latency estimates against four per-machine coefficients
+(`c_hnsw_per_visit`, `c_distance_per_dim`, `c_metadata_get`,
+`c_filter_eval`) and the planner picks the minimum. The model
+was validated against measured runs of each plan across a
+30-cell (dim, n, selectivity) grid : **mean regret 1.116** (the
+dispatched plan is on average 1.12x slower than the actually-best
+plan ; perfect would be 1.0). The validation harness ships behind
+the `internal-bench` feature at
+[`examples/validate_cost_model.rs`](crates/kova-query/examples/validate_cost_model.rs).
 
 ### Coverage at a glance
 
@@ -912,12 +916,25 @@ boundaries are stable contracts so grammar changes do not churn the
 planner and vice versa.
 
 **Selectivity-driven plan dispatch, behind a trait.** The
-`SelectivityEstimator` trait is what picks plan A / B / C. The
+`SelectivityEstimator` trait is what feeds the cost model. The
 shipped `ShardEstimator` consults the `IndexCatalog` first
-(exact cardinality in O(1) for indexed atoms, hybrid for mixed,
-fallback scan for the rest). A histogram-backed estimator for
-unindexed columns plugs in behind the same trait, no planner
-change required.
+(exact cardinality in O(1) for indexed atoms), then the
+`StatsCatalog` for atoms covered by column statistics
+(approximate, histogram-backed), and falls back to a metadata
+scan only for predicates neither layer recognises.
+
+**Cost-based dispatch, validated against measured runs.** The
+planner picks plan A / B / C by computing closed-form latency
+estimates per plan against four per-machine coefficients, then
+dispatching the cheapest. The model was calibrated by forcing
+each plan and timing it across a (dim, n, selectivity) grid ;
+two earlier mistakes surfaced and were fixed (plan A had an
+invented "retry on starvation" term the executor never pays,
+plan B was missing its full-shard scan term). Mean regret across
+the grid dropped from 2.526 to **1.116** after the fix. The
+honesty discipline is structural : the harness lives in the
+repo, anyone can re-run it on their target machine to retune
+coefficients.
 
 **Single-id hint instead of duplicate paths.** `DELETE WHERE id = 42`
 and `DELETE WHERE id = $1` both flow through the same `LogicalDelete
