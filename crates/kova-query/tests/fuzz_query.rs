@@ -988,9 +988,9 @@ fn correctness_one(fx: &mut Fixture, rng: &mut StdRng, seed: u64, iter: usize) {
                 return;
             };
             assert_eq!(rows.len(), 1, "COUNT should produce 1 row : `{sql}`");
-            let engine_count = match &rows[0].values[0] {
-                kova_query::executor::RowValue::Field(Value::I64(n)) => *n,
-                other => panic!(
+            let engine_count = match rows[0].values[0] {
+                kova_query::executor::RowValue::Field(Value::I64(n)) => n,
+                ref other => panic!(
                     "COUNT cell isn't I64 : `{sql}` value={other:?} (seed={seed} iter={iter})"
                 ),
             };

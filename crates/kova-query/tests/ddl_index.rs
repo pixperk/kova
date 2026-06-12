@@ -236,10 +236,10 @@ fn created_index_powers_subsequent_select() {
         panic!("expected Rows");
     };
     // Five `docs` rows in the fixture (even ids 0,2,4,6,8).
-    let kova_query::RowValue::Field(Value::I64(n)) = &rows[0].values[0] else {
+    let kova_query::RowValue::Field(Value::I64(n)) = rows[0].values[0] else {
         panic!("expected I64 count, got {:?}", rows[0].values[0]);
     };
-    assert_eq!(*n, 5);
+    assert_eq!(n, 5);
 }
 
 #[test]
@@ -265,10 +265,10 @@ fn create_inverted_index_then_array_contains() {
         panic!("expected Rows");
     };
     // Rows with n % 3 == 0 : ids 0, 3, 6, 9 → 4 matches.
-    let kova_query::RowValue::Field(Value::I64(n)) = &rows[0].values[0] else {
+    let kova_query::RowValue::Field(Value::I64(n)) = rows[0].values[0] else {
         panic!("expected I64 count");
     };
-    assert_eq!(*n, 4);
+    assert_eq!(n, 4);
 }
 
 #[test]

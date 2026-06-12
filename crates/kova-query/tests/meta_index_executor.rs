@@ -354,10 +354,10 @@ fn count_value(result: ExecutionResult) -> i64 {
         panic!("expected Rows, got {result:?}");
     };
     assert_eq!(rows.len(), 1, "COUNT must return exactly one row");
-    let RowValue::Field(Value::I64(n)) = &rows[0].values[0] else {
+    let RowValue::Field(Value::I64(n)) = rows[0].values[0] else {
         panic!("expected I64 count cell, got {:?}", rows[0].values[0]);
     };
-    *n
+    n
 }
 
 /// Run the same COUNT query with and without indexes registered.

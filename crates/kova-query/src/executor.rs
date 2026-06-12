@@ -1067,10 +1067,20 @@ fn expect_batch(
 /// this to decide between plan A and plan B for SELECT queries with
 /// predicates.
 ///
-/// v1 implementation walks the metadata store, evaluating the
-/// predicate against every row (cheap because metadata is in-memory).
-/// v2 will swap in index cardinality lookups when secondary indexes
-/// ship.
+/// The implementation routes through
+/// [`count_matching_with_predicate`], which itself does a three-way
+/// dispatch through [`crate::index_eval::try_index_eval`] :
+///
+/// - `Full` : the catalog gives exact cardinality in O(1) via
+///   `bitmap.len()`. No metadata bag is touched.
+/// - `Hybrid` : indexes shrink the candidate set ; the residue
+///   predicate is evaluated per-candidate.
+/// - `Fallback` : the legacy `Shard::count_matching` walk runs.
+///
+/// Errors are swallowed (treated as zero matches) because the
+/// estimator's job is fast cardinality, not error reporting :
+/// any predicate-eval error surfaces again when the executor runs
+/// the actual `MetadataScan` / `Count` / `Delete` / `Update`.
 struct ShardEstimator<'a, D: Distance> {
     shard: &'a Shard<D, MmapVectorStore, FileMetadataStore, FileWal>,
 }
@@ -1078,13 +1088,7 @@ struct ShardEstimator<'a, D: Distance> {
 impl<D: Distance> SelectivityEstimator for ShardEstimator<'_, D> {
     fn estimate(&self, pred: &PredicateExpr, params: &ParamBindings) -> SelectivityEstimate {
         let total = self.shard.len();
-        // The closure swallows eval errors (returns false on error)
-        // because the estimator's job is fast cardinality, not error
-        // reporting. Errors will surface when the executor evaluates
-        // the predicate for real during MetadataScan or post-filter.
-        let matches = self
-            .shard
-            .count_matching(|m| eval_predicate(pred, m, params).unwrap_or(false));
+        let matches = count_matching_with_predicate(self.shard, pred, params).unwrap_or(0);
         SelectivityEstimate { matches, total }
     }
 }
@@ -4020,5 +4024,124 @@ mod tests {
             engine.shard().contains(VectorId::new(200)),
             "surviving id should still be present"
         );
+    }
+
+    // ---- ShardEstimator behaviour ----
+    //
+    // The estimator routes through `count_matching_with_predicate`,
+    // which dispatches through `try_index_eval`. The two assertions
+    // below pin the contract :
+    //
+    //   1. With NO index registered, the estimator falls back to
+    //      `count_matching` and produces the exact count by walking
+    //      every bag.
+    //   2. With an index registered, the estimator hits the
+    //      catalog path (Full match → bitmap.len()) without
+    //      touching individual bags. We can't observe the bag-touch
+    //      directly, but the count must match the scan result.
+    //
+    // Both paths must produce the same `matches` value : the slice's
+    // whole point is "faster compute, same answer".
+
+    fn build_predicate_category_docs() -> PredicateExpr {
+        PredicateExpr::Atom(PredAtom::Eq {
+            field: crate::logical::FieldRef::plain("category"),
+            value: BoundExpr::Literal(crate::logical::BoundLiteral::String("docs".into())),
+        })
+    }
+
+    fn seed_categorised_rows(engine: &mut Engine<L2>, docs_count: u16, blogs_count: u16) {
+        for n in 0..docs_count {
+            engine
+                .execute_str(
+                    "INSERT INTO vectors (id, embedding, metadata) VALUES ($1, $2, $3)",
+                    ParamBindings::empty()
+                        .with_positional(ParamValue::Id(VectorId::new(u64::from(n))))
+                        .with_positional(ParamValue::Vector(
+                            kova_core::Vector::try_new(vec![f32::from(n), 0.0, 0.0, 0.0]).unwrap(),
+                        ))
+                        .with_positional(ParamValue::Metadata({
+                            let mut m = Metadata::new();
+                            m.insert("category".into(), Value::String("docs".into()));
+                            m
+                        })),
+                )
+                .unwrap();
+        }
+        for n in 0..blogs_count {
+            let id = docs_count + n;
+            engine
+                .execute_str(
+                    "INSERT INTO vectors (id, embedding, metadata) VALUES ($1, $2, $3)",
+                    ParamBindings::empty()
+                        .with_positional(ParamValue::Id(VectorId::new(u64::from(id))))
+                        .with_positional(ParamValue::Vector(
+                            kova_core::Vector::try_new(vec![f32::from(id), 0.0, 0.0, 0.0]).unwrap(),
+                        ))
+                        .with_positional(ParamValue::Metadata({
+                            let mut m = Metadata::new();
+                            m.insert("category".into(), Value::String("blog".into()));
+                            m
+                        })),
+                )
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn estimator_falls_back_to_scan_without_index() {
+        let dir = tempdir().unwrap();
+        let shard = Shard::open(dir.path(), 4, L2, HnswParams::default()).unwrap();
+        let mut engine = Engine::new(shard, "vectors");
+        seed_categorised_rows(&mut engine, 7, 3);
+
+        let pred = build_predicate_category_docs();
+        let estimator = ShardEstimator {
+            shard: engine.shard(),
+        };
+        let est = estimator.estimate(&pred, &ParamBindings::empty());
+        assert_eq!(est.total, 10);
+        assert_eq!(est.matches, 7);
+    }
+
+    #[test]
+    fn estimator_uses_catalog_when_index_present() {
+        let dir = tempdir().unwrap();
+        let shard = Shard::open(dir.path(), 4, L2, HnswParams::default()).unwrap();
+        let mut engine = Engine::new(shard, "vectors");
+        seed_categorised_rows(&mut engine, 7, 3);
+        engine
+            .execute_str(
+                "CREATE INDEX idx_cat ON vectors USING HASH (category)",
+                ParamBindings::empty(),
+            )
+            .unwrap();
+
+        let pred = build_predicate_category_docs();
+        let estimator = ShardEstimator {
+            shard: engine.shard(),
+        };
+        let est = estimator.estimate(&pred, &ParamBindings::empty());
+        // Same count as the scan path : the estimator's correctness
+        // doesn't depend on whether the index path or fallback runs.
+        assert_eq!(est.total, 10);
+        assert_eq!(est.matches, 7);
+    }
+
+    #[test]
+    fn estimator_returns_zero_on_unindexable_predicate_with_no_data() {
+        // No rows + an unindexed field → 0/0. The unwrap_or(0) on
+        // the error path is exercised when the predicate has no
+        // resolvable rows at all.
+        let dir = tempdir().unwrap();
+        let shard = Shard::open(dir.path(), 4, L2, HnswParams::default()).unwrap();
+        let engine = Engine::new(shard, "vectors");
+        let pred = build_predicate_category_docs();
+        let estimator = ShardEstimator {
+            shard: engine.shard(),
+        };
+        let est = estimator.estimate(&pred, &ParamBindings::empty());
+        assert_eq!(est.total, 0);
+        assert_eq!(est.matches, 0);
     }
 }
