@@ -1,4 +1,4 @@
-//! Baseline benchmarks for the IndexCatalog integration.
+//! Baseline benchmarks for the [`IndexCatalog`] integration.
 //!
 //! Each query is run twice against identical 10k-row shards :
 //! - **scan**    : no indexes registered, paths fall back to
@@ -6,18 +6,20 @@
 //! - **indexed** : the relevant indexes are registered, paths route
 //!   through `IndexCatalog::lookup` / `IndexCatalog::estimate`
 //!
-//! Same SQL, same fixture, same parser/binder/planner — the only
+//! Same SQL, same fixture, same parser/binder/planner ; the only
 //! difference is whether the catalog has anything to say. The delta
-//! is the M2.5 win.
+//! is what the catalog routing buys.
 //!
 //! Dataset shape :
-//! - 10_000 rows, 16-dim vectors (small enough to bench in seconds)
-//! - `category` : one of {"docs", "blog", "code", "wiki"} (4 values,
+//! - `10_000` rows, 16-dim vectors (small enough to bench in seconds)
+//! - `category` : one of `{"docs", "blog", "code", "wiki"}` (4 values,
 //!   ~25% selectivity per value)
-//! - `year`     : 2015..=2025 (11 values, range queries on this)
-//! - `tags`     : array of 1-3 strings drawn from {rust, python, go,
-//!   async, ml, web} (~5% per single-tag query)
-//! - `priority` : 1..10 (NOT indexed, used to exercise hybrid + scan)
+//! - `year`     : `2015..=2025` (11 values, range queries on this)
+//! - `tags`     : array of 1-3 strings drawn from `{rust, python, go,`
+//!   `async, ml, web}` (~5% per single-tag query)
+//! - `priority` : `1..10` (NOT indexed, used to exercise hybrid + scan)
+//!
+//! [`IndexCatalog`]: kova_meta_index::IndexCatalog
 
 #![allow(missing_docs, clippy::cast_precision_loss)]
 
