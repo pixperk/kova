@@ -45,12 +45,24 @@
 // loss is irrelevant to a selectivity in [0, 1].
 #![allow(clippy::cast_precision_loss)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::fs;
+use std::path::Path;
 
-use kova_core::Value;
+use kova_core::{Metadata, Value};
 use serde::{Deserialize, Serialize};
 
+use crate::error::KovaMetaIndexError;
 use crate::{CmpOp, IndexAtom};
+
+/// Magic header on every stats file. 8 bytes, ASCII for `KOVASTA1`.
+const STATS_MAGIC: &[u8; 8] = b"KOVASTA1";
+
+/// Bumped when the on-disk stats layout changes incompatibly.
+const STATS_FORMAT_VERSION: u32 = 1;
+
+/// Fixed header bytes : magic + version.
+const STATS_HEADER_LEN: usize = STATS_MAGIC.len() + std::mem::size_of::<u32>();
 
 /// Default number of equi-depth histogram buckets for numeric
 /// columns. Tuned for "small enough to bench in microseconds, large
@@ -119,6 +131,84 @@ impl StatsCatalog {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.fields.is_empty()
+    }
+
+    /// Encode the catalog into a self-describing byte buffer with
+    /// the same shape `IndexCatalog` uses :
+    ///
+    /// ```text
+    /// +----------+----------+-------------------------------+
+    /// | magic[8] | ver[u32] | bincode( StatsCatalog )       |
+    /// +----------+----------+-------------------------------+
+    /// ```
+    ///
+    /// The storage layer wraps this in an atomic write (tmp +
+    /// fsync + rename + dirsync) so observers see either the
+    /// whole new file or the previous one, never a partial.
+    ///
+    /// # Errors
+    /// Returns [`KovaMetaIndexError::Decode`] (the bincode error
+    /// variant covers both directions) if the payload can't be
+    /// serialised, which is effectively never for this shape.
+    pub fn encode(&self) -> Result<Vec<u8>, KovaMetaIndexError> {
+        let payload = bincode::serialize(self)?;
+        let mut buf = Vec::with_capacity(STATS_HEADER_LEN + payload.len());
+        buf.extend_from_slice(STATS_MAGIC);
+        buf.extend_from_slice(&STATS_FORMAT_VERSION.to_le_bytes());
+        buf.extend_from_slice(&payload);
+        Ok(buf)
+    }
+
+    /// Decode a catalog from a byte buffer produced by
+    /// [`Self::encode`]. Validates the magic header and version
+    /// before handing the rest to bincode.
+    ///
+    /// # Errors
+    /// - [`KovaMetaIndexError::Truncated`] if `bytes` is shorter
+    ///   than the fixed header.
+    /// - [`KovaMetaIndexError::BadMagic`] if the magic bytes don't
+    ///   match.
+    /// - [`KovaMetaIndexError::UnsupportedVersion`] if the version
+    ///   field doesn't match this build's expected version.
+    /// - [`KovaMetaIndexError::Decode`] if bincode rejects the
+    ///   payload.
+    pub fn decode(bytes: &[u8]) -> Result<Self, KovaMetaIndexError> {
+        if bytes.len() < STATS_HEADER_LEN {
+            return Err(KovaMetaIndexError::Truncated {
+                bytes: bytes.len(),
+                min: STATS_HEADER_LEN,
+            });
+        }
+        if &bytes[..STATS_MAGIC.len()] != STATS_MAGIC {
+            return Err(KovaMetaIndexError::BadMagic);
+        }
+        let ver_bytes: [u8; 4] = bytes[STATS_MAGIC.len()..STATS_HEADER_LEN]
+            .try_into()
+            .expect("4-byte slice");
+        let version = u32::from_le_bytes(ver_bytes);
+        if version != STATS_FORMAT_VERSION {
+            return Err(KovaMetaIndexError::UnsupportedVersion {
+                expected: STATS_FORMAT_VERSION,
+                got: version,
+            });
+        }
+        let cat: StatsCatalog = bincode::deserialize(&bytes[STATS_HEADER_LEN..])?;
+        Ok(cat)
+    }
+
+    /// Read + decode the catalog at `path`. Returns `Ok(None)` if
+    /// the file doesn't exist (fresh shard with no persisted stats).
+    ///
+    /// # Errors
+    /// All variants of [`KovaMetaIndexError`] that
+    /// [`Self::decode`] can produce, plus
+    /// [`KovaMetaIndexError::Io`] for read failures.
+    pub fn load(path: &Path) -> Result<Option<Self>, KovaMetaIndexError> {
+        if !path.exists() {
+            return Ok(None);
+        }
+        let bytes = fs::read(path)?;
+        Ok(Some(Self::decode(&bytes)?))
     }
 }
 
@@ -458,6 +548,388 @@ fn value_to_f64(v: &Value) -> Option<f64> {
         Value::F64(f) => Some(*f),
         _ => None,
     }
+}
+
+// =========================================================================
+// Builder : turn a stream of `Metadata` observations into a `StatsCatalog`.
+// =========================================================================
+
+/// Incremental [`StatsCatalog`] builder. Observe one row's metadata
+/// at a time ; the builder routes each `(field, value)` to a
+/// per-field sub-builder that tracks the kind-specific summary.
+///
+/// On [`Self::finish`], each sub-builder produces a
+/// [`ColumnStats`]. Fields that observed values of inconsistent
+/// kinds across rows collapse to [`ColumnStatsKind::Mixed`] and
+/// only retain `row_count` (enough to answer `IsNotNull`).
+///
+/// Used at checkpoint time : after vacuum, walk every live row's
+/// metadata once, finish, persist via [`StatsCatalog::encode`].
+pub struct StatsBuilder {
+    fields: HashMap<String, ColumnBuilder>,
+    total_rows: u64,
+    histogram_buckets: usize,
+    top_k: usize,
+}
+
+impl Default for StatsBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl StatsBuilder {
+    /// Construct a builder with the default histogram bucket count
+    /// ([`DEFAULT_HISTOGRAM_BUCKETS`]) and top-K size
+    /// ([`DEFAULT_TOP_K`]).
+    #[must_use]
+    pub fn new() -> Self {
+        Self::with_config(DEFAULT_HISTOGRAM_BUCKETS, DEFAULT_TOP_K)
+    }
+
+    /// Construct a builder with explicit histogram + top-K limits.
+    #[must_use]
+    pub fn with_config(histogram_buckets: usize, top_k: usize) -> Self {
+        Self {
+            fields: HashMap::new(),
+            total_rows: 0,
+            histogram_buckets,
+            top_k,
+        }
+    }
+
+    /// Observe one row's metadata. Increments `total_rows`, and
+    /// for every `(field, value)` in the bag, advances that
+    /// field's sub-builder by one value.
+    ///
+    /// Fields missing from the bag don't get touched. Their
+    /// `null_count` is reconstructed at finish time as
+    /// `total_rows - row_count`.
+    pub fn observe(&mut self, metadata: &Metadata) {
+        self.total_rows += 1;
+        for (field, value) in metadata {
+            let cb = self
+                .fields
+                .entry(field.clone())
+                .or_insert(ColumnBuilder::Empty);
+            cb.observe(value);
+        }
+    }
+
+    /// Force-track `field` even if no row has observed it. Useful
+    /// when the caller knows the field exists in the schema and
+    /// wants `null_count = total_rows` to surface explicitly.
+    pub fn track_field(&mut self, field: &str) {
+        self.fields
+            .entry(field.to_string())
+            .or_insert(ColumnBuilder::Empty);
+    }
+
+    /// Finalise into a [`StatsCatalog`]. Each tracked field gets
+    /// its `ColumnStats` ; fields nobody touched stay out.
+    #[must_use]
+    pub fn finish(self) -> StatsCatalog {
+        let mut catalog = StatsCatalog::new();
+        let total = self.total_rows;
+        let buckets = self.histogram_buckets;
+        let top_k = self.top_k;
+        for (field, builder) in self.fields {
+            let stats = builder.finish(buckets, top_k, total);
+            catalog.put(&field, stats);
+        }
+        catalog
+    }
+}
+
+/// Per-field state machine. Starts `Empty`, transitions to a
+/// kind-specific sub-builder on the first observed value, and
+/// collapses to `Mixed` if a later value disagrees on kind.
+enum ColumnBuilder {
+    Empty,
+    Numeric(NumericBuilder),
+    String(StringBuilder),
+    Bool(BoolBuilder),
+    Array(ArrayBuilder),
+    Mixed { row_count: u64 },
+}
+
+impl ColumnBuilder {
+    fn observe(&mut self, value: &Value) {
+        // Take ownership of the current state, advance, replace.
+        // `mem::replace` is the standard way to drive a state
+        // machine where the next variant depends on the current.
+        let prev = std::mem::replace(self, ColumnBuilder::Empty);
+        *self = prev.advance(value);
+    }
+
+    fn advance(self, value: &Value) -> Self {
+        match (self, value) {
+            (ColumnBuilder::Empty, Value::I64(_) | Value::F64(_)) => {
+                let mut b = NumericBuilder::default();
+                b.observe(value);
+                ColumnBuilder::Numeric(b)
+            }
+            (ColumnBuilder::Empty, Value::String(_)) => {
+                let mut b = StringBuilder::default();
+                b.observe(value);
+                ColumnBuilder::String(b)
+            }
+            (ColumnBuilder::Empty, Value::Bool(_)) => {
+                let mut b = BoolBuilder::default();
+                b.observe(value);
+                ColumnBuilder::Bool(b)
+            }
+            (ColumnBuilder::Empty, Value::Array(_)) => {
+                let mut b = ArrayBuilder::default();
+                b.observe(value);
+                ColumnBuilder::Array(b)
+            }
+            (ColumnBuilder::Empty, Value::Map(_)) => {
+                // Maps have no useful stats shape.
+                ColumnBuilder::Mixed { row_count: 1 }
+            }
+            (ColumnBuilder::Numeric(mut b), Value::I64(_) | Value::F64(_)) => {
+                b.observe(value);
+                ColumnBuilder::Numeric(b)
+            }
+            (ColumnBuilder::Numeric(b), _) => ColumnBuilder::Mixed {
+                row_count: b.row_count + 1,
+            },
+            (ColumnBuilder::String(mut b), Value::String(_)) => {
+                b.observe(value);
+                ColumnBuilder::String(b)
+            }
+            (ColumnBuilder::String(b), _) => ColumnBuilder::Mixed {
+                row_count: b.row_count + 1,
+            },
+            (ColumnBuilder::Bool(mut b), Value::Bool(_)) => {
+                b.observe(value);
+                ColumnBuilder::Bool(b)
+            }
+            (ColumnBuilder::Bool(b), _) => ColumnBuilder::Mixed {
+                row_count: b.true_count + b.false_count + 1,
+            },
+            (ColumnBuilder::Array(mut b), Value::Array(_)) => {
+                b.observe(value);
+                ColumnBuilder::Array(b)
+            }
+            (ColumnBuilder::Array(b), _) => ColumnBuilder::Mixed {
+                row_count: b.row_count + 1,
+            },
+            (ColumnBuilder::Mixed { row_count }, _) => ColumnBuilder::Mixed {
+                row_count: row_count + 1,
+            },
+        }
+    }
+
+    fn finish(self, hist_buckets: usize, top_k: usize, total_rows: u64) -> ColumnStats {
+        match self {
+            ColumnBuilder::Empty => ColumnStats {
+                row_count: 0,
+                null_count: total_rows,
+                distinct_count: 0,
+                kind: ColumnStatsKind::Mixed,
+            },
+            ColumnBuilder::Numeric(b) => b.finish(hist_buckets, total_rows),
+            ColumnBuilder::String(b) => b.finish(top_k, total_rows),
+            ColumnBuilder::Bool(b) => b.finish(total_rows),
+            ColumnBuilder::Array(b) => b.finish(top_k, total_rows),
+            ColumnBuilder::Mixed { row_count } => ColumnStats {
+                row_count,
+                null_count: total_rows.saturating_sub(row_count),
+                distinct_count: 0,
+                kind: ColumnStatsKind::Mixed,
+            },
+        }
+    }
+}
+
+#[derive(Default)]
+struct NumericBuilder {
+    values: Vec<f64>,
+    distinct: HashSet<u64>, // bit-cast f64 for hashing
+    row_count: u64,
+}
+
+impl NumericBuilder {
+    fn observe(&mut self, v: &Value) {
+        let Some(f) = value_to_f64(v) else { return };
+        self.values.push(f);
+        self.distinct.insert(f.to_bits());
+        self.row_count += 1;
+    }
+
+    fn finish(mut self, hist_buckets: usize, total_rows: u64) -> ColumnStats {
+        if self.values.is_empty() {
+            return ColumnStats {
+                row_count: 0,
+                null_count: total_rows,
+                distinct_count: 0,
+                kind: ColumnStatsKind::Numeric {
+                    min: 0.0,
+                    max: 0.0,
+                    histogram: vec![],
+                },
+            };
+        }
+        // f64 NaN comparison is partial ; in practice we never
+        // observe NaN through Value::F64 because the binder doesn't
+        // accept NaN literals, but the sort fallback to Equal keeps
+        // us total.
+        self.values
+            .sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let min = self.values[0];
+        let max = *self.values.last().expect("non-empty checked");
+        let histogram = build_equi_depth(&self.values, hist_buckets);
+        ColumnStats {
+            row_count: self.row_count,
+            null_count: total_rows.saturating_sub(self.row_count),
+            distinct_count: self.distinct.len() as u64,
+            kind: ColumnStatsKind::Numeric {
+                min,
+                max,
+                histogram,
+            },
+        }
+    }
+}
+
+#[derive(Default)]
+struct StringBuilder {
+    freqs: HashMap<String, u64>,
+    row_count: u64,
+}
+
+impl StringBuilder {
+    fn observe(&mut self, v: &Value) {
+        if let Value::String(s) = v {
+            *self.freqs.entry(s.clone()).or_insert(0) += 1;
+            self.row_count += 1;
+        }
+    }
+
+    fn finish(self, top_k: usize, total_rows: u64) -> ColumnStats {
+        let distinct_count = self.freqs.len() as u64;
+        let mut entries: Vec<(String, u64)> = self.freqs.into_iter().collect();
+        // Sort by count desc, then by key asc for determinism.
+        entries.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        entries.truncate(top_k);
+        ColumnStats {
+            row_count: self.row_count,
+            null_count: total_rows.saturating_sub(self.row_count),
+            distinct_count,
+            kind: ColumnStatsKind::String { top_k: entries },
+        }
+    }
+}
+
+#[derive(Default)]
+struct BoolBuilder {
+    true_count: u64,
+    false_count: u64,
+}
+
+impl BoolBuilder {
+    fn observe(&mut self, v: &Value) {
+        if let Value::Bool(b) = v {
+            if *b {
+                self.true_count += 1;
+            } else {
+                self.false_count += 1;
+            }
+        }
+    }
+
+    fn finish(self, total_rows: u64) -> ColumnStats {
+        let row_count = self.true_count + self.false_count;
+        let distinct = u64::from(self.true_count > 0) + u64::from(self.false_count > 0);
+        ColumnStats {
+            row_count,
+            null_count: total_rows.saturating_sub(row_count),
+            distinct_count: distinct,
+            kind: ColumnStatsKind::Bool {
+                true_count: self.true_count,
+                false_count: self.false_count,
+            },
+        }
+    }
+}
+
+#[derive(Default)]
+struct ArrayBuilder {
+    element_freqs: HashMap<String, u64>,
+    total_length: u64,
+    row_count: u64,
+}
+
+impl ArrayBuilder {
+    fn observe(&mut self, v: &Value) {
+        if let Value::Array(elems) = v {
+            self.row_count += 1;
+            self.total_length += elems.len() as u64;
+            for e in elems {
+                if let Value::String(s) = e {
+                    *self.element_freqs.entry(s.clone()).or_insert(0) += 1;
+                }
+                // Non-string array elements are ignored : the
+                // catalog only indexes string-element arrays
+                // (see InvertedIndex), so the stats follow suit.
+            }
+        }
+    }
+
+    fn finish(self, top_k: usize, total_rows: u64) -> ColumnStats {
+        let distinct_count = self.element_freqs.len() as u64;
+        let avg_array_len = if self.row_count == 0 {
+            0.0
+        } else {
+            self.total_length as f64 / self.row_count as f64
+        };
+        let mut entries: Vec<(String, u64)> = self.element_freqs.into_iter().collect();
+        entries.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        entries.truncate(top_k);
+        ColumnStats {
+            row_count: self.row_count,
+            null_count: total_rows.saturating_sub(self.row_count),
+            distinct_count,
+            kind: ColumnStatsKind::Array {
+                element_top_k: entries,
+                avg_array_len,
+            },
+        }
+    }
+}
+
+/// Build an equi-depth histogram from a sorted slice of values.
+///
+/// The output has at most `n_buckets` entries. Each bucket holds
+/// approximately `sorted.len() / n_buckets` values (the first
+/// `len % n_buckets` buckets get one extra value to absorb the
+/// remainder). Buckets are touching but not strictly contiguous :
+/// bucket[i].hi is the largest value assigned to bucket i, which
+/// may equal bucket[i+1].lo.
+fn build_equi_depth(sorted: &[f64], n_buckets: usize) -> Vec<HistogramBucket> {
+    let len = sorted.len();
+    if len == 0 || n_buckets == 0 {
+        return vec![];
+    }
+    let n = n_buckets.min(len);
+    let chunk_base = len / n;
+    let extra = len % n;
+
+    let mut buckets = Vec::with_capacity(n);
+    let mut start = 0;
+    for i in 0..n {
+        let count = chunk_base + usize::from(i < extra);
+        let end = start + count;
+        buckets.push(HistogramBucket {
+            lo: sorted[start],
+            hi: sorted[end - 1],
+            count: count as u64,
+        });
+        start = end;
+    }
+    buckets
 }
 
 #[cfg(test)]
@@ -813,5 +1285,319 @@ mod tests {
         assert_eq!(cat.len(), 1);
         cat.remove("a");
         assert!(cat.is_empty());
+    }
+
+    // ---- Builder ----
+
+    fn meta_from(pairs: &[(&str, Value)]) -> kova_core::Metadata {
+        let mut m = kova_core::Metadata::new();
+        for (k, v) in pairs {
+            m.insert((*k).to_string(), v.clone());
+        }
+        m
+    }
+
+    #[test]
+    fn builder_empty_finish_produces_empty_catalog() {
+        let cat = StatsBuilder::new().finish();
+        assert!(cat.is_empty());
+    }
+
+    #[test]
+    fn builder_numeric_field_produces_numeric_stats() {
+        let mut b = StatsBuilder::with_config(2, 16);
+        for n in 0..10_i64 {
+            b.observe(&meta_from(&[("year", i(2020 + n))]));
+        }
+        let cat = b.finish();
+        let st = cat.get("year").unwrap();
+        assert_eq!(st.row_count, 10);
+        assert_eq!(st.null_count, 0);
+        assert_eq!(st.distinct_count, 10);
+        match &st.kind {
+            ColumnStatsKind::Numeric {
+                min,
+                max,
+                histogram,
+            } => {
+                assert!(approx_eq(*min, 2020.0));
+                assert!(approx_eq(*max, 2029.0));
+                // 2 buckets requested, 10 values → 5 per bucket.
+                assert_eq!(histogram.len(), 2);
+                assert_eq!(histogram[0].count, 5);
+                assert_eq!(histogram[1].count, 5);
+            }
+            other => panic!("expected Numeric, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn builder_string_field_top_k_respects_config() {
+        let mut b = StatsBuilder::with_config(20, 2);
+        // 5 distinct categories, with counts [4, 3, 2, 1, 1] = 11 rows
+        let pattern = ["a", "a", "a", "a", "b", "b", "b", "c", "c", "d", "e"];
+        for p in pattern {
+            b.observe(&meta_from(&[("cat", s(p))]));
+        }
+        let cat = b.finish();
+        let st = cat.get("cat").unwrap();
+        assert_eq!(st.row_count, 11);
+        assert_eq!(st.distinct_count, 5);
+        match &st.kind {
+            ColumnStatsKind::String { top_k } => {
+                assert_eq!(top_k.len(), 2, "top_k truncated to configured 2");
+                assert_eq!(top_k[0], ("a".to_string(), 4));
+                assert_eq!(top_k[1], ("b".to_string(), 3));
+            }
+            other => panic!("expected String, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn builder_bool_field_counts_directly() {
+        let mut b = StatsBuilder::new();
+        for _ in 0..7 {
+            b.observe(&meta_from(&[("flag", Value::Bool(true))]));
+        }
+        for _ in 0..3 {
+            b.observe(&meta_from(&[("flag", Value::Bool(false))]));
+        }
+        let cat = b.finish();
+        let st = cat.get("flag").unwrap();
+        match &st.kind {
+            ColumnStatsKind::Bool {
+                true_count,
+                false_count,
+            } => {
+                assert_eq!(*true_count, 7);
+                assert_eq!(*false_count, 3);
+            }
+            other => panic!("expected Bool, got {other:?}"),
+        }
+        assert_eq!(st.row_count, 10);
+        assert_eq!(st.distinct_count, 2);
+    }
+
+    #[test]
+    fn builder_array_field_collects_element_top_k_and_avg_len() {
+        let mut b = StatsBuilder::with_config(20, 3);
+        // row 0 : ["rust", "async"]      (2 elements)
+        // row 1 : ["rust"]               (1)
+        // row 2 : ["go", "rust", "tokio"](3)
+        // row 3 : ["python"]             (1)
+        // Total length = 7, row_count = 4, avg = 1.75
+        // Element counts : rust=3, async=1, go=1, tokio=1, python=1
+        // Top-3 : rust=3, then ties broken alphabetically -> async=1, go=1
+        let rows = vec![
+            Value::Array(vec![s("rust"), s("async")]),
+            Value::Array(vec![s("rust")]),
+            Value::Array(vec![s("go"), s("rust"), s("tokio")]),
+            Value::Array(vec![s("python")]),
+        ];
+        for v in rows {
+            b.observe(&meta_from(&[("tags", v)]));
+        }
+        let cat = b.finish();
+        let st = cat.get("tags").unwrap();
+        assert_eq!(st.row_count, 4);
+        assert_eq!(st.distinct_count, 5);
+        match &st.kind {
+            ColumnStatsKind::Array {
+                element_top_k,
+                avg_array_len,
+            } => {
+                assert!(approx_eq(*avg_array_len, 1.75));
+                assert_eq!(element_top_k.len(), 3);
+                assert_eq!(element_top_k[0], ("rust".to_string(), 3));
+                // The remaining two are tied at count 1 ; deterministic tiebreak by key.
+                assert_eq!(element_top_k[1].0, "async");
+                assert_eq!(element_top_k[2].0, "go");
+            }
+            other => panic!("expected Array, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn builder_mixed_types_collapses_to_mixed_kind() {
+        let mut b = StatsBuilder::new();
+        b.observe(&meta_from(&[("messy", i(1))]));
+        b.observe(&meta_from(&[("messy", i(2))]));
+        b.observe(&meta_from(&[("messy", s("oops"))])); // type changes
+        b.observe(&meta_from(&[("messy", s("again"))]));
+        let cat = b.finish();
+        let st = cat.get("messy").unwrap();
+        assert!(matches!(st.kind, ColumnStatsKind::Mixed));
+        assert_eq!(st.row_count, 4);
+        // distinct_count is dropped for Mixed.
+        assert_eq!(st.distinct_count, 0);
+    }
+
+    #[test]
+    fn builder_tracks_null_count_per_field() {
+        // 5 rows total ; 3 of them have "year".
+        let mut b = StatsBuilder::new();
+        b.observe(&meta_from(&[("year", i(2020))]));
+        b.observe(&meta_from(&[("year", i(2021))]));
+        b.observe(&meta_from(&[("other", s("x"))]));
+        b.observe(&meta_from(&[("year", i(2022))]));
+        b.observe(&meta_from(&[("other", s("y"))]));
+        let cat = b.finish();
+        let year = cat.get("year").unwrap();
+        assert_eq!(year.row_count, 3);
+        assert_eq!(year.null_count, 2);
+        let other = cat.get("other").unwrap();
+        assert_eq!(other.row_count, 2);
+        assert_eq!(other.null_count, 3);
+    }
+
+    #[test]
+    fn builder_track_field_surfaces_fully_null_columns() {
+        let mut b = StatsBuilder::new();
+        b.track_field("missing");
+        for n in 0..5 {
+            b.observe(&meta_from(&[("present", i(n))]));
+        }
+        let cat = b.finish();
+        let st = cat.get("missing").unwrap();
+        assert_eq!(st.row_count, 0);
+        assert_eq!(st.null_count, 5);
+    }
+
+    #[test]
+    fn builder_n_smaller_than_buckets_uses_one_per_value() {
+        // 3 values, 20 buckets requested → max 3 buckets.
+        let mut b = StatsBuilder::with_config(20, 16);
+        for n in [1_i64, 5, 10] {
+            b.observe(&meta_from(&[("score", i(n))]));
+        }
+        let st = b.finish().get("score").cloned().unwrap();
+        match st.kind {
+            ColumnStatsKind::Numeric { histogram, .. } => {
+                assert!(histogram.len() <= 3);
+                let total: u64 = histogram.iter().map(|h| h.count).sum();
+                assert_eq!(total, 3);
+            }
+            _ => panic!("expected Numeric"),
+        }
+    }
+
+    #[test]
+    fn builder_round_trip_through_selectivity() {
+        // Build stats from a realistic stream, then query via the
+        // catalog. This catches "builder produces stats that the
+        // selectivity math interprets correctly" end-to-end.
+        let mut b = StatsBuilder::new();
+        for n in 0..100_i64 {
+            let cat_val = if n % 2 == 0 { "docs" } else { "blog" };
+            b.observe(&meta_from(&[
+                ("category", s(cat_val)),
+                ("year", i(2020 + n % 6)),
+            ]));
+        }
+        let cat = b.finish();
+        // ~50% of rows have category = 'docs'
+        let docs = cat
+            .selectivity("category", &IndexAtom::Eq(s("docs")))
+            .unwrap();
+        assert!(
+            (docs - 0.5).abs() < 0.05,
+            "expected ~0.5 selectivity, got {docs}"
+        );
+        // year stats : approximate range query
+        let recent = cat
+            .selectivity("year", &IndexAtom::Cmp(CmpOp::Ge, i(2023)))
+            .unwrap();
+        // 2023..=2025 should be roughly half the range.
+        assert!((0.2..0.7).contains(&recent), "got {recent}");
+    }
+
+    // ---- Persistence ----
+
+    #[test]
+    fn encode_decode_round_trip_preserves_selectivity() {
+        let mut b = StatsBuilder::new();
+        for n in 0..20 {
+            b.observe(&meta_from(&[
+                ("category", s(if n % 2 == 0 { "docs" } else { "blog" })),
+                ("year", i(2020 + n)),
+                ("active", Value::Bool(n % 3 == 0)),
+            ]));
+        }
+        let original = b.finish();
+        let bytes = original.encode().unwrap();
+        let back = StatsCatalog::decode(&bytes).unwrap();
+        // Same fields tracked.
+        let mut fa: Vec<&str> = original.fields().collect();
+        let mut fb: Vec<&str> = back.fields().collect();
+        fa.sort_unstable();
+        fb.sort_unstable();
+        assert_eq!(fa, fb);
+        // Same selectivity for a spot-check atom on each kind.
+        for (field, atom) in [
+            ("category", IndexAtom::Eq(s("docs"))),
+            ("year", IndexAtom::Cmp(CmpOp::Ge, i(2025))),
+            ("active", IndexAtom::Eq(Value::Bool(true))),
+        ] {
+            let a = original.selectivity(field, &atom);
+            let b = back.selectivity(field, &atom);
+            assert_eq!(a, b, "selectivity diverged after round-trip on {field}");
+        }
+    }
+
+    #[test]
+    fn decode_rejects_bad_magic() {
+        let bytes = vec![0u8; 64];
+        let err = StatsCatalog::decode(&bytes).unwrap_err();
+        assert!(matches!(err, KovaMetaIndexError::BadMagic), "{err:?}");
+    }
+
+    #[test]
+    fn decode_rejects_unsupported_version() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(STATS_MAGIC);
+        bytes.extend_from_slice(&999u32.to_le_bytes());
+        bytes.extend_from_slice(&[0u8; 8]);
+        let err = StatsCatalog::decode(&bytes).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                KovaMetaIndexError::UnsupportedVersion {
+                    expected: 1,
+                    got: 999
+                }
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn decode_rejects_truncated() {
+        let err = StatsCatalog::decode(&[0u8; 3]).unwrap_err();
+        assert!(
+            matches!(err, KovaMetaIndexError::Truncated { .. }),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn load_missing_file_returns_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nonexistent.bin");
+        assert!(StatsCatalog::load(&path).unwrap().is_none());
+    }
+
+    #[test]
+    fn load_existing_file_round_trip() {
+        let mut b = StatsBuilder::new();
+        for n in 0..5 {
+            b.observe(&meta_from(&[("x", i(n))]));
+        }
+        let cat = b.finish();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("stats.bin");
+        std::fs::write(&path, cat.encode().unwrap()).unwrap();
+        let loaded = StatsCatalog::load(&path).unwrap().unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert!(loaded.get("x").is_some());
     }
 }
