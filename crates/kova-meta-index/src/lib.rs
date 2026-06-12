@@ -36,6 +36,7 @@ pub mod catalog;
 pub mod error;
 pub mod hash;
 pub mod inverted;
+pub mod stats;
 
 use kova_core::{Value, VectorId};
 use roaring::RoaringTreemap;
@@ -46,6 +47,7 @@ pub use catalog::{IndexCatalog, IndexKind};
 pub use error::KovaMetaIndexError;
 pub use hash::HashIndex;
 pub use inverted::InvertedIndex;
+pub use stats::{ColumnStats, ColumnStatsKind, HistogramBucket, StatsCatalog};
 
 /// Comparison operator for [`IndexAtom::Cmp`].
 ///
