@@ -4,6 +4,7 @@
 use std::io::{self, Read};
 
 use kova_core::{Metadata, Vector, VectorId};
+use kova_meta_index::IndexKind;
 use serde::{Deserialize, Serialize};
 
 use crate::KovaStorageError;
@@ -58,6 +59,33 @@ pub enum Record {
         old_metadata: Metadata,
         /// New metadata bag (replaces the old one in full).
         metadata: Metadata,
+    },
+    /// Register a named secondary index of `kind` on `field`.
+    /// Replay re-applies it via
+    /// [`crate::IndexCatalog::create_named_index`] plus a backfill
+    /// against the metadata store at this point in the WAL.
+    ///
+    /// **Replay correctness invariant** : the backfill walk reads
+    /// the metadata store's current state, which by the WAL's
+    /// strict ordering reflects every preceding `Insert`/`Delete`/
+    /// `UpdateMetadata` record. Reordering the replay loop would
+    /// break this.
+    CreateIndex {
+        /// Index name (the DDL identifier, possibly auto-synthesised
+        /// by the binder).
+        name: String,
+        /// Indexed field name (top-level bag key).
+        field: String,
+        /// Index method.
+        kind: IndexKind,
+    },
+    /// Drop a named secondary index. Replay re-applies it via
+    /// [`crate::IndexCatalog::drop_named_index`] which both
+    /// unregisters the name and removes the underlying bucket
+    /// state.
+    DropIndex {
+        /// Index name (the DDL identifier).
+        name: String,
     },
 }
 

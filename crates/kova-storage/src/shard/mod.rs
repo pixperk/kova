@@ -280,40 +280,64 @@ where
         &self.catalog
     }
 
-    /// Register a [`HashIndex`](kova_meta_index::HashIndex) on `field`
-    /// and backfill it from the shard's current metadata. The new
-    /// index is then maintained automatically by every subsequent
-    /// `insert`/`delete`/`update` op.
+    /// Register an anonymous [`HashIndex`](kova_meta_index::HashIndex)
+    /// on `field` and backfill it from the shard's current
+    /// metadata. The new index is then maintained automatically by
+    /// every subsequent `insert`/`delete`/`update` op.
     ///
-    /// Idempotent-replace : calling this twice on the same field
-    /// rebuilds the index from scratch.
+    /// The "anonymous" qualifier matters : this index has no name
+    /// in the catalog's registry, so it cannot be dropped by
+    /// `DROP INDEX`. It exists solely for code paths that want to
+    /// install an index without going through DDL. For named
+    /// (DDL-style) indexes that survive reopen, use
+    /// [`Self::create_index`].
+    ///
+    /// # Errors
+    /// Returns [`ShardError::Backend`] wrapping
+    /// [`kova_meta_index::KovaMetaIndexError::IndexAlreadyExists`]
+    /// if a hash index already exists on `field`. Each
+    /// `(field, kind)` slot holds at most one index.
     ///
     /// # Durability
     /// The new index is **transient** until the next successful
-    /// [`Self::checkpoint`]. Indexes registered after the last
-    /// checkpoint are lost on close ; call `checkpoint` before
-    /// closing if you want them to survive reopen.
-    pub fn add_hash_index(&mut self, field: &str) {
-        self.catalog.add_hash_index(field);
+    /// [`Self::checkpoint`]. Anonymous adds are NOT WAL-persisted
+    /// (unlike [`Self::create_index`]), so a close without a
+    /// checkpoint loses them. Tests are the primary caller, and
+    /// tests don't reopen ; production code paths should use
+    /// [`Self::create_index`].
+    pub fn add_hash_index(&mut self, field: &str) -> Result<(), ShardError> {
+        self.catalog
+            .add_hash_index(field)
+            .map_err(ShardError::backend)?;
         self.backfill_field(field);
+        Ok(())
     }
 
-    /// Register a [`BTreeIndex`](kova_meta_index::BTreeIndex) on
-    /// `field` and backfill it from current metadata. See
-    /// [`Self::add_hash_index`] for the maintenance and durability
-    /// contracts.
-    pub fn add_btree_index(&mut self, field: &str) {
-        self.catalog.add_btree_index(field);
+    /// Anonymous [`BTreeIndex`](kova_meta_index::BTreeIndex)
+    /// counterpart of [`Self::add_hash_index`].
+    ///
+    /// # Errors
+    /// See [`Self::add_hash_index`].
+    pub fn add_btree_index(&mut self, field: &str) -> Result<(), ShardError> {
+        self.catalog
+            .add_btree_index(field)
+            .map_err(ShardError::backend)?;
         self.backfill_field(field);
+        Ok(())
     }
 
-    /// Register an [`InvertedIndex`](kova_meta_index::InvertedIndex)
-    /// on `field` and backfill it from current metadata. See
-    /// [`Self::add_hash_index`] for the maintenance and durability
-    /// contracts.
-    pub fn add_inverted_index(&mut self, field: &str) {
-        self.catalog.add_inverted_index(field);
+    /// Anonymous
+    /// [`InvertedIndex`](kova_meta_index::InvertedIndex)
+    /// counterpart of [`Self::add_hash_index`].
+    ///
+    /// # Errors
+    /// See [`Self::add_hash_index`].
+    pub fn add_inverted_index(&mut self, field: &str) -> Result<(), ShardError> {
+        self.catalog
+            .add_inverted_index(field)
+            .map_err(ShardError::backend)?;
         self.backfill_field(field);
+        Ok(())
     }
 
     /// DDL : register a **named** secondary index of `kind` on
@@ -344,9 +368,43 @@ where
         field: &str,
         kind: IndexKind,
     ) -> Result<(), ShardError> {
-        self.catalog
-            .create_named_index(name, field, kind)
-            .map_err(ShardError::backend)?;
+        // Phase 1 : pre-commit validation. Catch duplicate name and
+        // slot-occupied conditions before the WAL is touched.
+        if self.catalog.resolve_name(name).is_some() {
+            return Err(ShardError::backend(
+                kova_meta_index::KovaMetaIndexError::IndexNameInUse {
+                    name: name.to_string(),
+                },
+            ));
+        }
+        if self.catalog.has_kind_on(field, kind) {
+            return Err(ShardError::backend(
+                kova_meta_index::KovaMetaIndexError::IndexAlreadyExists {
+                    field: field.to_string(),
+                    kind,
+                },
+            ));
+        }
+
+        // Phase 2 : commit. After sync returns Ok the DDL is durable.
+        let record = Record::CreateIndex {
+            name: name.to_string(),
+            field: field.to_string(),
+            kind,
+        };
+        self.wal.append(&record).map_err(ShardError::backend)?;
+        self.wal.sync().map_err(ShardError::backend)?;
+
+        // Phase 3 : apply. Phase 1 validated, so this must succeed ;
+        // if the catalog disagrees the WAL has committed something
+        // we can't apply, which is a broken invariant. Panic so
+        // replay can reconcile.
+        if let Err(e) = self.catalog.create_named_index(name, field, kind) {
+            panic!(
+                "Shard::create_index phase-3 apply failure on catalog.create_named_index: {e:?} \
+                 (WAL has committed the record ; aborting so replay can reconcile)"
+            );
+        }
         self.backfill_field(field);
         Ok(())
     }
@@ -365,9 +423,30 @@ where
     /// [`KovaMetaIndexError::UnknownIndexName`] when `name` was
     /// never registered.
     pub fn drop_index(&mut self, name: &str) -> Result<(), ShardError> {
-        self.catalog
-            .drop_named_index(name)
-            .map_err(ShardError::backend)
+        // Phase 1 : pre-commit validation.
+        if self.catalog.resolve_name(name).is_none() {
+            return Err(ShardError::backend(
+                kova_meta_index::KovaMetaIndexError::UnknownIndexName {
+                    name: name.to_string(),
+                },
+            ));
+        }
+
+        // Phase 2 : commit.
+        let record = Record::DropIndex {
+            name: name.to_string(),
+        };
+        self.wal.append(&record).map_err(ShardError::backend)?;
+        self.wal.sync().map_err(ShardError::backend)?;
+
+        // Phase 3 : apply.
+        if let Err(e) = self.catalog.drop_named_index(name) {
+            panic!(
+                "Shard::drop_index phase-3 apply failure on catalog.drop_named_index: {e:?} \
+                 (WAL has committed the record ; aborting so replay can reconcile)"
+            );
+        }
+        Ok(())
     }
 
     /// Scan the metadata store for rows that have `field`, pull the
@@ -467,6 +546,28 @@ where
                     self.catalog.on_update(id, &old_metadata, &metadata);
                     self.metadata
                         .put(id, metadata)
+                        .map_err(ShardError::backend)?;
+                }
+                Record::CreateIndex { name, field, kind } => {
+                    // Replay-time index registration. Mirrors the
+                    // live path's phase-3 apply : catalog gets the
+                    // new index, then `backfill_field` walks the
+                    // metadata store to populate it.
+                    //
+                    // Backfill correctness during replay relies on
+                    // every preceding `Insert` / `Delete` /
+                    // `UpdateMetadata` record having been applied
+                    // to `self.metadata` already, which the WAL's
+                    // strict ordering plus this `for` loop's
+                    // ordering guarantees.
+                    self.catalog
+                        .create_named_index(&name, &field, kind)
+                        .map_err(ShardError::backend)?;
+                    self.backfill_field(&field);
+                }
+                Record::DropIndex { name } => {
+                    self.catalog
+                        .drop_named_index(&name)
                         .map_err(ShardError::backend)?;
                 }
             }

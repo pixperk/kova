@@ -56,7 +56,7 @@ fn fresh_shard() -> Shard<L2, InMemoryVectorStore, InMemoryMetadataStore, InMemo
 #[test]
 fn add_hash_index_then_insert_routes_through_catalog() {
     let mut shard = fresh_shard();
-    shard.add_hash_index("category");
+    shard.add_hash_index("category").unwrap();
 
     shard
         .insert(id(0), v(vec![1.0, 0.0]), meta(&[("category", s("docs"))]))
@@ -90,7 +90,7 @@ fn insert_before_add_index_then_backfill() {
         .insert(id(1), v(vec![0.0, 1.0]), meta(&[("category", s("blog"))]))
         .unwrap();
 
-    shard.add_hash_index("category");
+    shard.add_hash_index("category").unwrap();
 
     let docs = shard
         .catalog()
@@ -103,9 +103,9 @@ fn insert_before_add_index_then_backfill() {
 #[test]
 fn insert_many_populates_all_indexes() {
     let mut shard = fresh_shard();
-    shard.add_hash_index("category");
-    shard.add_btree_index("year");
-    shard.add_inverted_index("tags");
+    shard.add_hash_index("category").unwrap();
+    shard.add_btree_index("year").unwrap();
+    shard.add_inverted_index("tags").unwrap();
 
     let batch: Vec<_> = (0u64..6)
         .map(|n| {
@@ -157,7 +157,7 @@ fn insert_many_populates_all_indexes() {
 #[test]
 fn delete_removes_id_from_catalog() {
     let mut shard = fresh_shard();
-    shard.add_hash_index("category");
+    shard.add_hash_index("category").unwrap();
 
     shard
         .insert(id(0), v(vec![1.0, 0.0]), meta(&[("category", s("docs"))]))
@@ -180,7 +180,7 @@ fn delete_removes_id_from_catalog() {
 #[test]
 fn delete_many_removes_all_from_catalog() {
     let mut shard = fresh_shard();
-    shard.add_hash_index("category");
+    shard.add_hash_index("category").unwrap();
 
     for n in 0u64..5 {
         shard
@@ -210,7 +210,7 @@ fn delete_many_removes_all_from_catalog() {
 #[test]
 fn update_metadata_moves_id_between_buckets() {
     let mut shard = fresh_shard();
-    shard.add_hash_index("category");
+    shard.add_hash_index("category").unwrap();
 
     shard
         .insert(id(0), v(vec![1.0, 0.0]), meta(&[("category", s("docs"))]))
@@ -238,7 +238,7 @@ fn update_dropping_indexed_field_removes_from_index() {
     // The new bag doesn't have the indexed field at all : the row
     // disappears from the bucket but survives in the shard.
     let mut shard = fresh_shard();
-    shard.add_hash_index("category");
+    shard.add_hash_index("category").unwrap();
 
     shard
         .insert(id(0), v(vec![1.0, 0.0]), meta(&[("category", s("docs"))]))
@@ -265,7 +265,7 @@ fn update_dropping_indexed_field_removes_from_index() {
 #[test]
 fn update_adding_indexed_field_inserts_into_index() {
     let mut shard = fresh_shard();
-    shard.add_hash_index("category");
+    shard.add_hash_index("category").unwrap();
 
     shard
         .insert(id(0), v(vec![1.0, 0.0]), meta(&[("other", s("x"))]))
@@ -296,9 +296,9 @@ fn multi_field_composition_works_end_to_end() {
     //   = (n < 10) AND (n % 4 == 0) AND (n < 5)
     //   = n in {0, 4}
     let mut shard = fresh_shard();
-    shard.add_hash_index("category");
-    shard.add_btree_index("year");
-    shard.add_inverted_index("tags");
+    shard.add_hash_index("category").unwrap();
+    shard.add_btree_index("year").unwrap();
+    shard.add_inverted_index("tags").unwrap();
 
     let batch: Vec<_> = (0u64..20)
         .map(|n| {
@@ -356,7 +356,7 @@ fn lookup_returns_none_for_unindexed_field() {
 #[test]
 fn estimate_matches_lookup_len() {
     let mut shard = fresh_shard();
-    shard.add_hash_index("category");
+    shard.add_hash_index("category").unwrap();
     for n in 0u64..40 {
         let v_ = if n % 5 == 0 { s("hot") } else { s("cold") };
         shard
@@ -382,7 +382,7 @@ fn estimate_matches_lookup_len() {
 #[test]
 fn missing_field_in_row_doesnt_affect_other_rows() {
     let mut shard = fresh_shard();
-    shard.add_hash_index("category");
+    shard.add_hash_index("category").unwrap();
 
     shard
         .insert(id(0), v(vec![1.0, 0.0]), meta(&[("category", s("docs"))]))

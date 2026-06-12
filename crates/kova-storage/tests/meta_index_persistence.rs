@@ -46,7 +46,7 @@ fn catalog_survives_close_after_checkpoint() {
 
     {
         let mut shard = Shard::open(dir.path(), 2, L2, HnswParams::default()).unwrap();
-        shard.add_hash_index("category");
+        shard.add_hash_index("category").unwrap();
 
         for n in 0u64..10 {
             let category = if n % 2 == 0 { "docs" } else { "blog" };
@@ -82,7 +82,7 @@ fn post_checkpoint_records_replay_into_loaded_catalog() {
 
     {
         let mut shard = Shard::open(dir.path(), 2, L2, HnswParams::default()).unwrap();
-        shard.add_hash_index("category");
+        shard.add_hash_index("category").unwrap();
 
         for n in 0u64..5 {
             shard
@@ -127,7 +127,7 @@ fn indexes_without_checkpoint_dont_persist() {
         shard
             .insert(id(0), v(vec![1.0, 0.0]), meta(&[("category", s("docs"))]))
             .unwrap();
-        shard.add_hash_index("category");
+        shard.add_hash_index("category").unwrap();
         // NO checkpoint here.
     }
 
@@ -150,9 +150,9 @@ fn all_three_index_types_persist_together() {
 
     {
         let mut shard = Shard::open(dir.path(), 2, L2, HnswParams::default()).unwrap();
-        shard.add_hash_index("category");
-        shard.add_btree_index("year");
-        shard.add_inverted_index("tags");
+        shard.add_hash_index("category").unwrap();
+        shard.add_btree_index("year").unwrap();
+        shard.add_inverted_index("tags").unwrap();
 
         for n in 0u64..6 {
             let category = if n % 2 == 0 { "docs" } else { "blog" };
@@ -200,7 +200,7 @@ fn delete_after_checkpoint_replays_into_catalog() {
 
     {
         let mut shard = Shard::open(dir.path(), 2, L2, HnswParams::default()).unwrap();
-        shard.add_hash_index("category");
+        shard.add_hash_index("category").unwrap();
         for n in 0u64..5 {
             shard
                 .insert(
@@ -236,7 +236,7 @@ fn update_after_checkpoint_replays_into_catalog() {
 
     {
         let mut shard = Shard::open(dir.path(), 2, L2, HnswParams::default()).unwrap();
-        shard.add_hash_index("category");
+        shard.add_hash_index("category").unwrap();
         shard
             .insert(id(0), v(vec![1.0, 0.0]), meta(&[("category", s("docs"))]))
             .unwrap();
@@ -267,7 +267,7 @@ fn second_checkpoint_supersedes_first_catalog_file() {
     let dir = tempdir().unwrap();
     {
         let mut shard = Shard::open(dir.path(), 2, L2, HnswParams::default()).unwrap();
-        shard.add_hash_index("category");
+        shard.add_hash_index("category").unwrap();
         shard
             .insert(id(0), v(vec![1.0, 0.0]), meta(&[("category", s("docs"))]))
             .unwrap();
@@ -301,7 +301,7 @@ fn orphan_catalog_files_swept_on_open() {
     // First produce a manifest + catalog at gen 1.
     {
         let mut shard = Shard::open(dir.path(), 2, L2, HnswParams::default()).unwrap();
-        shard.add_hash_index("category");
+        shard.add_hash_index("category").unwrap();
         shard
             .insert(id(0), v(vec![1.0, 0.0]), meta(&[("category", s("docs"))]))
             .unwrap();

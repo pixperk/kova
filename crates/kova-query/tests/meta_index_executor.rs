@@ -120,21 +120,21 @@ fn round_trip(sql: &str, params: ParamBindings, index_setup: fn(&mut Engine<L2>)
 }
 
 fn install_hash_on_category(engine: &mut Engine<L2>) {
-    engine.shard_mut().add_hash_index("category");
+    engine.shard_mut().add_hash_index("category").unwrap();
 }
 
 fn install_btree_on_year(engine: &mut Engine<L2>) {
-    engine.shard_mut().add_btree_index("year");
+    engine.shard_mut().add_btree_index("year").unwrap();
 }
 
 fn install_inverted_on_tags(engine: &mut Engine<L2>) {
-    engine.shard_mut().add_inverted_index("tags");
+    engine.shard_mut().add_inverted_index("tags").unwrap();
 }
 
 fn install_all_three(engine: &mut Engine<L2>) {
-    engine.shard_mut().add_hash_index("category");
-    engine.shard_mut().add_btree_index("year");
-    engine.shard_mut().add_inverted_index("tags");
+    engine.shard_mut().add_hash_index("category").unwrap();
+    engine.shard_mut().add_btree_index("year").unwrap();
+    engine.shard_mut().add_inverted_index("tags").unwrap();
 }
 
 // ---- Pure scan-and-limit shapes (no kNN ORDER BY) ----
@@ -210,8 +210,8 @@ fn and_two_indexes_full_path_matches_fallback() {
         "SELECT id FROM vectors WHERE category = 'docs' AND year >= 2023 LIMIT 100",
         ParamBindings::empty(),
         |e| {
-            e.shard_mut().add_hash_index("category");
-            e.shard_mut().add_btree_index("year");
+            e.shard_mut().add_hash_index("category").unwrap();
+            e.shard_mut().add_btree_index("year").unwrap();
         },
     );
 }
@@ -278,7 +278,7 @@ fn delete_by_predicate_still_works_with_indexes_registered() {
     let dir = tempdir().unwrap();
     let mut engine = Engine::new(open_shard(dir.path()), "vectors");
     seed(&mut engine);
-    engine.shard_mut().add_hash_index("category");
+    engine.shard_mut().add_hash_index("category").unwrap();
 
     let result = engine
         .execute_str(
@@ -300,7 +300,7 @@ fn index_registered_after_inserts_still_matches_fallback() {
     let mut engine = Engine::new(open_shard(dir.path()), "vectors");
     seed(&mut engine);
     // Register AFTER inserts ; backfill walks the metadata store.
-    engine.shard_mut().add_hash_index("category");
+    engine.shard_mut().add_hash_index("category").unwrap();
 
     let dir_b = tempdir().unwrap();
     let mut engine_b = Engine::new(open_shard(dir_b.path()), "vectors");
@@ -332,7 +332,7 @@ fn no_match_on_indexed_field_returns_empty() {
     let dir = tempdir().unwrap();
     let mut engine = Engine::new(open_shard(dir.path()), "vectors");
     seed(&mut engine);
-    engine.shard_mut().add_hash_index("category");
+    engine.shard_mut().add_hash_index("category").unwrap();
 
     let result = engine
         .execute_str(
@@ -516,8 +516,8 @@ fn delete_and_chain_full_path_matches_fallback() {
         "DELETE FROM vectors WHERE category = 'blog' AND year < 2023",
         ParamBindings::empty(),
         |e| {
-            e.shard_mut().add_hash_index("category");
-            e.shard_mut().add_btree_index("year");
+            e.shard_mut().add_hash_index("category").unwrap();
+            e.shard_mut().add_btree_index("year").unwrap();
         },
     );
 }
