@@ -16,7 +16,7 @@ with gRPC between nodes. Every byte, every index, every network call is ours.
 | `kova-core`    | shipped     | `Vector`, `Distance` trait + `Cosine` / `L2` / `InnerProduct` (SIMD)   |
 | `kova-index`   | shipped     | `Index` trait, `FlatIndex` baseline, `HnswIndex` (insert + search + two-pass vacuum + streaming snapshot) |
 | `kova-storage` | shipped     | Segmented WAL, `MmapVectorStore` (free-list slot reuse, crash-mid-init recovery), `FileMetadataStore`, `atomic_write` (+ streaming variant), `Manifest` commit point, `Shard` (log-then-mutate, batched inserts, logical delete, vacuum, checkpoint + WAL truncate, generation-numbered snapshots). SIGKILL-tested across 55,697 acks and 962 checkpoints. |
-| `kova-query`   | Phase 1 shipped | KQL end to end : parser (Pest grammar, all 8 statements), binder (typed `LogicalStatement` with hard semantic rejections), planner (three SELECT strategies dispatched by predicate selectivity, plus radius, COUNT and scan-and-limit bypasses), executor wired to `Shard` for both read and write paths, full DML (INSERT / UPDATE / DELETE including subscripted, radius, and param-bound shapes), `Value::Map` for nested metadata, probabilistic query fuzzer with reference-impl correctness check, recall regression sweep across kNN / filtered / radius. See [`docs/query.md`](docs/query.md). |
+| `kova-query`   | shipped     | KQL end to end : parser (Pest grammar, full DML + DDL), binder (typed `LogicalStatement` with hard semantic rejections), planner (three SELECT strategies dispatched by predicate selectivity, plus radius, COUNT and scan-and-limit bypasses), executor wired to `Shard` for both read and write paths, full DML (INSERT / UPDATE / DELETE including subscripted, radius, and param-bound shapes), `CREATE INDEX` / `DROP INDEX` end to end via the `IndexCatalog`, `Value::Map` for nested metadata, probabilistic query fuzzer with reference-impl correctness check, recall regression sweep across kNN / filtered / radius. See [`docs/query.md`](docs/query.md). |
 | `kova-meta-index` | shipped | Secondary indexes on metadata fields : `HashIndex` (equality), `BTreeIndex` (range, with float-ordering gate), `InvertedIndex` (array containment). `RoaringTreemap`-backed bitmaps compose for AND / OR / NOT in microseconds. `IndexCatalog` orchestrates per-field bundles, routes lookups by priority, exposes exact cardinality for the planner. Catalog persists alongside the graph snapshot, generation-numbered like `graph.{N}.snapshot`. WAL records carry `old_metadata` so replay rebuilds the catalog without depending on the (eagerly-mutated) metadata store. See [`docs/meta-index.md`](docs/meta-index.md). |
 | `kova-cluster` | not started | Consistent hashing, quorum replication, coordinator                    |
 | `kova-server`  | not started | gRPC node binary                                                       |
@@ -802,7 +802,7 @@ the indexes never have to worry about id range exhaustion. At Kova's
 scale that doesn't matter, but coding to `u64` from the start means
 no migration when shards get large enough that it does.
 
-## `kova-query` : KQL (Phase 1 shipped)
+## `kova-query` : KQL
 
 KQL is the SQL-shaped query language Kova uses for hybrid vector +
 metadata workloads. **One query expresses both an ANN search and a
@@ -811,7 +811,7 @@ based on the predicate's selectivity, so you don't have to.** That
 is the whole pitch ; the rest of this section unpacks it.
 
 This is the README view. Full architecture, plan dispatch, type
-system, algorithms, and the Phase 2 plan live in
+system, algorithms, baselines, and what's still in flight live in
 [`docs/query.md`](docs/query.md).
 
 ### What a real KQL query looks like
@@ -866,19 +866,20 @@ Plan A is the obvious one. Plan B is the small-selectivity bypass.
 Plan C is the contribution that makes the middle band fast : neither
 overfetch nor pre-scan can win there, but threading the predicate
 into the graph walk does. The selectivity bands are constants today ;
-Phase 2 swaps in a histogram-backed estimator and a cost model behind
-the same `SelectivityEstimator` trait, no planner change required.
+the next planner pass replaces them with a cost model that reads
+from a histogram-backed estimator behind the same
+`SelectivityEstimator` trait, no planner change required.
 
 ### Coverage at a glance
 
 Everything the language accepts today, by pipeline layer :
 
-| Layer | What lands in Phase 1 |
+| Layer | What lands |
 |-------|------------------------|
 | Grammar | All 8 statements parse (SELECT / INSERT / UPDATE / DELETE / VACUUM / CHECKPOINT / CREATE / DROP INDEX). Predicates : 6 comparison ops, `IN`, `BETWEEN`, `IS NULL`, `@>`, distance threshold, AND/OR/NOT with correct precedence. Subscripted field references (`attrs['key']`) work in both predicates and assignments. |
-| Binder | Hard semantic rejections : embedding mutation, kNN without LIMIT, distance ordering with `DESC`, OR containing a distance threshold, v2-only DDL. |
+| Binder | Hard semantic rejections : embedding mutation, kNN without LIMIT, distance ordering with `DESC`, OR containing a distance threshold. `CREATE INDEX` / `DROP INDEX` flow through ; missing names get synthesised. |
 | Planner | Three kNN strategies dispatched by predicate selectivity, plus radius operator, COUNT bypass, scan-and-limit bypass. Single-id hint detection (literal + param) fast-paths DELETE / UPDATE. |
-| Executor | Full DML : single + batch INSERT, DELETE-by-id / by-param / by-predicate / by-radius, UPDATE-by-id / by-param / by-predicate / by-radius with flat or subscripted SET clauses. VACUUM + CHECKPOINT bridge to `Shard`. |
+| Executor | Full DML : single + batch INSERT, DELETE-by-id / by-param / by-predicate / by-radius, UPDATE-by-id / by-param / by-predicate / by-radius with flat or subscripted SET clauses. DDL : `Shard::create_index` / `drop_index` go through the WAL so the catalog survives reopen. VACUUM + CHECKPOINT bridge to `Shard`. |
 | Types | `Value` covers `String`, `I64`, `F64`, `Bool`, `Array`, `Map` (nested bags). Numeric coercion (`5 == 5.0`) ; everything else is type-strict. |
 
 ### Why you can trust it
@@ -911,10 +912,12 @@ boundaries are stable contracts so grammar changes do not churn the
 planner and vice versa.
 
 **Selectivity-driven plan dispatch, behind a trait.** The
-`SelectivityEstimator` trait is what picks plan A / B / C. Phase 1
-ships a `ShardEstimator` that evaluates the predicate against every
-row (cheap : metadata is in-memory). Phase 2 swaps in a histogram-
-backed estimator behind the same trait, no planner change.
+`SelectivityEstimator` trait is what picks plan A / B / C. The
+shipped `ShardEstimator` consults the `IndexCatalog` first
+(exact cardinality in O(1) for indexed atoms, hybrid for mixed,
+fallback scan for the rest). A histogram-backed estimator for
+unindexed columns plugs in behind the same trait, no planner
+change required.
 
 **Single-id hint instead of duplicate paths.** `DELETE WHERE id = 42`
 and `DELETE WHERE id = $1` both flow through the same `LogicalDelete
@@ -939,13 +942,13 @@ fuzzer enforces that every code path through the pipeline returns
 one of these, never panics. A panic is always a bug ; a typed error
 is a contract.
 
-**The reference fuzzer caught its own bug.** Phase 1's correctness
+**The reference fuzzer caught its own bug.** The correctness
 fuzzer is reference-first : the reference impl computes the expected
 result before the engine runs. An earlier version let the engine
 run first and the reference fell behind on shapes it could not
 evaluate, manifesting as a fake "engine deleted 0, expected 10"
 mismatch. The fix was harness discipline, not engine code, but the
-mode of failure is the kind of methodology Phase 2 inherits.
+mode of failure is the kind of methodology the project keeps.
 
 ## `kova-meta-index` : secondary indexes
 

@@ -7,8 +7,8 @@ plan -> execute pipeline, including DDL, DML, management ops, and
 reads.
 
 This document is the reference. The README has the highlights ; here
-is the full architecture, the design choices, how Phase 1 stands,
-and what Phase 2 changes.
+is the full architecture, the design choices, what ships today,
+and what's still in flight.
 
 If you are new to KQL, read top-to-bottom. The first few sections
 are a guided tour : a 30-second taste, then a quick start you can
@@ -17,7 +17,7 @@ have a feel for the language, the middle of the doc opens up the
 pipeline and the algorithms underneath. The reference material
 (types, full statement coverage, result shapes) lives near the end,
 and the closing sections cover how we know it works and what
-Phase 2 changes.
+remains.
 
 ---
 
@@ -238,8 +238,8 @@ planner picks what it picks, and how you can be sure it works.
 You have seen the queries. The rest of the doc is for the curious :
 **how the engine actually answers them.** Skip ahead to "Type system
 and reference" if you only need the API. Stay with us if you want to
-understand what changed when KQL shipped, and why Phase 2 will be
-fast without anyone having to rewrite their queries.
+understand what KQL ships, and why future work will keep speeding
+things up without anyone having to rewrite their queries.
 
 The next handful of sections walk through the pipeline as a whole,
 then each layer in turn, then the algorithms inside the operators.
@@ -349,8 +349,10 @@ loud-and-clear rejections. What it does :
    both get a `single_id_hint`. The planner uses this to dispatch
    `DeleteById` / `DeleteByParamId` / `UpdateById` / `UpdateByParamId`
    without re-walking the predicate tree.
-5. **v2-only DDL rejection.** `CREATE INDEX` and `DROP INDEX` parse
-   but the binder refuses them ; index DDL is Phase 2 territory.
+5. **DDL pass-through.** `CREATE INDEX` and `DROP INDEX` flow
+   through to `LogicalCreateIndex` / `LogicalDropIndex` ; the
+   binder synthesises a default name when the user omitted one,
+   so downstream code can assume the name is always set.
 
 The result is a `LogicalStatement` that is guaranteed well-typed and
 free of grammar-level ambiguity. Anything downstream of the binder
@@ -416,10 +418,14 @@ trait SelectivityEstimator {
 }
 ```
 
-Phase 1's implementation (`ShardEstimator`) runs the predicate
-against every row and returns an exact count. Cheap because metadata
-is in-memory. Phase 2 swaps in an estimator backed by histograms and
-secondary-index cardinality, same trait, same dispatch.
+The shipped implementation (`ShardEstimator`) consults the
+secondary-index catalog first via the same three-way dispatch the
+executor uses : pure-index hits return cardinality in O(1),
+hybrid hits walk only the indexed candidates and evaluate the
+residue per row, and predicates the catalog can't touch fall
+back to a metadata scan. A histogram-backed selectivity estimator
+for unindexed columns is what's still in flight ; the trait stays
+the same, the dispatch stays the same.
 
 ### Radius operator
 
@@ -442,7 +448,7 @@ when the entry point is outside the ball.
 
 AND-residue stays on as a `post_filter`. OR with a distance threshold
 is rejected at plan time : the right answer is a Union operator that
-merges radius balls, which is not in Phase 1.
+merges radius balls, which doesn't ship today.
 
 ### COUNT(*) bypass
 
@@ -644,7 +650,7 @@ flowchart TD
     AddCand -.-> Loop
 ```
 
-The Phase 1 implementation passes the filter as a borrowed `&F`
+The implementation passes the filter as a borrowed `&F`
 where `F: Fn(VectorId) -> bool`. The `Shard` wrapper
 (`search_filtered`) bridges from the engine's `FnMut(&Metadata) ->
 bool` predicate to the index's `Fn(VectorId) -> bool` via
@@ -756,8 +762,8 @@ on bad input :
 | `KovaQueryError::Execution` | Runtime issue : missing param, missing id, wrong type |
 | `KovaQueryError::Backend` | Boxed error from the `Shard` layer (WAL, storage, index) |
 
-The fuzzer (see Phase 1 status below) enforces this : 32k+ queries
-across multiple seeds, zero panics.
+The fuzzer (see the test surface section below) enforces this :
+32k+ queries across multiple seeds, zero panics.
 
 ### The result shape
 
@@ -951,7 +957,7 @@ let params = ParamBindings::empty()
 
 ---
 
-## Statement coverage in Phase 1
+## Statement coverage
 
 Everything in this table works end to end :
 
@@ -973,15 +979,16 @@ Everything in this table works end to end :
 | `UPDATE vectors SET f = v WHERE embedding <-> $q < r [AND pred]` | radius | |
 | `UPDATE vectors SET attrs['key'] = v WHERE ...` | subscripted | Lands the value in a nested Map |
 | `UPDATE vectors SET attrs = $1 WHERE id = $2` | bag-replace | `$1` is `ParamValue::Metadata` |
+| `CREATE INDEX [name] ON vectors USING <method> (<field>)` | DDL | Synthesises name when absent ; WAL-persisted |
+| `DROP INDEX <name> ON vectors` | DDL | Drops by registered name |
 | `VACUUM vectors` | management | Bridges to `Shard::vacuum` |
 | `CHECKPOINT` | management | Bridges to `Shard::checkpoint` |
 
-What is **not** in Phase 1 :
+What's **not** in the grammar :
 
-| Shape | Why deferred |
+| Shape | Why |
 |-------|--------------|
-| `CREATE INDEX`, `DROP INDEX` | No secondary indexes in Phase 1 |
-| `OR` with a distance threshold | Needs a Union operator (Phase 2) |
+| `OR` with a distance threshold | Needs a Union operator that merges radius balls ; not shipped |
 | `WHERE attrs['a']['b'] = ...` | Multi-level subscripts ; grammar would need to grow |
 | Multi-table queries, JOIN | Out of language scope (single `vectors` table) |
 | Transactions across statements | Each statement is its own commit |
@@ -992,10 +999,10 @@ Reference covered. The next section is the case for trusting any of
 this : what the test surface looks like, what numbers it produces,
 and how the fuzzer that produces them actually works.
 
-## What Phase 1 ships strong
+## What KQL ships strong
 
-Phase 1 has three load-bearing guarantees, each backed by mechanical
-verification :
+KQL has three load-bearing guarantees today, each backed by
+mechanical verification :
 
 **No-panic across the language surface.** The fuzzer
 ([`fuzz_query.rs`](../crates/kova-query/tests/fuzz_query.rs))
@@ -1016,8 +1023,8 @@ divergence.
 The reference-first design (compute expectation, then execute) was
 itself caught by the fuzzer : an earlier version let the engine run
 ahead and the reference fell behind on uncheckable shapes. The bug
-was in the harness, not the engine, but the fix is the fuzzer
-methodology Phase 2 inherits.
+was in the harness, not the engine, but the fix is a methodology
+the project keeps.
 
 **Recall measured, not assumed.** The HNSW recall sweep
 ([`hnsw/search.rs`](../crates/kova-index/src/hnsw/search.rs))
@@ -1178,9 +1185,11 @@ A few categories are out of scope by construction :
   approximation. The fuzzer asserts no panic on those, but does
   not compare results against a brute-force reference. The recall
   sweep above is what does that.
-- **Performance regressions.** No timing assertions. A slow query
-  is still a passing query. Phase 2's M2.7 milestone is where
-  latency baselines land.
+- **Performance regressions.** No timing assertions in the fuzzer.
+  A slow query is still a passing query. The criterion baselines
+  in "What ships today" cover the metadata-index path ; broader
+  latency baselines (kNN, radius, etc.) land alongside the
+  external benchmarks.
 - **Multi-query coherence.** Each iteration is independent. The
   fuzzer does not check that a sequence of queries preserves some
   invariant across them (other than the implicit "reference and
@@ -1193,101 +1202,133 @@ if you want to read the actual generators.
 
 ---
 
-The case for trust covered. The last substantive section is the
-case for staying : what Phase 2 changes, and how it manages to do so
-without breaking anything Phase 1 already ships. If you are picking
-up KQL now, this is what tomorrow looks like.
+The case for trust covered. The next two sections look at what
+the engine does today on top of the original KQL surface (real
+indexes, real DDL, real selectivity estimation from the catalog),
+and what's still in flight on the planner side.
 
-## What Phase 2 builds on top
+## What ships today
 
-Phase 2 is where KQL goes from "works" to "fast at scale on
-predicate-heavy workloads." The shape is :
+The KQL pipeline already does more than what the introduction
+described. The grammar parses every statement the README mentions
+and a few more besides ; the binder normalises predicates and
+catches semantic errors loudly ; the planner picks one of three
+strategies for kNN queries with WHERE clauses ; the executor
+talks to a real file-backed shard.
 
-```mermaid
-flowchart LR
-    P1["Phase 1<br/>full-scan predicates,<br/>flat estimator,<br/>fixed plan bands"]
-    P1 -. same grammar,<br/>same operators,<br/>swap impls behind traits .-> P2["Phase 2<br/>real indexes,<br/>histogram stats,<br/>cost-model planner"]
-```
+On top of that, secondary indexes are now plumbed end to end. The
+catalog holds three index kinds (hash, btree, inverted) and the
+executor consults it before walking metadata. DDL works through
+the same parser-binder-planner-executor pipeline. The catalog
+persists across reopens via the WAL, and the planner's
+selectivity estimator now reads exact cardinalities out of the
+catalog instead of walking every row.
 
-Every Phase 2 milestone is a trait-impl swap behind a stable
-interface. No grammar change. No new operators on the read path.
-Predicates already parsed today by Phase 1 will plan differently
-in Phase 2 and execute faster, but the same query string keeps
-working.
+What's left, in plain language : statistics on unindexed columns
+(so the planner can estimate selectivity for predicates the
+catalog can't help with), a real cost model that replaces the
+hardcoded selectivity bands, and external benchmarks against
+pgvector and Qdrant.
 
-### M2.1 : secondary indexes + `RoaringBitmap` composition
+### Baseline numbers : the catalog payoff
 
-Today's `MetadataScan` is an O(N) walk over the metadata store. M2.1
-ships `HashIndex` (eq), `BTreeIndex` (range), and `InvertedIndex`
-(array containment) for the metadata fields users care about, plus
-`RoaringBitmap` composition so `field_a = X AND field_b > Y`
-intersects the two bitmaps in microseconds instead of re-walking
-the full shard.
+A 10k-row file-backed shard with deterministic metadata
+(`category` in 4 buckets, `year` in 11 buckets, `tags` arrays of
+1-3 strings drawn from a 6-element pool, `priority` left
+unindexed). Each query ran twice on identical shards : once with
+no indexes registered (forces the scan path), once with the
+relevant indexes registered (engages the catalog). Numbers are
+criterion medians across 100 samples on a single machine ; the
+absolute values shift run-to-run but the speedup ratios are
+stable.
 
-The `MetadataStore` trait grows index hooks. `Shard::scan_metadata`
-gains an index-driven fast path. Predicate evaluator stays the same.
-Queries that hit indexed fields drop from O(N) to O(matches +
-log(N)).
+| Query shape | Path | Scan median | Indexed median | Speedup |
+|---|---|---|---|---|
+| `COUNT(*) WHERE category = 'docs'` | HashIndex `Eq` | 2.07 ms | 5.89 µs | **~350x** |
+| `COUNT(*) WHERE year >= 2022` | BTreeIndex range | 1.82 ms | 28.4 µs | **~64x** |
+| `COUNT(*) WHERE tags @> 'rust'` | InvertedIndex containment | 2.26 ms | 5.66 µs | **~399x** |
+| `COUNT(*) WHERE cat = 'docs' AND year >= 2020 AND tags @> 'rust'` | Full index (3 bitmaps intersected) | 2.33 ms | 63.5 µs | **~37x** |
+| `COUNT(*) WHERE category = 'docs' AND priority > 5` | Hybrid (`category` indexed, `priority` not) | 2.42 ms | 1.47 ms | **~1.7x** |
+| `SELECT id WHERE category = 'docs' LIMIT 100` | HashIndex + materialise 100 ids | 4.30 ms | 1.87 ms | **~2.3x** |
 
-### M2.2 : index sidecar persistence
+What the numbers say :
 
-Built indexes live in their own snapshot files alongside the graph
-snapshot. The manifest's commit point grows two more lines : index
-generation and version. Crash safety story is identical to today's
-graph snapshot, same generation-numbered files, same atomic
-manifest swap.
+- **Pure `COUNT` on a single indexed atom is hundreds of times
+  faster.** `bitmap.len()` is O(1) ; the scan path walks every
+  metadata bag in the shard.
+- **BTree range is slower than Hash or Inverted lookups** because
+  the range walk visits multiple buckets and sums their
+  cardinalities. Still ~64x faster than scanning every row, just
+  not as flat as the O(1) bucket lookup.
+- **Full AND chains scale better than the sum of the parts.**
+  Three bitmap intersections are an order of magnitude faster
+  than three predicate evaluations against every row, even
+  though the AND short-circuits aggressively in the scan path.
+- **Hybrid queries get a smaller (but real) win.** The indexed
+  atom narrows the candidate set ; the unindexed residue still
+  has to be evaluated per candidate. The ~1.7x on this workload
+  reflects "the index halved the set, then we paid roughly the
+  same per-row cost as before on the survivors." Wins grow with
+  the selectivity of the indexed atom.
+- **`SELECT id ... LIMIT 100` is dominated by metadata fetches.**
+  Even with the index, we clone 100 metadata bags into the
+  result. The win is the avoided scan over the other 9,900 rows,
+  not the bag fetches themselves.
 
-### M2.3 : `CREATE INDEX` / `DROP INDEX` DDL
+The bench harness lives at
+[`crates/kova-query/benches/meta_index.rs`](../crates/kova-query/benches/meta_index.rs).
+Reproduce with `cargo bench -p kova-query --bench meta_index`.
+These are the baseline ; future planner or executor changes
+should re-run the bench to make sure the speedups hold.
 
-The grammar already accepts `CREATE INDEX foo ON vectors USING
-HASH (category)` and `DROP INDEX foo`. The binder rejects both
-today. M2.3 unrejects them : `LogicalCreateIndex` / `LogicalDropIndex`
-flow through to a new `PhysicalPlan::CreateIndex` /
-`PhysicalPlan::DropIndex`, executor builds or drops the sidecar.
+---
 
-### M2.4 : statistics + histograms
+## What's still in flight
 
-The `SelectivityEstimator` trait grows a histogram-backed impl.
-Equi-depth histograms per indexed field, refreshed at checkpoint.
-Estimates that were O(N) (`ShardEstimator` walks every row) become
-O(log buckets). Estimates that are currently exact become
-approximate but vastly cheaper.
+Three substantive pieces of work remain on the index path. Each is
+a trait-impl swap behind a stable interface. The grammar doesn't
+change, the read-path operator set doesn't change, the result
+shape doesn't change. Existing queries keep working, just with
+better plan choices and tighter estimates.
 
-### M2.5 : index-driven `MetadataScan` dispatch
+### Statistics on unindexed columns
 
-The executor's `MetadataScan` arm starts consulting the index
-catalog. Predicates with indexed atoms route through the bitmap
-path ; non-indexed atoms still walk the metadata store. Mixed
-predicates (`category = 'docs' AND priority > 5` when `category`
-is indexed but `priority` is not) intersect the bitmap with the
-scan output.
+`ShardEstimator` today returns exact cardinality for indexed atoms
+(via `IndexCatalog::estimate`) and falls back to a metadata scan
+for unindexed ones. The unindexed fallback is O(N) every time the
+planner needs to estimate selectivity. The fix : equi-depth
+histograms per non-indexed field, refreshed at checkpoint,
+persisted alongside the catalog. Estimates that are currently
+O(N) become O(log buckets) ; estimates that are currently exact
+stay exact for indexed atoms.
 
-### M2.6 : cost-model planner
+### A real cost model
 
-The hardcoded `PLAN_B_UPPER = 0.05` and `PLAN_A_LOWER = 0.5` bands
-become a real cost model. The `dispatch_knn_plan` function grows
-inputs for `k`, target recall, shard size, and the histogram-backed
-selectivity estimate. The bands are computed from measured cost
-coefficients, not constants.
+The planner picks plan A / B / C based on a single number :
+selectivity fraction. Today the bands are hardcoded constants
+(`PLAN_B_UPPER = 0.05`, `PLAN_A_LOWER = 0.5`). A cost model would
+make those bands a function of `k`, target recall, shard size,
+and the selectivity estimate, with cost coefficients measured on
+the target machine. The decision-grid test keeps protecting the
+boundary behaviour ; it just becomes parametric over the cost
+coefficients instead of fixed.
 
-The decision-grid test from Phase 1 keeps protecting the boundary
-behaviour ; it just becomes parametric over the cost coefficients.
+### External benchmarks
 
-### M2.7 : benchmarks + public design notes
+The baseline numbers earlier in this doc compare KQL against
+itself : same query, with and without indexes. The next step is
+apples-to-apples comparisons against pgvector and Qdrant on
+standard datasets (ANN-benchmarks, MS MARCO subsets). Those land
+as a public writeup, not as part of the engine.
 
-Once Phase 2's machinery is in place, the same recall sweep that
-Phase 1 published gets a latency column. Numbers go out as part of
-a public benchmarking writeup.
-
-### What does not change in Phase 2
+### What does not change
 
 The KQL grammar, the AST, the LogicalStatement shape, the
 PhysicalPlan operator set on the read path, the `ExecutionResult`
-shape, the parameter binding model, the error taxonomy. Phase 1
-queries are Phase 2 queries with no rewrite. The fuzzer Phase 1
-already runs is the same fuzzer that pins Phase 2 against
-regressions ; nothing in its harness assumes Phase 1's plan-choice
-constants.
+shape, the parameter binding model, the error taxonomy. Queries
+that work today keep working with no rewrite. The fuzzer that
+runs today is the same fuzzer that catches regressions tomorrow ;
+nothing in its harness assumes the current plan-choice constants.
 
 ---
 
@@ -1298,8 +1339,8 @@ A few things worth knowing before you build on KQL.
 **One table.** The grammar carries the table name through
 (`AstVacuum { table: "my_shard" }`, `LogicalVacuum { table }`, and so
 on) precisely so that multi-table is a runtime config change later,
-not a language change. But Phase 1 only validates against the
-`Engine`'s single `Shard`. Multi-shard fan-out lives in the future
+not a language change. But the engine only validates against its
+single `Shard` today. Multi-shard fan-out lives in the future
 cluster layer.
 
 **Param-id resolution is positional.** `WHERE id = $1` expects
