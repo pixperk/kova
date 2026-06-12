@@ -14,6 +14,8 @@ pub mod physical;
 pub mod planner;
 pub mod printer;
 
+pub mod cost;
+
 mod index_eval;
 
 pub use ast::AstStatement;

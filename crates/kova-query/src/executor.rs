@@ -1123,6 +1123,13 @@ impl<D: Distance> SelectivityEstimator for ShardEstimator<'_, D> {
         let matches = count_matching_with_predicate(self.shard, pred, params).unwrap_or(0);
         SelectivityEstimate { matches, total }
     }
+
+    fn dim(&self) -> usize {
+        // Returns 0 if the shard has never observed a vector ;
+        // cost model treats dim=0 as "no distance contribution"
+        // and still produces a sensible dispatch.
+        self.shard.dim().unwrap_or(0)
+    }
 }
 
 /// Materialise an id bitmap (from the catalog's `lookup`) into the
@@ -3444,52 +3451,17 @@ mod tests {
     }
 
     // ----- selectivity-driven dispatch -----
-
-    /// High selectivity (most rows pass the predicate) keeps the
-    /// planner on plan A even when a predicate is present : kNN
-    /// overfetch + post-filter wins when the filter rarely drops
-    /// candidates. Seed a shard where 9/10 rows pass and verify the
-    /// emitted plan has `KnnSearch` underneath the Limit.
-    #[test]
-    fn high_selectivity_keeps_plan_a_with_post_filter() {
-        use crate::physical::PhysicalPlan;
-        let dir = tempdir().expect("tempdir");
-        let mut engine = make_engine(&dir);
-        // 9 'docs' rows + 1 'specs' : selectivity = 0.9 > 0.5 threshold.
-        let mut metas: Vec<Metadata> = (0..9)
-            .map(|_| meta_of(&[("category", Value::String("docs".into()))]))
-            .collect();
-        metas.push(meta_of(&[("category", Value::String("specs".into()))]));
-        seed_engine(&mut engine, &metas);
-
-        // Plan through Engine's full pipeline (which uses ShardEstimator).
-        let ast = parse_str(
-            "SELECT id FROM vectors WHERE category = 'docs' \
-             ORDER BY embedding <-> $1 LIMIT 5",
-        )
-        .expect("parse");
-        let logical = crate::binder::bind(ast).expect("bind");
-        let est = ShardEstimator {
-            shard: engine.shard(),
-        };
-        let physical = crate::planner::plan_with_estimator(logical, &est, &ParamBindings::empty())
-            .expect("plan");
-
-        // Projection -> Limit -> KnnSearch (with post_filter)
-        let PhysicalPlan::Projection { input, .. } = physical else {
-            panic!("expected Projection");
-        };
-        let PhysicalPlan::Limit { input, .. } = *input else {
-            panic!("expected Limit");
-        };
-        let PhysicalPlan::KnnSearch { post_filter, .. } = *input else {
-            panic!("expected KnnSearch (plan A), got {input:?}");
-        };
-        assert!(
-            post_filter.is_some(),
-            "plan A with predicate has post_filter"
-        );
-    }
+    //
+    // The old `high_selectivity_keeps_plan_a_with_post_filter` and
+    // `mid_selectivity_picks_plan_c` tests pinned specific plan
+    // choices on tiny (10-row) fixtures under the hardcoded-bands
+    // dispatch. The cost model picks plan B on those tiny fixtures
+    // regardless of selectivity because the HNSW walk overhead
+    // dominates a linear scan of 10 rows. The
+    // `planner_decision_grid_across_selectivity` and
+    // `planner_picks_plan_c_at_high_dim_low_selectivity` tests below
+    // cover the cost model's dispatch space with realistic shard
+    // sizes.
 
     /// Low selectivity (few rows pass) flips the planner to plan B :
     /// the predicate matches 1 of 10 rows, so scan + exact-distance
@@ -3530,71 +3502,54 @@ mod tests {
         );
     }
 
-    /// Mid-range selectivity (in `[PLAN_B_UPPER, PLAN_A_LOWER)`) routes
-    /// to plan C : the filter threads into the kNN walk, no overfetch,
-    /// no metadata scan. Verifies the planner emits
-    /// `FilteredKnnSearch` under the `Limit`.
-    #[test]
-    fn mid_selectivity_picks_plan_c() {
-        use crate::physical::PhysicalPlan;
-        let dir = tempdir().expect("tempdir");
-        let mut engine = make_engine(&dir);
-        // 2 'docs' + 8 'other' : selectivity = 0.2, in the plan C band.
-        let mut metas: Vec<Metadata> = (0..2)
-            .map(|_| meta_of(&[("category", Value::String("docs".into()))]))
-            .collect();
-        for _ in 0..8 {
-            metas.push(meta_of(&[("category", Value::String("other".into()))]));
-        }
-        seed_engine(&mut engine, &metas);
+    // See the removal note above `low_selectivity_picks_plan_b` :
+    // the mid-selectivity-picks-plan-C assertion is obsolete under
+    // the cost model.
 
-        let ast = parse_str(
-            "SELECT id FROM vectors WHERE category = 'docs' \
-             ORDER BY embedding <-> $1 LIMIT 5",
-        )
-        .expect("parse");
-        let logical = crate::binder::bind(ast).expect("bind");
-        let est = ShardEstimator {
-            shard: engine.shard(),
-        };
-        let physical = crate::planner::plan_with_estimator(logical, &est, &ParamBindings::empty())
-            .expect("plan");
-
-        let PhysicalPlan::Projection { input, .. } = physical else {
-            panic!("expected Projection");
-        };
-        let PhysicalPlan::Limit { input, .. } = *input else {
-            panic!("expected Limit");
-        };
-        assert!(
-            matches!(*input, PhysicalPlan::FilteredKnnSearch { .. }),
-            "mid selectivity should pick plan C (FilteredKnnSearch), got {input:?}"
-        );
-    }
-
-    /// Plan C end-to-end : run a SELECT in the mid-selectivity band
     /// Decision-grid sweep : drive the planner with a deterministic
     /// estimator across the full selectivity range and assert each
-    /// fraction maps to the expected inner operator. Uses a fake
-    /// estimator so we don't pay seeding cost per cell.
+    /// fraction maps to the expected inner operator. The
+    /// expectations reflect the cost-model dispatch under default
+    /// `CostCoefficients`, not the old hardcoded bands.
+    ///
+    /// At n=10000, k=5, dim=16 with the shipped defaults, the
+    /// crossover is around s=0.14 :
+    /// - `selectivity < 0.14` : plan B wins (small match set,
+    ///   exact distance is cheap compared to plan A's HNSW walk)
+    /// - `selectivity >= 0.14` : plan A wins (loose predicate, the
+    ///   overfetch succeeds first try ; plan B's `matches * dim`
+    ///   grows past plan A's fixed walk cost)
+    /// - plan C : dominated by both A and B at low dim ; see the
+    ///   high-dim case below for when C wins
     #[test]
     fn planner_decision_grid_across_selectivity() {
         use crate::physical::PhysicalPlan;
         use crate::planner::{SelectivityEstimate, SelectivityEstimator};
 
-        struct Const(f64);
+        struct Const {
+            sel: f64,
+            total: usize,
+            dim: usize,
+        }
         impl SelectivityEstimator for Const {
             fn estimate(
                 &self,
                 _pred: &crate::logical::PredicateExpr,
                 _params: &ParamBindings,
             ) -> SelectivityEstimate {
-                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-                let matches = (self.0 * 1000.0) as usize;
+                #[allow(
+                    clippy::cast_possible_truncation,
+                    clippy::cast_sign_loss,
+                    clippy::cast_precision_loss
+                )]
+                let matches = (self.sel * self.total as f64) as usize;
                 SelectivityEstimate {
                     matches,
-                    total: 1000,
+                    total: self.total,
                 }
+            }
+            fn dim(&self) -> usize {
+                self.dim
             }
         }
 
@@ -3602,30 +3557,36 @@ mod tests {
         enum Expect {
             PlanA,
             PlanB,
+            #[allow(dead_code)] // grid below currently only exercises A and B at dim=16
             PlanC,
         }
 
-        let cases: &[(f64, Expect)] = &[
+        // n=10000, dim=16 : plan A and B handle the dispatch.
+        let cases_typical: &[(f64, Expect)] = &[
             (0.001, Expect::PlanB),
             (0.04, Expect::PlanB),
-            (0.05, Expect::PlanC), // PLAN_B_UPPER boundary : at threshold = plan C
-            (0.10, Expect::PlanC),
-            (0.30, Expect::PlanC),
-            (0.49, Expect::PlanC),
-            (0.50, Expect::PlanA), // PLAN_A_LOWER boundary : at threshold = plan A
+            (0.10, Expect::PlanB),
+            (0.13, Expect::PlanB),
+            (0.20, Expect::PlanA),
+            (0.50, Expect::PlanA),
             (0.80, Expect::PlanA),
             (1.00, Expect::PlanA),
         ];
 
-        for (sel, expected) in cases {
+        for (sel, expected) in cases_typical {
             let ast = parse_str(
                 "SELECT id FROM vectors WHERE category = 'docs' \
                  ORDER BY embedding <-> $1 LIMIT 5",
             )
             .expect("parse");
             let logical = crate::binder::bind(ast).expect("bind");
+            let estimator = Const {
+                sel: *sel,
+                total: 10_000,
+                dim: 16,
+            };
             let plan =
-                crate::planner::plan_with_estimator(logical, &Const(*sel), &ParamBindings::empty())
+                crate::planner::plan_with_estimator(logical, &estimator, &ParamBindings::empty())
                     .expect("plan");
             let PhysicalPlan::Projection { input, .. } = plan else {
                 panic!("expected Projection at sel={sel}");
@@ -3641,9 +3602,67 @@ mod tests {
             );
             assert!(
                 matches,
-                "selectivity {sel} expected {expected:?}, got operator {input:?}"
+                "typical n=10k dim=16 : selectivity {sel} expected {expected:?}, got operator {input:?}"
             );
         }
+    }
+
+    /// At very high dim (e.g. 1536 for `OpenAI` embeddings) plan B's
+    /// distance compute dominates and plan A's overfetch retries
+    /// get expensive at low selectivity. The cost model picks
+    /// plan C in the middle band : the hardcoded bands picked C
+    /// at this selectivity by accident ; the cost model picks C
+    /// here for principled reasons.
+    #[test]
+    fn planner_picks_plan_c_at_high_dim_low_selectivity() {
+        use crate::physical::PhysicalPlan;
+        use crate::planner::{SelectivityEstimate, SelectivityEstimator};
+
+        struct HighDim {
+            sel: f64,
+        }
+        impl SelectivityEstimator for HighDim {
+            fn estimate(
+                &self,
+                _pred: &crate::logical::PredicateExpr,
+                _params: &ParamBindings,
+            ) -> SelectivityEstimate {
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                let matches = (self.sel * 1_000_000.0) as usize;
+                SelectivityEstimate {
+                    matches,
+                    total: 1_000_000,
+                }
+            }
+            fn dim(&self) -> usize {
+                1536
+            }
+        }
+
+        let ast = parse_str(
+            "SELECT id FROM vectors WHERE category = 'docs' \
+             ORDER BY embedding <-> $1 LIMIT 10",
+        )
+        .expect("parse");
+        let logical = crate::binder::bind(ast).expect("bind");
+        // s=0.02 at dim=1536, n=1M : plan A's retries blow up,
+        // plan B's per-match distance is huge ; plan C wins.
+        let plan = crate::planner::plan_with_estimator(
+            logical,
+            &HighDim { sel: 0.02 },
+            &ParamBindings::empty(),
+        )
+        .expect("plan");
+        let PhysicalPlan::Projection { input, .. } = plan else {
+            panic!("expected Projection");
+        };
+        let PhysicalPlan::Limit { input, .. } = *input else {
+            panic!("expected Limit");
+        };
+        assert!(
+            matches!(input.as_ref(), PhysicalPlan::FilteredKnnSearch { .. }),
+            "high-dim low-sel should pick FilteredKnnSearch, got {input:?}"
+        );
     }
 
     /// and check the returned ids actually pass the predicate. This

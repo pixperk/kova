@@ -295,6 +295,18 @@ where
         &self.stats
     }
 
+    /// Vector dimension pinned on the underlying HNSW index, or the
+    /// store's dim if the index hasn't seen its first insert yet.
+    /// Returns `None` for a brand-new in-memory shard that's never
+    /// observed a vector.
+    ///
+    /// Used by the planner's cost model to weight distance-compute
+    /// costs in plan A / B / C ranking.
+    #[must_use]
+    pub fn dim(&self) -> Option<usize> {
+        self.index.dim().or_else(|| self.index.store_dim())
+    }
+
     /// Walk the live metadata store and rebuild the stats catalog
     /// from scratch. Called by [`Self::checkpoint`] after vacuum so
     /// the persisted stats reflect the post-vacuum row set.

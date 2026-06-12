@@ -24,21 +24,6 @@ use crate::physical::PhysicalPlan;
 /// without starving the final LIMIT. v2 tunes this from selectivity.
 const KNN_OVERFETCH: usize = 4;
 
-/// Lower selectivity boundary : below this fraction we pick plan B
-/// (scan metadata + exact distance). The candidate set is small enough
-/// that an O(matches * d) exact distance loop beats running the full
-/// ANN walk.
-const PLAN_B_UPPER: f64 = 0.05;
-
-/// Upper selectivity boundary : at or above this fraction we pick
-/// plan A (overfetched kNN + post-filter). The predicate is loose
-/// enough that the post-filter rarely drops candidates, so the
-/// cheaper overfetch wins over plan C's per-visit predicate eval.
-///
-/// In between (`PLAN_B_UPPER`, `PLAN_A_LOWER`) we pick plan C :
-/// filter threaded into the graph walk.
-const PLAN_A_LOWER: f64 = 0.5;
-
 /// Estimate produced by [`SelectivityEstimator::estimate`].
 #[derive(Debug, Clone, Copy)]
 pub struct SelectivityEstimate {
@@ -70,14 +55,24 @@ impl SelectivityEstimate {
 
 /// Estimates how many rows a predicate matches against a shard.
 ///
-/// v1 impl runs the predicate against every row (cheap because
-/// metadata is in-memory) and returns an exact count. v2 swaps in
-/// index cardinality lookups for `O(log N)` per atom.
+/// Today's `ShardEstimator` consults the `IndexCatalog` for indexed
+/// atoms (exact O(1)), the `StatsCatalog` for atoms covered by
+/// column statistics (approximate), and falls back to a metadata
+/// scan for everything else.
 pub trait SelectivityEstimator {
     /// Estimate selectivity of `pred`. `params` is passed through so
     /// the estimator can resolve param-bound atoms (e.g.
     /// `WHERE category = $1`).
     fn estimate(&self, pred: &PredicateExpr, params: &ParamBindings) -> SelectivityEstimate;
+
+    /// Vector dimension of the shard backing this estimator. Used
+    /// by the cost-model dispatcher to weight distance-compute
+    /// costs in plan A / B / C ranking. Defaults to 16, a typical
+    /// small-embedding dim, so test estimators don't need to
+    /// implement it.
+    fn dim(&self) -> usize {
+        16
+    }
 }
 
 /// Pick the physical plan for a [`LogicalStatement`], driving SELECT
@@ -435,20 +430,29 @@ fn dispatch_knn_plan<E: SelectivityEstimator>(
     } = inputs;
     match predicate {
         Some(pred) => {
-            let fraction = estimator.estimate(&pred, params).fraction();
-            if fraction < PLAN_B_UPPER {
-                build_plan_b(from_table, pred, query_param, metric, user_k, user_limit)
-            } else if fraction < PLAN_A_LOWER {
-                build_plan_c(from_table, pred, query_param, metric, user_k, user_limit)
-            } else {
-                build_plan_a(
+            let estimate = estimator.estimate(&pred, params);
+            let workload = crate::cost::Workload {
+                selectivity: estimate.fraction(),
+                user_k,
+                total_rows: estimate.total,
+                dim: estimator.dim(),
+            };
+            let coeffs = crate::cost::CostCoefficients::default();
+            match crate::cost::dispatch_via_cost(&workload, &coeffs) {
+                crate::cost::PlanKind::B => {
+                    build_plan_b(from_table, pred, query_param, metric, user_k, user_limit)
+                }
+                crate::cost::PlanKind::C => {
+                    build_plan_c(from_table, pred, query_param, metric, user_k, user_limit)
+                }
+                crate::cost::PlanKind::A => build_plan_a(
                     from_table,
                     query_param,
                     metric,
                     user_k,
                     Some(pred),
                     user_limit,
-                )
+                ),
             }
         }
         None => build_plan_a(from_table, query_param, metric, user_k, None, user_limit),
