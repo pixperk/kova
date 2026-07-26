@@ -117,20 +117,56 @@ fn predicate_eq_bucket_param() -> PredicateExpr {
     })
 }
 
-fn build_shard(dir: &std::path::Path, dim: usize, n: usize, buckets: usize) -> TestShard {
+/// Denominator for the per-mille selectivity construction below.
+/// Caps the finest selectivity this harness can express at 0.001.
+const SELECTIVITY_GRANULARITY: usize = 1000;
+
+/// Spread matching rows across insertion order rather than blocking them
+/// together. Coprime with [`SELECTIVITY_GRANULARITY`], so
+/// `(i * STRIDE) % GRANULARITY` visits every residue exactly once per
+/// 1000 rows — giving an *exact* match count with the matches scattered.
+const SELECTIVITY_STRIDE: usize = 7919;
+
+/// Build a shard where exactly `selectivity` of the rows satisfy
+/// `bucket = 0`. Returns the shard and the **actual** number of matching
+/// rows, so the caller can verify the construction rather than trust it.
+///
+/// # Why not `bucket = i % round(1/s)`
+///
+/// That was the original construction, and it is silently wrong for
+/// `s > 0.5` : `round(1/0.7) == round(1/0.9) == 1`, so every row lands
+/// in bucket 0 and the actual selectivity is 1.0 regardless of what was
+/// requested. The bug was invisible while the grid stopped at `s = 0.5`
+/// (where `1/s >= 2` and the arithmetic happens to work), and it made
+/// the first attempt at extending the selectivity axis measure `s = 1.0`
+/// twice under two different labels.
+///
+/// The per-mille form has no such cliff : `s = 0.7` means 700 of every
+/// 1000 rows, which is exactly what it says.
+fn build_shard(
+    dir: &std::path::Path,
+    dim: usize,
+    n: usize,
+    selectivity: f64,
+) -> (TestShard, usize) {
+    let per_mille = (selectivity * SELECTIVITY_GRANULARITY as f64).round() as usize;
     let mut rng = StdRng::seed_from_u64(SEED);
     let mut shard = Shard::open(dir, dim, L2, HnswParams::default()).unwrap();
+    let mut matching = 0usize;
     for i in 0..n {
         let v: Vec<f32> = (0..dim).map(|_| rng.random::<f32>() * 2.0 - 1.0).collect();
-        let bucket = (i % buckets) as i64;
+        let is_match = (i * SELECTIVITY_STRIDE) % SELECTIVITY_GRANULARITY < per_mille;
+        if is_match {
+            matching += 1;
+        }
         let mut m = Metadata::new();
-        m.insert("bucket".into(), Value::I64(bucket));
+        m.insert("bucket".into(), Value::I64(i64::from(!is_match)));
         shard
             .insert(VectorId::new(i as u64), Vector::try_new(v).unwrap(), m)
             .unwrap();
     }
     shard.checkpoint().unwrap();
-    shard
+    (shard, matching)
 }
 
 /// Median latency in microseconds, plus **how many rows the plan
@@ -204,9 +240,20 @@ fn main() {
                 // built once per cell and reused across the whole k sweep.
                 // Building per-k would quadruple the (dominant) HNSW
                 // construction cost for identical data.
-                let buckets = (1.0 / s).round() as usize;
                 let dir = tempdir().unwrap();
-                let shard = build_shard(dir.path(), dim, n, buckets);
+                let (shard, matching) = build_shard(dir.path(), dim, n, s);
+
+                // Verify the construction instead of assuming it. The
+                // previous `round(1/s)` bucket scheme silently produced
+                // selectivity 1.0 for every s > 0.5 ; an assertion here
+                // would have caught it the first time the axis was
+                // extended.
+                let actual_s = matching as f64 / n as f64;
+                assert!(
+                    (actual_s - s).abs() < 0.002,
+                    "selectivity construction wrong: requested {s}, built {actual_s} \
+                     ({matching}/{n} rows match)"
+                );
 
                 let mut rng = StdRng::seed_from_u64(SEED ^ (dim as u64));
                 let qv: Vec<f32> = (0..dim).map(|_| rng.random::<f32>() * 2.0 - 1.0).collect();
