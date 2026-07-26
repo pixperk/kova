@@ -45,8 +45,10 @@
 //!   ops + neighbour walk, exclusive of distance compute)
 //! - `c_distance_per_dim` : per-scalar cost of distance compute.
 //!   Distance for `dim`-dim vectors costs `dim * c_distance_per_dim`.
-//! - `c_metadata_get` : cost of fetching one metadata bag
-//!   from the metadata store
+//! - `c_metadata_get` : cost of fetching one metadata bag **by
+//!   value** (lookup + deep clone) — plans A and B
+//! - `c_metadata_peek` : cost of **borrowing** one metadata bag
+//!   (lookup, no clone) — plan C's per-visit filter
 //! - `c_filter_eval` : cost of evaluating one predicate atom
 //!   on a metadata bag
 //!
@@ -125,9 +127,27 @@ pub struct CostCoefficients {
     /// Nanoseconds per scalar in a distance computation. A
     /// `dim`-dim distance costs `dim * c_distance_per_dim`.
     pub c_distance_per_dim: f64,
-    /// Nanoseconds per metadata bag fetch from the metadata store
-    /// (`HashMap` lookup + clone).
+    /// Nanoseconds to fetch one metadata bag **by value** from the
+    /// metadata store : `HashMap` lookup + a deep clone of every key
+    /// and value (`MetadataStore::get`).
+    ///
+    /// Charged by plans A and B, both of which materialise owned bags
+    /// into their results (`SearchHit.metadata`, `InternalHit.metadata`).
     pub c_metadata_get: f64,
+    /// Nanoseconds to **borrow** one metadata bag
+    /// (`MetadataStore::with_metadata`) : the same lookup with no
+    /// clone.
+    ///
+    /// Charged by plan C, whose filter closure reads a bag per visited
+    /// graph node and never keeps it.
+    ///
+    /// Split out from [`Self::c_metadata_get`] because they differ by
+    /// roughly an order of magnitude, and plan C pays its version on
+    /// the hottest path in the engine. Pricing the borrow at the clone's
+    /// rate made plan C look ~2.4x more expensive than it is — enough
+    /// that it was never dispatched, in a band where measurement shows
+    /// it running 1.4-2.2x faster than the alternatives.
+    pub c_metadata_peek: f64,
     /// Nanoseconds per predicate atom evaluation on a fetched bag.
     pub c_filter_eval: f64,
 }
@@ -145,6 +165,10 @@ impl Default for CostCoefficients {
             c_hnsw_per_visit: 100.0,
             c_distance_per_dim: 0.15,
             c_metadata_get: 310.0,
+            // Placeholder until the first calibration run on a given
+            // machine ; a borrow is a bare `HashMap` lookup, so it sits
+            // an order of magnitude under the cloning `get`.
+            c_metadata_peek: 30.0,
             c_filter_eval: 70.0,
         }
     }
@@ -296,9 +320,12 @@ pub fn cost_plan_c(w: &Workload, c: &CostCoefficients) -> f64 {
     let base = hnsw_visits(w.user_k, w.total_rows);
     let overhead = filter_visit_multiplier(w.selectivity);
     let visits = (base * overhead).min(w.total_rows as f64);
+    // `c_metadata_peek`, not `c_metadata_get` : the filter closure
+    // borrows each visited node's bag via `MetadataStore::with_metadata`
+    // and never takes ownership.
     let per_visit = c.c_hnsw_per_visit
         + c.c_distance_per_dim * w.dim as f64
-        + c.c_metadata_get
+        + c.c_metadata_peek
         + c.c_filter_eval;
     visits * per_visit
 }
@@ -420,7 +447,7 @@ mod tests {
         let n = 10_000;
         let w = workload(0.001, 10, n, 16);
         let per_visit =
-            c.c_hnsw_per_visit + c.c_distance_per_dim * 16.0 + c.c_metadata_get + c.c_filter_eval;
+            c.c_hnsw_per_visit + c.c_distance_per_dim * 16.0 + c.c_metadata_peek + c.c_filter_eval;
         // Clamped at exactly one visit per row in the shard.
         assert!((cost_plan_c(&w, &c) - n as f64 * per_visit).abs() < 1.0);
     }

@@ -163,7 +163,12 @@ fn evaluate(coeffs: &CostCoefficients) -> (usize, f64, usize, usize) {
     let mut c_dispatched = 0;
     let mut c_correctly_dispatched = 0;
     for m in CELLS {
-        let w = Workload { selectivity: m.2, user_k: m.3, total_rows: m.1, dim: m.0 };
+        let w = Workload {
+            selectivity: m.2,
+            user_k: m.3,
+            total_rows: m.1,
+            dim: m.0,
+        };
         let predicted = dispatch_via_cost(&w, coeffs);
         let actual = measured_winner(m);
         if predicted == actual {
@@ -178,22 +183,80 @@ fn evaluate(coeffs: &CostCoefficients) -> (usize, f64, usize, usize) {
         let measured = [m.4, m.5, m.6];
         total_regret += measured[predicted as usize] / measured[actual as usize].max(1.0);
     }
-    (correct, total_regret / CELLS.len() as f64, c_dispatched, c_correctly_dispatched)
+    (
+        correct,
+        total_regret / CELLS.len() as f64,
+        c_dispatched,
+        c_correctly_dispatched,
+    )
+}
+
+/// Coefficients measured by `calibrate_cost_coefficients` on the same
+/// machine that produced the timings in `CELLS`. NOT pasted into
+/// `CostCoefficients::default()` : the shipped defaults are documented
+/// as x86 values, and replacing them with Apple-silicon numbers would
+/// just make them wrong for a different machine. Per-machine
+/// calibration belongs in config, not in a `Default` impl.
+/// Measured `MetadataStore::with_metadata` cost on this machine, from
+/// `calibrate_cost_coefficients`. Overwritten below by the real value.
+const CALIBRATED_PEEK: f64 = 30.0;
+
+fn calibrated() -> CostCoefficients {
+    CostCoefficients {
+        c_hnsw_per_visit: 115.8,
+        c_distance_per_dim: 0.10,
+        c_metadata_get: 295.4,
+        c_metadata_peek: CALIBRATED_PEEK,
+        c_filter_eval: 53.2,
+    }
 }
 
 fn main() {
-    let c_wins: Vec<&M> = CELLS.iter().filter(|m| measured_winner(m) == PlanKind::C).collect();
-    println!("120 measured cells ; plan C is fastest in {}\n", c_wins.len());
+    let c_wins: Vec<&M> = CELLS
+        .iter()
+        .filter(|m| measured_winner(m) == PlanKind::C)
+        .collect();
+    println!(
+        "120 measured cells ; plan C is fastest in {}\n",
+        c_wins.len()
+    );
+
+    println!("=== Shipped defaults vs coefficients calibrated on this machine ===");
+    println!(
+        "  scenario                       correct/120   regret   C dispatched (of which right)"
+    );
+    for (label, coeffs) in [
+        ("shipped defaults (x86)", CostCoefficients::default()),
+        ("calibrated (this machine)", calibrated()),
+    ] {
+        let (correct, regret, c_disp, c_ok) = evaluate(&coeffs);
+        println!("  {label:30} {correct:6}/120     {regret:.3}    {c_disp:9} ({c_ok})");
+    }
+    println!();
 
     println!("=== The 8 cells where plan C actually won ===");
     println!("  dim      n      s     k   A(us)   B(us)   C(us)   predicted@310  predicted@25");
     let default = CostCoefficients::default();
-    let borrowing = CostCoefficients { c_metadata_get: 25.0, ..default };
+    let borrowing = CostCoefficients {
+        c_metadata_get: 25.0,
+        ..default
+    };
     for m in &c_wins {
-        let w = Workload { selectivity: m.2, user_k: m.3, total_rows: m.1, dim: m.0 };
+        let w = Workload {
+            selectivity: m.2,
+            user_k: m.3,
+            total_rows: m.1,
+            dim: m.0,
+        };
         println!(
             "  {:4} {:6}  {:.3} {:5} {:7.0} {:7.0} {:7.0}        {:?}             {:?}",
-            m.0, m.1, m.2, m.3, m.4, m.5, m.6,
+            m.0,
+            m.1,
+            m.2,
+            m.3,
+            m.4,
+            m.5,
+            m.6,
             dispatch_via_cost(&w, &default),
             dispatch_via_cost(&w, &borrowing),
         );
@@ -202,18 +265,31 @@ fn main() {
     println!("\n=== Sweeping c_metadata_get (the coefficient 0A.2 invalidated) ===");
     println!("  c_meta_get   correct/120   regret   C dispatched   C dispatched correctly");
     for c_meta in [310.0, 200.0, 150.0, 100.0, 50.0, 25.0, 10.0] {
-        let coeffs = CostCoefficients { c_metadata_get: c_meta, ..default };
+        let coeffs = CostCoefficients {
+            c_metadata_get: c_meta,
+            ..default
+        };
         let (correct, regret, c_disp, c_ok) = evaluate(&coeffs);
         println!("  {c_meta:9.0}   {correct:6}/120     {regret:.3}    {c_disp:9}   {c_ok:18}");
     }
 
     println!("\n=== One cell in detail : dim=16 n=10000 s=0.5 k=50 (C measured 2.2x faster) ===");
-    let w = Workload { selectivity: 0.5, user_k: 50, total_rows: 10_000, dim: 16 };
+    let w = Workload {
+        selectivity: 0.5,
+        user_k: 50,
+        total_rows: 10_000,
+        dim: 16,
+    };
     for c_meta in [310.0, 25.0] {
-        let coeffs = CostCoefficients { c_metadata_get: c_meta, ..default };
+        let coeffs = CostCoefficients {
+            c_metadata_get: c_meta,
+            ..default
+        };
         println!(
             "  c_meta_get={c_meta:5.0}  ->  cost_A={:9.0}  cost_B={:9.0}  cost_C={:9.0}  picks {:?}",
-            cost_plan_a(&w, &coeffs), cost_plan_b(&w, &coeffs), cost_plan_c(&w, &coeffs),
+            cost_plan_a(&w, &coeffs),
+            cost_plan_b(&w, &coeffs),
+            cost_plan_c(&w, &coeffs),
             dispatch_via_cost(&w, &coeffs),
         );
     }

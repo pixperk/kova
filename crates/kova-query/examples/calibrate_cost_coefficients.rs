@@ -28,6 +28,7 @@
 //! Run with:
 //!   cargo run --release --example calibrate_cost_coefficients --features internal-bench
 
+use std::collections::HashMap;
 use std::hint::black_box;
 use std::time::Instant;
 
@@ -87,7 +88,9 @@ fn calibrate_distance_per_dim() -> f64 {
     elapsed / (DIST_SAMPLES as f64 * DIM_FOR_DIST as f64)
 }
 
-fn calibrate_metadata_get() -> f64 {
+/// Build the fixture both metadata microbenches share, plus the
+/// randomised id list they probe it with.
+fn metadata_fixture() -> (tempfile::TempDir, FileMetadataStore, Vec<VectorId>) {
     let dir = tempdir().unwrap();
     let mut store = FileMetadataStore::open(dir.path().join("metadata.bin")).unwrap();
 
@@ -103,11 +106,44 @@ fn calibrate_metadata_get() -> f64 {
         .map(|_| VectorId::new(rng.random::<u64>() % N_FOR_META as u64))
         .collect();
 
+    (dir, store, ids)
+}
+
+/// `MetadataStore::get` : the **cloning** accessor. Plans A and B pay
+/// this, because both materialise owned bags into their results
+/// (`SearchHit.metadata` and `InternalHit.metadata`).
+fn calibrate_metadata_get() -> f64 {
+    let (_dir, store, ids) = metadata_fixture();
+
     let mut sink = 0usize;
     let t0 = Instant::now();
     for id in &ids {
         if let Some(m) = store.get(*id) {
             sink += m.len();
+        }
+    }
+    let elapsed = t0.elapsed().as_nanos() as f64;
+    black_box(sink);
+    elapsed / META_SAMPLES as f64
+}
+
+/// `MetadataStore::with_metadata` : the **borrowing** accessor. Plan C
+/// pays this per visited graph node, because its filter closure only
+/// reads the bag and never keeps it.
+///
+/// Measured separately from [`calibrate_metadata_get`] because the two
+/// are genuinely different operations : one is a `HashMap` lookup, the
+/// other is a lookup plus a deep clone of every key and value. Pricing
+/// plan C with the clone number over-charges it by roughly an order of
+/// magnitude, which is enough to stop it ever being dispatched.
+fn calibrate_metadata_peek() -> f64 {
+    let (_dir, store, ids) = metadata_fixture();
+
+    let mut sink = 0usize;
+    let t0 = Instant::now();
+    for id in &ids {
+        if let Some(n) = store.with_metadata(*id, HashMap::len) {
+            sink += n;
         }
     }
     let elapsed = t0.elapsed().as_nanos() as f64;
@@ -227,14 +263,24 @@ fn main() {
     println!();
 
     println!(
-        "[2/3] c_metadata_get : FileMetadataStore::get, {N_FOR_META} rows, {META_SAMPLES} samples"
+        "[2/4] c_metadata_get : FileMetadataStore::get (clone), {N_FOR_META} rows, {META_SAMPLES} samples"
     );
     let c_meta = calibrate_metadata_get();
     println!("       -> {c_meta:.0} ns/get");
     println!();
 
     println!(
-        "[3/3] c_filter_eval, c_hnsw_per_visit : derived from plan B + plan A at n={N_FOR_PLAN}, dim={PLAN_DIM}"
+        "[3/4] c_metadata_peek : FileMetadataStore::with_metadata (borrow), {N_FOR_META} rows, {META_SAMPLES} samples"
+    );
+    let c_peek = calibrate_metadata_peek();
+    println!(
+        "       -> {c_peek:.0} ns/peek   ({:.1}x cheaper than get)",
+        c_meta / c_peek.max(0.001)
+    );
+    println!();
+
+    println!(
+        "[4/4] c_filter_eval, c_hnsw_per_visit : derived from plan B + plan A at n={N_FOR_PLAN}, dim={PLAN_DIM}"
     );
     let (c_filter, c_hnsw) = calibrate_plans(c_meta, c_dist);
     println!("       -> c_filter_eval     = {c_filter:.0} ns");
@@ -267,6 +313,11 @@ fn main() {
         "  c_metadata_get     default={:>7.1}  measured={c_meta:>7.1}  ratio={:.2}x",
         d.c_metadata_get,
         c_meta / d.c_metadata_get
+    );
+    println!(
+        "  c_metadata_peek    default={:>7.1}  measured={c_peek:>7.1}  ratio={:.2}x",
+        d.c_metadata_peek,
+        c_peek / d.c_metadata_peek
     );
     println!(
         "  c_filter_eval      default={:>7.1}  measured={c_filter:>7.1}  ratio={:.2}x",
