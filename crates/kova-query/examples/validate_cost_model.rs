@@ -29,7 +29,7 @@ use kova_query::ast::{DistanceOp, ParamRef};
 use kova_query::cost::{
     CostCoefficients, PlanKind, Workload, cost_plan_a, cost_plan_b, cost_plan_c, dispatch_via_cost,
 };
-use kova_query::executor::{Engine, ParamBindings, ParamValue};
+use kova_query::executor::{Engine, ExecutionResult, ParamBindings, ParamValue};
 use kova_query::logical::{
     BoundExpr, BoundProjection, FieldRef, PredAtom, PredicateExpr, ProjectionSpec,
 };
@@ -53,12 +53,41 @@ const SEED: u64 = 0xC057_C057_C057_F00D;
 
 type TestShard = Shard<L2, MmapVectorStore, FileMetadataStore, FileWal>;
 
+/// Read a comma-separated axis override out of the environment, falling
+/// back to the compiled-in default.
+///
+/// The full grid is `DIMS x NS x SELS x KS` and takes tens of minutes,
+/// almost all of it in HNSW construction. Overriding the axes lets a
+/// targeted question ("what happens above s=0.5?") be answered with a
+/// handful of cells instead of a whole re-sweep :
+///
+/// ```sh
+/// KOVA_SELS=0.7,0.9 KOVA_NS=10000 KOVA_KS=50,100,500 \
+///   cargo run --release --example validate_cost_model --features internal-bench
+/// ```
+fn axis<T: std::str::FromStr>(var: &str, default: &[T]) -> Vec<T>
+where
+    T: Copy,
+{
+    let parsed: Option<Vec<T>> = std::env::var(var).ok().map(|s| {
+        s.split(',')
+            .filter_map(|x| x.trim().parse::<T>().ok())
+            .collect()
+    });
+    match parsed {
+        Some(v) if !v.is_empty() => v,
+        _ => default.to_vec(),
+    }
+}
+
 struct CellResult {
     dim: usize,
     n: usize,
     s: f64,
     k: usize,
     measured_micros: [f64; 3],
+    /// Rows each plan actually returned. Compare against `k`.
+    returned: [usize; 3],
     #[allow(dead_code)] // kept for debugging when tuning coefficients
     predicted_cost: [f64; 3],
     measured_winner: PlanKind,
@@ -104,16 +133,34 @@ fn build_shard(dir: &std::path::Path, dim: usize, n: usize, buckets: usize) -> T
     shard
 }
 
+/// Median latency in microseconds, plus **how many rows the plan
+/// actually returned**.
+///
+/// The row count is not decoration. Plan A overfetches `k * OVERFETCH`
+/// candidates, post-filters, and returns whatever survives — with no
+/// retry. At low selectivity that means a `LIMIT k` query can come back
+/// with far fewer than `k` rows, and the cost model deliberately does
+/// not charge for it (`cost_plan_a` has no selectivity term, on the
+/// grounds that starvation is a recall concern rather than a latency
+/// one). Nothing then went on to measure the recall. This does.
 fn time_plan(
     label: &str,
     engine: &mut Engine<L2>,
     plan: PhysicalPlan,
     params: &ParamBindings,
-) -> f64 {
+) -> (f64, usize) {
+    let mut returned = 0usize;
     for _ in 0..WARMUP {
-        if let Err(e) = engine.execute_plan(plan.clone(), params) {
-            eprintln!("[{label}] execute error: {e:?}");
-            return f64::INFINITY;
+        match engine.execute_plan(plan.clone(), params) {
+            Ok(ExecutionResult::Rows { rows, .. }) => returned = rows.len(),
+            Ok(other) => {
+                eprintln!("[{label}] expected Rows, got {other:?}");
+                return (f64::INFINITY, 0);
+            }
+            Err(e) => {
+                eprintln!("[{label}] execute error: {e:?}");
+                return (f64::INFINITY, 0);
+            }
         }
     }
     let mut samples: Vec<u128> = Vec::with_capacity(SAMPLES);
@@ -121,13 +168,13 @@ fn time_plan(
         let t0 = Instant::now();
         if let Err(e) = engine.execute_plan(plan.clone(), params) {
             eprintln!("[{label}] execute error mid-sample: {e:?}");
-            return f64::INFINITY;
+            return (f64::INFINITY, returned);
         }
         samples.push(t0.elapsed().as_nanos());
     }
     samples.sort_unstable();
-    // Return microseconds with sub-microsecond resolution.
-    (samples[samples.len() / 2] as f64) / 1000.0
+    // Microseconds with sub-microsecond resolution.
+    ((samples[samples.len() / 2] as f64) / 1000.0, returned)
 }
 
 fn argmin3(xs: [f64; 3]) -> PlanKind {
@@ -144,9 +191,15 @@ fn main() {
     let coeffs = CostCoefficients::default();
     let mut results = Vec::new();
 
-    for &dim in DIMS {
-        for &n in NS {
-            for &s in SELS {
+    let dims = axis::<usize>("KOVA_DIMS", DIMS);
+    let ns = axis::<usize>("KOVA_NS", NS);
+    let sels = axis::<f64>("KOVA_SELS", SELS);
+    let ks = axis::<usize>("KOVA_KS", KS);
+    println!("grid: dims={dims:?} ns={ns:?} sels={sels:?} ks={ks:?}");
+
+    for &dim in &dims {
+        for &n in &ns {
+            for &s in &sels {
                 // The shard depends on (dim, n, s) but NOT on k, so it is
                 // built once per cell and reused across the whole k sweep.
                 // Building per-k would quadruple the (dominant) HNSW
@@ -164,7 +217,7 @@ fn main() {
 
                 let mut engine = Engine::new(shard, "vectors");
 
-                for &k in KS {
+                for &k in &ks {
                     let pred = predicate_eq_bucket_param();
 
                     let plan_a = wrap(build_plan_a(
@@ -193,10 +246,11 @@ fn main() {
                     ));
 
                     let cell = format!("dim={dim} n={n} s={s} k={k}");
-                    let m_a = time_plan(&format!("{cell} A"), &mut engine, plan_a, &params);
-                    let m_b = time_plan(&format!("{cell} B"), &mut engine, plan_b, &params);
-                    let m_c = time_plan(&format!("{cell} C"), &mut engine, plan_c, &params);
+                    let (m_a, r_a) = time_plan(&format!("{cell} A"), &mut engine, plan_a, &params);
+                    let (m_b, r_b) = time_plan(&format!("{cell} B"), &mut engine, plan_b, &params);
+                    let (m_c, r_c) = time_plan(&format!("{cell} C"), &mut engine, plan_c, &params);
                     let measured = [m_a, m_b, m_c];
+                    let returned = [r_a, r_b, r_c];
 
                     let w = Workload {
                         selectivity: s,
@@ -216,13 +270,15 @@ fn main() {
                         s,
                         k,
                         measured_micros: measured,
+                        returned,
                         predicted_cost: predicted,
                         measured_winner: argmin3(measured),
                         predicted_winner: dispatch_via_cost(&w, &coeffs),
                     });
                     println!(
                         "  dim={dim:4} n={n:6} s={s:.3} k={k:4}  \
-                         A={m_a:8.0}us  B={m_b:8.0}us  C={m_c:8.0}us"
+                         A={m_a:8.0}us/{r_a:<4} B={m_b:8.0}us/{r_b:<4} C={m_c:8.0}us/{r_c:<4} \
+                         (us/rows, want {k})"
                     );
                 }
             }
@@ -295,6 +351,56 @@ fn print_report(rs: &[CellResult]) {
         );
         print_confusion(conf);
     }
+
+    // ---- Result completeness : does each plan actually return k rows? ----
+    //
+    // The cost model scores latency only. Plan A can return fewer rows
+    // than the LIMIT asked for (overfetch + post-filter, no retry) while
+    // plan C cannot (its termination gate requires a full results heap).
+    // A dispatch that is optimal on latency can therefore be handing
+    // back a short answer, and nothing in the confusion matrix or the
+    // regret figure would show it.
+    println!("\n=== RESULT COMPLETENESS : rows returned vs k ===");
+    println!("   dim      n      s     k     A      B      C   dispatched  short?");
+    let mut a_short = 0;
+    let mut dispatched_short = 0;
+    for r in rs {
+        let want = r.k.min(r.n);
+        let short_a = r.returned[0] < want;
+        let short_dispatched = r.returned[r.predicted_winner as usize] < want;
+        if short_a {
+            a_short += 1;
+        }
+        if short_dispatched {
+            dispatched_short += 1;
+        }
+        // Only print rows where something came up short ; the complete
+        // ones are the uninteresting majority.
+        if short_a || short_dispatched {
+            println!(
+                "  {:4} {:6}  {:.3} {:5} {:5} {:6} {:6}      {:?}      {}",
+                r.dim,
+                r.n,
+                r.s,
+                r.k,
+                r.returned[0],
+                r.returned[1],
+                r.returned[2],
+                r.predicted_winner,
+                if short_dispatched {
+                    "DISPATCHED PLAN SHORT"
+                } else {
+                    "(plan A only)"
+                },
+            );
+        }
+    }
+    println!(
+        "\n  plan A returned < k in {a_short}/{} cells ; \
+         the DISPATCHED plan did in {dispatched_short}/{}",
+        rs.len(),
+        rs.len()
+    );
 
     // ---- Where plan C actually wins, measured ----
     println!("\n=== CELLS WHERE PLAN C IS MEASURED FASTEST ===");
