@@ -70,7 +70,44 @@ pub trait MetadataStore {
     fn put(&mut self, id: VectorId, meta: Metadata) -> Result<(), Self::Error>;
 
     /// Fetch the metadata for `id`, if present. Returns an owned clone.
+    ///
+    /// Prefer [`Self::with_metadata`] when the caller only needs to
+    /// *read* the bag : `get` clones the whole `HashMap`, which
+    /// dominates on hot paths that touch many rows.
     fn get(&self, id: VectorId) -> Option<Metadata>;
+
+    /// Borrow the metadata for `id` and run `f` against it, returning
+    /// `f`'s result. `None` if `id` isn't in the store.
+    ///
+    /// This is the read-only counterpart to [`Self::get`]. `get` has to
+    /// hand back an owned [`Metadata`], which means cloning the entire
+    /// attribute bag (a `HashMap<String, Value>`, itself holding owned
+    /// `String`s and possibly nested `Array` / `Map` values). Callers
+    /// that just want to evaluate a predicate, read one field, or test
+    /// presence pay that allocation for nothing.
+    ///
+    /// The cost is not academic : the query planner's `c_metadata_get`
+    /// coefficient was calibrated against `get` at ~310 ns, and the
+    /// filtered-ANN plan pays it *per visited graph node*. Routing
+    /// those paths through this method removes the clone from the hot
+    /// loop entirely.
+    ///
+    /// The default implementation delegates to [`Self::get`] (so
+    /// existing impls keep compiling unchanged) and therefore still
+    /// clones. Concrete stores that hold bags in memory should override
+    /// to hand out a borrow.
+    ///
+    /// # Object safety
+    /// The generic closure and return type make this callable only
+    /// when `Self: Sized`, matching [`Self::scan_ids`] and
+    /// [`Self::walk_field`].
+    fn with_metadata<F, R>(&self, id: VectorId, f: F) -> Option<R>
+    where
+        F: FnOnce(&Metadata) -> R,
+        Self: Sized,
+    {
+        self.get(id).map(|m| f(&m))
+    }
 
     /// Remove the entry for `id`. No-op if absent.
     fn delete(&mut self, id: VectorId) -> Result<(), Self::Error>;
@@ -187,6 +224,15 @@ impl MetadataStore for InMemoryMetadataStore {
 
     fn get(&self, id: VectorId) -> Option<Metadata> {
         self.entries.get(&id).cloned()
+    }
+
+    /// Borrowing override : hands the closure a reference straight out
+    /// of the map, skipping the clone the default impl would pay.
+    fn with_metadata<F, R>(&self, id: VectorId, f: F) -> Option<R>
+    where
+        F: FnOnce(&Metadata) -> R,
+    {
+        self.entries.get(&id).map(f)
     }
 
     fn delete(&mut self, id: VectorId) -> Result<(), Self::Error> {
@@ -365,6 +411,68 @@ mod tests {
         store.put(id(1), sample_meta()).unwrap();
         let _ = store.scan_ids(|_| true);
         assert!(store.contains(id(1)));
+    }
+
+    #[test]
+    fn with_metadata_runs_closure_against_the_stored_bag() {
+        let mut store = InMemoryMetadataStore::new();
+        store.put(id(1), sample_meta()).unwrap();
+
+        let count = store.with_metadata(id(1), |m| m.get("count").cloned());
+        assert_eq!(count, Some(Some(Value::I64(42))));
+    }
+
+    #[test]
+    fn with_metadata_missing_id_returns_none_without_calling_closure() {
+        let store = InMemoryMetadataStore::new();
+        let mut called = false;
+        let out = store.with_metadata(id(99), |_| {
+            called = true;
+            1_u8
+        });
+        assert_eq!(out, None);
+        assert!(!called, "closure must not run for a missing id");
+    }
+
+    #[test]
+    fn with_metadata_can_return_any_type() {
+        // The closure's return type is generic, so callers can project
+        // out a bool (predicate eval), an owned clone, or anything else.
+        let mut store = InMemoryMetadataStore::new();
+        store.put(id(1), sample_meta()).unwrap();
+
+        let is_active = store.with_metadata(id(1), |m| {
+            matches!(m.get("active"), Some(Value::Bool(true)))
+        });
+        assert_eq!(is_active, Some(true));
+
+        let key_count = store.with_metadata(id(1), HashMap::len);
+        assert_eq!(key_count, Some(5));
+    }
+
+    #[test]
+    fn with_metadata_leaves_the_store_intact() {
+        // Borrowing, not moving : the bag is still owned by the store
+        // after the closure returns.
+        let mut store = InMemoryMetadataStore::new();
+        store.put(id(1), sample_meta()).unwrap();
+        let _ = store.with_metadata(id(1), |_| ());
+        assert_eq!(store.get(id(1)), Some(sample_meta()));
+        assert_eq!(store.len(), 1);
+    }
+
+    #[test]
+    fn with_metadata_agrees_with_get() {
+        // The override must be observationally identical to the default
+        // impl (`get(id).map(|m| f(&m))`) for both present and absent ids.
+        let mut store = InMemoryMetadataStore::new();
+        store.put(id(1), sample_meta()).unwrap();
+
+        for probe in [id(1), id(2)] {
+            let via_get = store.get(probe).map(|m| m.len());
+            let via_borrow = store.with_metadata(probe, HashMap::len);
+            assert_eq!(via_get, via_borrow, "mismatch for id {}", probe.get());
+        }
     }
 
     #[test]

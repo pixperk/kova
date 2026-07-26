@@ -811,19 +811,26 @@ impl<D: Distance> Engine<D> {
                 let mut out = Vec::new();
                 for raw_id in &candidates {
                     let id = VectorId::from(raw_id);
-                    let Some(meta) = self.shard.get_metadata(id) else {
+                    // Evaluate the residue against a *borrowed* bag and
+                    // only clone for candidates that survive it. The
+                    // previous shape cloned every candidate up front and
+                    // discarded the rejects, paying the clone for rows
+                    // that never reach the result set.
+                    let Some(kept) = self.shard.with_metadata(id, |meta| {
+                        eval_predicate(&residue, meta, params)
+                            .map(|passed| if passed { Some(meta.clone()) } else { None })
+                    }) else {
                         // Tombstoned between catalog snapshot and now,
                         // or never had metadata. Either way, skip.
                         continue;
                     };
-                    if !eval_predicate(&residue, &meta, params)? {
-                        continue;
+                    if let Some(metadata) = kept? {
+                        out.push(InternalHit {
+                            id,
+                            distance: None,
+                            metadata,
+                        });
                     }
-                    out.push(InternalHit {
-                        id,
-                        distance: None,
-                        metadata: meta,
-                    });
                 }
                 Ok(out)
             }
@@ -1197,10 +1204,14 @@ fn count_matching_with_predicate<D: Distance>(
             let mut count: usize = 0;
             for raw_id in &candidates {
                 let id = VectorId::from(raw_id);
-                let Some(meta) = shard.get_metadata(id) else {
+                // Borrow : the residue check only reads the bag, and
+                // this loop runs once per index candidate.
+                let Some(passed) =
+                    shard.with_metadata(id, |meta| eval_predicate(&residue, meta, params))
+                else {
                     continue;
                 };
-                if eval_predicate(&residue, &meta, params)? {
+                if passed? {
                     count += 1;
                 }
             }
@@ -1254,10 +1265,14 @@ fn ids_matching<D: Distance>(
             let mut out = Vec::new();
             for raw_id in &candidates {
                 let id = VectorId::from(raw_id);
-                let Some(meta) = shard.get_metadata(id) else {
+                // Borrow : only the id is kept, so the bag never needs
+                // to outlive the predicate check.
+                let Some(passed) =
+                    shard.with_metadata(id, |meta| eval_predicate(&residue, meta, params))
+                else {
                     continue;
                 };
-                if eval_predicate(&residue, &meta, params)? {
+                if passed? {
                     out.push(id);
                 }
             }

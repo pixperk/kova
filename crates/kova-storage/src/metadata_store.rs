@@ -150,6 +150,17 @@ impl MetadataStore for FileMetadataStore {
         self.entries.get(&id).cloned()
     }
 
+    /// Borrowing override, same shape as the
+    /// [`kova_core::InMemoryMetadataStore`] one : reads serve from the
+    /// in-memory map, so a reference costs nothing while the default
+    /// impl's `get` would clone the whole bag.
+    fn with_metadata<F, R>(&self, id: VectorId, f: F) -> Option<R>
+    where
+        F: FnOnce(&Metadata) -> R,
+    {
+        self.entries.get(&id).map(f)
+    }
+
     fn delete(&mut self, id: VectorId) -> Result<(), Self::Error> {
         let prev = self.entries.remove(&id);
         if let Err(e) = self.flush() {

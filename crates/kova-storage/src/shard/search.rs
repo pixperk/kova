@@ -64,11 +64,14 @@ where
     {
         use std::cell::RefCell;
         let pred_cell = RefCell::new(predicate);
+        // Borrow the bag rather than cloning it : this closure runs once
+        // per node the HNSW walk visits (not once per result), so a
+        // `get`-style clone here is the single largest cost in the
+        // filtered-search path. See `MetadataStore::with_metadata`.
         let filter = |id: VectorId| -> bool {
-            let Some(meta) = self.metadata.get(id) else {
-                return false;
-            };
-            (pred_cell.borrow_mut())(&meta)
+            self.metadata
+                .with_metadata(id, |meta| (pred_cell.borrow_mut())(meta))
+                .unwrap_or(false)
         };
         let hits = self.index.search_filtered(query, k, &filter)?;
         let results = hits
@@ -143,6 +146,21 @@ where
     /// `MetadataScan` to attach metadata to each id.
     pub fn get_metadata(&self, id: VectorId) -> Option<Metadata> {
         self.metadata.get(id)
+    }
+
+    /// Borrow the metadata bag for `id` and run `f` against it.
+    /// `None` if the id isn't in the metadata store.
+    ///
+    /// The read-only counterpart to [`Self::get_metadata`], which
+    /// clones the whole bag. Use this whenever the caller only needs
+    /// to inspect the metadata (evaluate a predicate, read one field)
+    /// rather than keep it : the executor's index-driven paths walk
+    /// large candidate sets and the clone dominates.
+    pub fn with_metadata<F, R>(&self, id: VectorId, f: F) -> Option<R>
+    where
+        F: FnOnce(&Metadata) -> R,
+    {
+        self.metadata.with_metadata(id, f)
     }
 
     /// Distance from the vector at `id` to the `query` vector under
