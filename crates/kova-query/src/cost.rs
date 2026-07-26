@@ -559,10 +559,46 @@ mod tests {
         );
     }
 
+    /// For tiny shards, touching every row beats HNSW walk overhead —
+    /// but *which* exhaustive plan wins depends on how each one reads
+    /// metadata, and at mid selectivity that is genuinely close.
+    ///
+    /// At `n=100, s=0.5, k=5` with the shipped coefficients :
+    ///
+    /// ```text
+    /// cost_B = 100 * 70            (scan)          =  7_000
+    ///        +  50 * (310 + 2.4)   (clone + dist)  = 15_620   -> 22_620
+    /// cost_C = 100 * (100 + 2.4 + 30 + 70)         -> 20_240
+    /// ```
+    ///
+    /// Both visit all 100 rows. Plan B loses because it **clones** a
+    /// bag per match (`InternalHit.metadata`) while plan C only
+    /// **borrows** one per visit — 50 clones at 310 ns outweighs 100
+    /// borrows at 30 ns. Before `c_metadata_peek` was split out, plan C
+    /// was charged the clone rate too and this asserted `B`.
+    ///
+    /// There is no measured cell at `n=100`, so neither answer is
+    /// empirically settled ; the test pins that the model is at least
+    /// *self-consistent* about it. It also points at a real
+    /// optimisation : plan B fetches metadata for every match but only
+    /// needs it for the `k` rows that survive the sort, so
+    /// `MetadataScan` -> `ExactDistance` could defer the clone and turn
+    /// `matches` clones into `k` clones.
     #[test]
-    fn dispatch_picks_b_on_tiny_shard() {
-        // For tiny shards, scan everything beats HNSW walk overhead.
+    fn dispatch_on_tiny_shard_at_mid_selectivity_prefers_the_borrowing_plan() {
         let w = workload(0.5, 5, 100, 16);
+        assert_eq!(
+            dispatch_via_cost(&w, &CostCoefficients::default()),
+            PlanKind::C
+        );
+    }
+
+    /// The robust tiny-shard case : at low selectivity there is almost
+    /// nothing to score, so plan B's scan-then-measure wins outright
+    /// and plan C's whole-graph walk is wasted work.
+    #[test]
+    fn dispatch_picks_b_on_tiny_shard_at_low_selectivity() {
+        let w = workload(0.01, 5, 100, 16);
         assert_eq!(
             dispatch_via_cost(&w, &CostCoefficients::default()),
             PlanKind::B

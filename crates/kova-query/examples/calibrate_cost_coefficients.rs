@@ -109,12 +109,29 @@ fn metadata_fixture() -> (tempfile::TempDir, FileMetadataStore, Vec<VectorId>) {
     (dir, store, ids)
 }
 
-/// `MetadataStore::get` : the **cloning** accessor. Plans A and B pay
-/// this, because both materialise owned bags into their results
-/// (`SearchHit.metadata` and `InternalHit.metadata`).
-fn calibrate_metadata_get() -> f64 {
+/// Measure both metadata accessors against **one** fixture.
+///
+/// Returns `(c_metadata_get, c_metadata_peek)` :
+///
+/// - `get` is the **cloning** accessor. Plans A and B pay it, because
+///   both materialise owned bags into their results
+///   (`SearchHit.metadata`, `InternalHit.metadata`).
+/// - `with_metadata` is the **borrowing** accessor. Plan C pays it per
+///   visited graph node, because its filter closure only reads the bag.
+///
+/// They must be measured on the same store : the whole point is the
+/// *ratio* between them, and two fixtures would let allocator state or
+/// page-cache warmth leak into the comparison.
+///
+/// Sharing the fixture is also what keeps this runner usable.
+/// `FileMetadataStore::put` rewrites the entire file per call, so
+/// building an `N_FOR_META`-row store is quadratic and dominates the
+/// whole calibration — building it twice roughly doubled the runtime
+/// for no extra information.
+fn calibrate_metadata_accessors() -> (f64, f64) {
     let (_dir, store, ids) = metadata_fixture();
 
+    // --- get : lookup + deep clone ---
     let mut sink = 0usize;
     let t0 = Instant::now();
     for id in &ids {
@@ -122,23 +139,10 @@ fn calibrate_metadata_get() -> f64 {
             sink += m.len();
         }
     }
-    let elapsed = t0.elapsed().as_nanos() as f64;
+    let get_ns = t0.elapsed().as_nanos() as f64 / META_SAMPLES as f64;
     black_box(sink);
-    elapsed / META_SAMPLES as f64
-}
 
-/// `MetadataStore::with_metadata` : the **borrowing** accessor. Plan C
-/// pays this per visited graph node, because its filter closure only
-/// reads the bag and never keeps it.
-///
-/// Measured separately from [`calibrate_metadata_get`] because the two
-/// are genuinely different operations : one is a `HashMap` lookup, the
-/// other is a lookup plus a deep clone of every key and value. Pricing
-/// plan C with the clone number over-charges it by roughly an order of
-/// magnitude, which is enough to stop it ever being dispatched.
-fn calibrate_metadata_peek() -> f64 {
-    let (_dir, store, ids) = metadata_fixture();
-
+    // --- with_metadata : lookup only ---
     let mut sink = 0usize;
     let t0 = Instant::now();
     for id in &ids {
@@ -146,9 +150,10 @@ fn calibrate_metadata_peek() -> f64 {
             sink += n;
         }
     }
-    let elapsed = t0.elapsed().as_nanos() as f64;
+    let peek_ns = t0.elapsed().as_nanos() as f64 / META_SAMPLES as f64;
     black_box(sink);
-    elapsed / META_SAMPLES as f64
+
+    (get_ns, peek_ns)
 }
 
 // Visit count comes from the model itself (`cost::internal_bench`),
@@ -263,24 +268,19 @@ fn main() {
     println!();
 
     println!(
-        "[2/4] c_metadata_get : FileMetadataStore::get (clone), {N_FOR_META} rows, {META_SAMPLES} samples"
+        "[2/3] c_metadata_get + c_metadata_peek : {N_FOR_META} rows, {META_SAMPLES} samples each"
     );
-    let c_meta = calibrate_metadata_get();
-    println!("       -> {c_meta:.0} ns/get");
-    println!();
-
+    let (c_meta, c_peek) = calibrate_metadata_accessors();
+    println!("       -> get  (clone)  = {c_meta:.0} ns");
+    println!("       -> peek (borrow) = {c_peek:.0} ns");
     println!(
-        "[3/4] c_metadata_peek : FileMetadataStore::with_metadata (borrow), {N_FOR_META} rows, {META_SAMPLES} samples"
-    );
-    let c_peek = calibrate_metadata_peek();
-    println!(
-        "       -> {c_peek:.0} ns/peek   ({:.1}x cheaper than get)",
+        "       -> borrowing is {:.1}x cheaper  <- what 0A.2 bought plan C",
         c_meta / c_peek.max(0.001)
     );
     println!();
 
     println!(
-        "[4/4] c_filter_eval, c_hnsw_per_visit : derived from plan B + plan A at n={N_FOR_PLAN}, dim={PLAN_DIM}"
+        "[3/3] c_filter_eval, c_hnsw_per_visit : derived from plan B + plan A at n={N_FOR_PLAN}, dim={PLAN_DIM}"
     );
     let (c_filter, c_hnsw) = calibrate_plans(c_meta, c_dist);
     println!("       -> c_filter_eval     = {c_filter:.0} ns");
@@ -293,6 +293,7 @@ fn main() {
     println!("        c_hnsw_per_visit:   {c_hnsw:.1},");
     println!("        c_distance_per_dim: {c_dist:.2},");
     println!("        c_metadata_get:     {c_meta:.1},");
+    println!("        c_metadata_peek:    {c_peek:.1},");
     println!("        c_filter_eval:      {c_filter:.1},");
     println!("    }}");
     println!();

@@ -13,7 +13,7 @@
 //! Run with:
 //!   cargo run --release --example cost_probe --features internal-bench
 
-#![allow(clippy::cast_precision_loss)]
+#![allow(clippy::cast_precision_loss, clippy::doc_markdown)]
 
 use kova_query::cost::{
     CostCoefficients, PlanKind, Workload, cost_plan_a, cost_plan_b, cost_plan_c, dispatch_via_cost,
@@ -197,17 +197,34 @@ fn evaluate(coeffs: &CostCoefficients) -> (usize, f64, usize, usize) {
 /// as x86 values, and replacing them with Apple-silicon numbers would
 /// just make them wrong for a different machine. Per-machine
 /// calibration belongs in config, not in a `Default` impl.
-/// Measured `MetadataStore::with_metadata` cost on this machine, from
-/// `calibrate_cost_coefficients`. Overwritten below by the real value.
-const CALIBRATED_PEEK: f64 = 30.0;
-
+/// Coefficients measured by `calibrate_cost_coefficients` on the same
+/// machine that produced the timings in `CELLS`.
+///
+/// NOT pasted into `CostCoefficients::default()` : the shipped defaults
+/// are documented as x86 values, and replacing them with Apple-silicon
+/// numbers would just make them wrong for a different machine.
+/// Per-machine calibration belongs in config, not in a `Default` impl.
 fn calibrated() -> CostCoefficients {
     CostCoefficients {
-        c_hnsw_per_visit: 115.8,
+        c_hnsw_per_visit: 116.4,
         c_distance_per_dim: 0.10,
-        c_metadata_get: 295.4,
-        c_metadata_peek: CALIBRATED_PEEK,
-        c_filter_eval: 53.2,
+        c_metadata_get: 249.5,
+        c_metadata_peek: 10.4,
+        c_filter_eval: 53.3,
+    }
+}
+
+/// The same machine, but pricing plan C's per-visit metadata access at
+/// the *cloning* rate — i.e. modelling the engine as it was before
+/// `MetadataStore::with_metadata` landed.
+///
+/// The delta between this and [`calibrated`] is 0A.2's payoff, isolated
+/// from every other change.
+fn calibrated_before_borrow() -> CostCoefficients {
+    let c = calibrated();
+    CostCoefficients {
+        c_metadata_peek: c.c_metadata_get,
+        ..c
     }
 }
 
@@ -227,20 +244,22 @@ fn main() {
     );
     for (label, coeffs) in [
         ("shipped defaults (x86)", CostCoefficients::default()),
-        ("calibrated (this machine)", calibrated()),
+        (
+            "calibrated, C clones (pre-0A.2)",
+            calibrated_before_borrow(),
+        ),
+        ("calibrated, C borrows (now)", calibrated()),
     ] {
         let (correct, regret, c_disp, c_ok) = evaluate(&coeffs);
         println!("  {label:30} {correct:6}/120     {regret:.3}    {c_disp:9} ({c_ok})");
     }
     println!();
 
+    let pre = calibrated_before_borrow();
+    let now = calibrated();
+
     println!("=== The 8 cells where plan C actually won ===");
-    println!("  dim      n      s     k   A(us)   B(us)   C(us)   predicted@310  predicted@25");
-    let default = CostCoefficients::default();
-    let borrowing = CostCoefficients {
-        c_metadata_get: 25.0,
-        ..default
-    };
+    println!("  dim      n      s     k   A(us)   B(us)   C(us)    pre-0A.2   now");
     for m in &c_wins {
         let w = Workload {
             selectivity: m.2,
@@ -249,7 +268,7 @@ fn main() {
             dim: m.0,
         };
         println!(
-            "  {:4} {:6}  {:.3} {:5} {:7.0} {:7.0} {:7.0}        {:?}             {:?}",
+            "  {:4} {:6}  {:.3} {:5} {:7.0} {:7.0} {:7.0}       {:?}        {:?}",
             m.0,
             m.1,
             m.2,
@@ -257,20 +276,23 @@ fn main() {
             m.4,
             m.5,
             m.6,
-            dispatch_via_cost(&w, &default),
-            dispatch_via_cost(&w, &borrowing),
+            dispatch_via_cost(&w, &pre),
+            dispatch_via_cost(&w, &now),
         );
     }
 
-    println!("\n=== Sweeping c_metadata_get (the coefficient 0A.2 invalidated) ===");
-    println!("  c_meta_get   correct/120   regret   C dispatched   C dispatched correctly");
-    for c_meta in [310.0, 200.0, 150.0, 100.0, 50.0, 25.0, 10.0] {
+    // Sweep `c_metadata_peek`, not `c_metadata_get` : after the split,
+    // plan C's per-visit cost is the only place the metadata term shows
+    // up in C's formula, and it reads the borrow coefficient.
+    println!("\n=== Sensitivity to c_metadata_peek (measured: 10.4 ns) ===");
+    println!("  c_meta_peek   correct/120   regret   C dispatched   of which right");
+    for c_peek in [249.5, 100.0, 50.0, 30.0, 10.4, 5.0] {
         let coeffs = CostCoefficients {
-            c_metadata_get: c_meta,
-            ..default
+            c_metadata_peek: c_peek,
+            ..now
         };
         let (correct, regret, c_disp, c_ok) = evaluate(&coeffs);
-        println!("  {c_meta:9.0}   {correct:6}/120     {regret:.3}    {c_disp:9}   {c_ok:18}");
+        println!("  {c_peek:10.1}   {correct:6}/120     {regret:.3}    {c_disp:9}   {c_ok:12}");
     }
 
     println!("\n=== One cell in detail : dim=16 n=10000 s=0.5 k=50 (C measured 2.2x faster) ===");
@@ -280,13 +302,9 @@ fn main() {
         total_rows: 10_000,
         dim: 16,
     };
-    for c_meta in [310.0, 25.0] {
-        let coeffs = CostCoefficients {
-            c_metadata_get: c_meta,
-            ..default
-        };
+    for (label, coeffs) in [("C clones (pre-0A.2)", pre), ("C borrows (now)", now)] {
         println!(
-            "  c_meta_get={c_meta:5.0}  ->  cost_A={:9.0}  cost_B={:9.0}  cost_C={:9.0}  picks {:?}",
+            "  {label:20}  cost_A={:9.0}  cost_B={:9.0}  cost_C={:9.0}  picks {:?}",
             cost_plan_a(&w, &coeffs),
             cost_plan_b(&w, &coeffs),
             cost_plan_c(&w, &coeffs),
