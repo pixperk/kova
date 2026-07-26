@@ -115,12 +115,12 @@ fn calibrate_metadata_get() -> f64 {
     elapsed / META_SAMPLES as f64
 }
 
-// Visit count formula mirrored from cost::hnsw_visits.
-fn hnsw_visits(k: usize, n: usize) -> f64 {
-    let n_f = n as f64;
-    let ef = ((k as f64) * 2.0).max(50.0).min(n_f);
-    ef * n_f.log2()
-}
+// Visit count comes from the model itself (`cost::internal_bench`),
+// never a local copy : `c_hnsw_per_visit` is derived by dividing a
+// measured latency by this count, so a formula that drifts from the
+// one `cost_plan_a` uses yields a coefficient that is wrong by
+// exactly the ratio between them.
+use kova_query::cost::internal_bench::hnsw_visits;
 
 fn run_median_ns(engine: &mut Engine<L2>, plan: PhysicalPlan, params: &ParamBindings) -> f64 {
     for _ in 0..PLAN_WARMUP {

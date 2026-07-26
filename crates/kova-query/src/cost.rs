@@ -303,6 +303,31 @@ pub fn cost_plan_c(w: &Workload, c: &CostCoefficients) -> f64 {
     visits * per_visit
 }
 
+/// Internals exposed for the benchmark harnesses only, gated behind
+/// the `internal-bench` feature so the regular public API doesn't
+/// grow them.
+///
+/// This exists because a copy is not a mirror.
+/// `examples/calibrate_cost_coefficients.rs` used to carry its own
+/// `hnsw_visits` under a `// mirrored from cost::hnsw_visits`
+/// comment. When the real one was corrected from `max(2k, 50)` to
+/// `max(k, 50)`, the copy silently kept the old formula — and since
+/// the calibrator *derives* `c_hnsw_per_visit` by dividing a measured
+/// latency by a modelled visit count, the stale copy produced a
+/// coefficient off by the exact ratio of the two formulas (1.6x).
+///
+/// One definition, shared. If a harness needs a piece of the model,
+/// re-export it here rather than transcribing it.
+#[cfg(feature = "internal-bench")]
+pub mod internal_bench {
+    /// The model's HNSW visit-count estimate, `ef * log2(n)` with
+    /// `ef = max(k, 50).min(n)`. See [`super::hnsw_visits`].
+    #[must_use]
+    pub fn hnsw_visits(k: usize, n: usize) -> f64 {
+        super::hnsw_visits(k, n)
+    }
+}
+
 /// Dispatch a plan by computing `cost_plan_a/b/c` and returning the
 /// kind with the lowest cost. Ties break A > B > C (most-general
 /// first).
