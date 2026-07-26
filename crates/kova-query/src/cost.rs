@@ -14,8 +14,21 @@
 //!   compute exact distance per match, take top-k. Wins when the
 //!   match set is small.
 //! - **Plan C** : filtered HNSW walk where the predicate is
-//!   consulted during graph traversal. Wins in the middle band
-//!   where A starves and B's match set is large.
+//!   consulted during graph traversal. Wins at **high** selectivity
+//!   on large shards with a large `k` — not, as an earlier version of
+//!   this doc claimed, in the middle band.
+//!
+//!   The measured band (`examples/validate_cost_model.rs`, 120 cells)
+//!   is `s = 0.5`, `n = 10_000`, `k >= 50`, across every dimension
+//!   tested, where C runs 1.4-2.2x faster than the best alternative.
+//!   The reason is plan A's fixed `k * KNN_OVERFETCH` : sized for a
+//!   filter that rejects, it does roughly double the necessary graph
+//!   work when the filter passes half the rows, while C asks for
+//!   exactly `k`.
+//!
+//!   At *low* selectivity plan C is the worst option by a wide margin,
+//!   because its results heap can never fill and the walk drains the
+//!   whole candidate set (measured: 13ms at n=10k, dim=1536, s=0.001).
 //!
 //! ## Inputs
 //!
@@ -52,7 +65,8 @@
 //!   distance compute. Dominant scan term `n * c_filter_eval` is
 //!   what makes plan B expensive at large `n`.
 //! - Plan C's filter overhead per visit, with visit count scaling
-//!   by `1/s` (worst-case linear filter rejection rate).
+//!   by `1/s` and clamped at `n` (the point where the filtered walk
+//!   has degenerated into a full scan).
 //!
 //! ## What this model deliberately omits
 //!
@@ -60,6 +74,7 @@
 //!   `ef * log2(n)`. Real HNSW visit counts depend on `M`,
 //!   `ef_construction`, and the data distribution. The
 //!   approximation is correct to within a small constant.
+//!
 //! - **Cache effects, NUMA, prefetching** : real per-visit cost
 //!   varies with shard size. We use a flat coefficient.
 //! - **Column correlation in compound predicates** : we already
@@ -69,6 +84,28 @@
 //! Coefficient values shipped with the crate are educated guesses
 //! tuned to dim=16 / n=10k workloads. Per-machine calibration via
 //! microbenchmarks is the natural follow-up.
+//!
+//! ## Staying honest about what the executor does
+//!
+//! Every bug this model has shipped has had the same shape : the
+//! formulas scored an *idealised* plan rather than the one the
+//! executor actually runs. Four instances so far —
+//!
+//! 1. plan A charged a starvation-retry term for a retry that does
+//!    not exist (the executor returns short rather than retrying) ;
+//! 2. plan B was missing the `n * c_filter_eval` scan term, because
+//!    the model assumed an O(1) catalog lookup that only happens
+//!    when the predicate is fully indexed ;
+//! 3. `hnsw_visits` used `ef = max(2k, 50)` where the index uses
+//!    `ef = max(k, 50)` ;
+//! 4. plan C's visit multiplier was linear in `(1 - s)` where the
+//!    real behaviour is hyperbolic in `s`.
+//!
+//! All four were found the same way : by running
+//! `examples/validate_cost_model.rs`, which forces each plan on a
+//! grid and compares predicted to measured. **Change a formula here,
+//! re-run that harness.** A model that is internally consistent can
+//! still describe a different program than the one you shipped.
 
 // Cost math is full of ratios of counts. `usize` / `u64` → `f64`
 // loses precision past 2^53, which we never approach.
@@ -144,24 +181,70 @@ pub const KNN_OVERFETCH: usize = 4;
 
 /// Minimum `ef` for an HNSW search. Even small-k queries pay this
 /// floor's worth of visits.
+///
+/// Must track `HnswParams::ef_search`'s default : the executor uses
+/// `ef = params.ef_search.max(k)`, and this model mirrors that.
 const HNSW_EF_FLOOR: f64 = 50.0;
 
-/// Filtered HNSW overhead factor : on the `1.0 - selectivity` axis,
-/// how much more does plan C visit than vanilla? At s=1 the factor
-/// is 1.0 (filter never rejects). At s=0 the factor saturates at
-/// `1 + FILTER_OVERHEAD_AT_S0`.
-const FILTER_OVERHEAD_AT_S0: f64 = 4.0;
-
-/// Expected HNSW visit count for a kNN search returning `k` items
-/// from a shard of `n` rows. Standard approximation : `ef * log2(n)`
-/// where `ef = max(2*k, HNSW_EF_FLOOR)`.
+/// Expected HNSW visit count for a search returning `k` items from a
+/// shard of `n` rows. Approximated as `ef * log2(n)`.
+///
+/// `ef` must match what [`kova_index::HnswIndex`] actually uses :
+///
+/// ```text
+/// // hnsw/search.rs, search_impl + search_filtered_impl
+/// let ef = self.params.ef_search.max(k);
+/// ```
+///
+/// i.e. `max(k, 50)` — **not** `max(2k, 50)`. An earlier version of
+/// this function doubled `k`, which inflated the modelled visit count
+/// for every plan that walks the graph. The error mostly cancelled in
+/// the plan A vs plan C comparison (both were doubled) except below
+/// the floor, where it mattered a lot : at `k = 10` the model saw
+/// `ef_A = 80` vs `ef_C = 50` and credited plan C with a 1.6x
+/// visit-count advantage it does not have. In reality both floor at
+/// 50 and the advantage is exactly 1.0x.
 fn hnsw_visits(k: usize, n: usize) -> f64 {
     if n <= 1 {
         return 1.0;
     }
     let n_f = n as f64;
-    let ef = ((k as f64) * 2.0).max(HNSW_EF_FLOOR).min(n_f);
+    let ef = (k as f64).max(HNSW_EF_FLOOR).min(n_f);
     ef * n_f.log2()
+}
+
+/// Visit-count multiplier for plan C's filtered walk, as a function of
+/// selectivity.
+///
+/// Plan C only admits filter-passing nodes into its results heap, and
+/// its termination rule requires that heap to hold `ef` entries before
+/// it can short-circuit. So to collect `ef` in-filter results it must
+/// visit roughly `ef / s` nodes : the multiplier is **hyperbolic in
+/// `s`**, not linear.
+///
+/// The previous implementation was `1 + 4 * (1 - s)`, a line
+/// saturating at 5x. That was wrong at both ends :
+///
+/// | s | linear model | `1/s` | measured |
+/// |---|---|---|---|
+/// | 0.5 | 3.0x | 2.0x | ~1.5-2x (plan C wins here) |
+/// | 0.001 | 5.0x | 1000x, clamped to `n` | visits ~all of `n` |
+///
+/// Overstating the cost at high selectivity meant plan C was never
+/// dispatched in the band where it is genuinely 1.4-2.2x faster;
+/// understating it at low selectivity hid the fact that plan C
+/// degenerates into a full scan there.
+///
+/// The result is clamped by the caller to `n` : you cannot visit more
+/// nodes than exist. That clamp is what keeps `s -> 0` finite.
+fn filter_visit_multiplier(selectivity: f64) -> f64 {
+    let s = selectivity.clamp(0.0, 1.0);
+    if s <= 0.0 {
+        // No matching rows : the walk drains the candidate set. The
+        // caller's `.min(total_rows)` turns this into "visit everything".
+        return f64::INFINITY;
+    }
+    1.0 / s
 }
 
 /// Cost of plan A : overfetched kNN + post-filter.
@@ -202,14 +285,16 @@ pub fn cost_plan_b(w: &Workload, c: &CostCoefficients) -> f64 {
 
 /// Cost of plan C : filtered HNSW walk.
 ///
-/// Visit count scales by `1 + FILTER_OVERHEAD_AT_S0 * (1 - s)` :
-/// at high selectivity, walks like vanilla ; at low selectivity,
-/// the filter rejection rate forces more visits to find `k`
-/// matches.
+/// Visit count scales by `1 / s` (see [`filter_visit_multiplier`]) :
+/// at high selectivity the walk behaves like vanilla HNSW ; as the
+/// filter rejects more, proportionally more nodes must be visited to
+/// fill the results heap. Clamped at `total_rows`, since the walk
+/// cannot visit more nodes than the graph holds — that clamp is the
+/// model's way of saying "plan C degenerated into a full scan."
 #[must_use]
 pub fn cost_plan_c(w: &Workload, c: &CostCoefficients) -> f64 {
     let base = hnsw_visits(w.user_k, w.total_rows);
-    let overhead = 1.0 + FILTER_OVERHEAD_AT_S0 * (1.0 - w.selectivity).clamp(0.0, 1.0);
+    let overhead = filter_visit_multiplier(w.selectivity);
     let visits = (base * overhead).min(w.total_rows as f64);
     let per_visit = c.c_hnsw_per_visit
         + c.c_distance_per_dim * w.dim as f64
@@ -246,6 +331,73 @@ mod tests {
             total_rows: n,
             dim,
         }
+    }
+
+    // ---- hnsw_visits : must mirror the index, not an idealised HNSW ----
+
+    /// The index computes `ef = params.ef_search.max(k)`, so any `k`
+    /// at or below the floor produces the same visit count. A model
+    /// that used `max(2k, 50)` would show k=10 and k=25 differing.
+    #[test]
+    fn hnsw_visits_floors_at_ef_search_not_double_k() {
+        let at_10 = hnsw_visits(10, 10_000);
+        let at_25 = hnsw_visits(25, 10_000);
+        let at_50 = hnsw_visits(50, 10_000);
+        assert!(
+            (at_10 - at_50).abs() < f64::EPSILON,
+            "k=10 must floor to ef=50"
+        );
+        assert!(
+            (at_25 - at_50).abs() < f64::EPSILON,
+            "k=25 must floor to ef=50"
+        );
+    }
+
+    /// Above the floor, visits scale linearly in `k` (ef == k).
+    #[test]
+    fn hnsw_visits_scales_linearly_above_the_floor() {
+        let at_100 = hnsw_visits(100, 10_000);
+        let at_200 = hnsw_visits(200, 10_000);
+        assert!((at_200 / at_100 - 2.0).abs() < 1e-9);
+    }
+
+    /// The regression this pins : at k=10 plan A requests `k * 4 = 40`
+    /// candidates and plan C requests `10`. Both are under the ef floor,
+    /// so both walk with ef=50 and plan C has **no** visit-count
+    /// advantage. The old `max(2k, 50)` formula claimed `ef_A = 80` vs
+    /// `ef_C = 50`, crediting C with a 1.6x edge it never had.
+    #[test]
+    fn plan_a_and_plan_c_walk_identically_at_small_k() {
+        let k = 10;
+        let plan_a_request = k * KNN_OVERFETCH; // 40
+        assert!(
+            (hnsw_visits(plan_a_request, 10_000) - hnsw_visits(k, 10_000)).abs() < f64::EPSILON,
+            "below the ef floor A and C must walk the same width"
+        );
+    }
+
+    // ---- filter_visit_multiplier : hyperbolic, not linear ----
+
+    #[test]
+    fn filter_multiplier_is_inverse_selectivity() {
+        assert!((filter_visit_multiplier(1.0) - 1.0).abs() < 1e-9);
+        assert!((filter_visit_multiplier(0.5) - 2.0).abs() < 1e-9);
+        assert!((filter_visit_multiplier(0.1) - 10.0).abs() < 1e-9);
+        assert!(filter_visit_multiplier(0.0).is_infinite());
+    }
+
+    /// The old linear form saturated at 5x, so it could never express
+    /// "this walk visits the whole shard." The hyperbolic form does,
+    /// and `cost_plan_c` clamps it at `total_rows`.
+    #[test]
+    fn plan_c_degenerates_to_a_full_scan_at_low_selectivity() {
+        let c = CostCoefficients::default();
+        let n = 10_000;
+        let w = workload(0.001, 10, n, 16);
+        let per_visit =
+            c.c_hnsw_per_visit + c.c_distance_per_dim * 16.0 + c.c_metadata_get + c.c_filter_eval;
+        // Clamped at exactly one visit per row in the shard.
+        assert!((cost_plan_c(&w, &c) - n as f64 * per_visit).abs() < 1.0);
     }
 
     // ---- cost functions ----
@@ -363,6 +515,33 @@ mod tests {
             dispatch_via_cost(&w, &CostCoefficients::default()),
             PlanKind::B
         );
+    }
+
+    /// Plan C is measurably fastest at high selectivity on a large
+    /// shard — `examples/validate_cost_model.rs` records
+    /// `dim=16 n=10_000 s=0.5 k=50` at A=229us B=1149us **C=103us**
+    /// (C wins by 2.2x), plus seven sibling cells.
+    ///
+    /// The model only agrees once `c_metadata_get` reflects a
+    /// *borrowed* bag rather than a cloned one. The shipped default
+    /// (310ns) was calibrated against `MetadataStore::get`, which
+    /// clones the whole `HashMap` ; plan C pays that per visited node,
+    /// so it dominates C's per-visit cost. With
+    /// `MetadataStore::with_metadata` on the read paths the real cost
+    /// is an order of magnitude lower, and dispatch lines up with the
+    /// measurement.
+    ///
+    /// If this test starts failing after a re-calibration, the
+    /// coefficient moved — re-run the validation harness before
+    /// changing the assertion.
+    #[test]
+    fn plan_c_is_dispatched_in_its_measured_band_when_metadata_is_borrowed() {
+        let borrowing = CostCoefficients {
+            c_metadata_get: 25.0,
+            ..Default::default()
+        };
+        let w = workload(0.5, 50, 10_000, 16);
+        assert_eq!(dispatch_via_cost(&w, &borrowing), PlanKind::C);
     }
 
     #[test]
