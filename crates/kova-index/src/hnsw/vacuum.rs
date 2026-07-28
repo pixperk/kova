@@ -54,6 +54,10 @@ use super::HnswIndex;
 /// Wraps any `V::Error` (or other `Debug` error) into
 /// [`KovaIndexError::Storage`], the standard pattern for surfacing
 /// foreign errors from the vector store.
+/// One repair unit : the `(node, layer)` whose neighbour list lost
+/// edges, and the set of now-gone ids that were removed from it.
+type AffectedEntry = ((VectorId, usize), HashSet<VectorId>);
+
 fn store_err<E: Debug>(e: E) -> KovaIndexError {
     KovaIndexError::Storage(format!("{e:?}"))
 }
@@ -81,7 +85,11 @@ impl<D: Distance, V: VectorStore> HnswIndex<D, V> {
         // Snapshot tombstone ids so we can iterate without holding an
         // immutable borrow on self.tombstones (later passes need mut
         // borrows on self for graph mutations).
-        let tombstoned: Vec<VectorId> = self.tombstones.iter().copied().collect();
+        // Sorted : `self.tombstones` is a `HashSet`, and this vec drives
+        // both the cleanup loop and the repair path's filtering. Sorting
+        // keeps vacuum reproducible across processes.
+        let mut tombstoned: Vec<VectorId> = self.tombstones.iter().copied().collect();
+        tombstoned.sort_unstable();
         let n_removed = tombstoned.len();
 
         // --------------------------------------------------------------
@@ -97,7 +105,7 @@ impl<D: Distance, V: VectorStore> HnswIndex<D, V> {
         // removed anyway. If two tombstones share a live neighbour N,
         // N only gets one entry in `affected` covering both removals.
         // --------------------------------------------------------------
-        let affected = self.collect_affected_at_layer(&tombstoned)?;
+        let affected = self.collect_affected_at_layer();
 
         // --------------------------------------------------------------
         // PASS 2 : repair each (N, layer) at most once.
@@ -144,26 +152,39 @@ impl<D: Distance, V: VectorStore> HnswIndex<D, V> {
     /// neighbour, layer it appears in) pair. Tombstoned neighbours of
     /// tombstoned ids are skipped : they get removed in CLEANUP without
     /// needing a repair pass.
-    fn collect_affected_at_layer(
-        &self,
-        tombstoned: &[VectorId],
-    ) -> Result<HashMap<(VectorId, usize), HashSet<VectorId>>, KovaIndexError> {
+    fn collect_affected_at_layer(&self) -> Vec<AffectedEntry> {
         let mut affected: HashMap<(VectorId, usize), HashSet<VectorId>> = HashMap::new();
-        for &t in tombstoned {
-            let t_node = self.nodes.get(&t).ok_or_else(|| {
-                KovaIndexError::Storage(format!("vacuum: tombstoned id {t} missing from nodes map"))
-            })?;
-            for (layer, neighbours_at_layer) in t_node.neighbors.iter().enumerate() {
-                for &n in neighbours_at_layer {
-                    if self.tombstones.contains(&n) {
-                        // n is also tombstoned ; skip ; cleanup removes both.
-                        continue;
-                    }
-                    affected.entry((n, layer)).or_default().insert(t);
+
+        for (&owner, node) in &self.nodes {
+            if self.tombstones.contains(&owner) {
+                // About to be removed wholesale ; nothing to repair.
+                continue;
+            }
+            for (layer, neighbours_at_layer) in node.neighbors.iter().enumerate() {
+                let dead: HashSet<VectorId> = neighbours_at_layer
+                    .iter()
+                    .copied()
+                    .filter(|nb| {
+                        // Tombstoned now, or already gone : a previous
+                        // vacuum written by the buggy version could have
+                        // left dangling ids behind, and this pass is the
+                        // natural place to heal them.
+                        self.tombstones.contains(nb) || !self.nodes.contains_key(nb)
+                    })
+                    .collect();
+                if !dead.is_empty() {
+                    affected.insert((owner, layer), dead);
                 }
             }
         }
-        Ok(affected)
+
+        // Sort so pass 2 repairs in a reproducible order. Pass 2 mutates
+        // the graph (it adds bidirectional edges and prunes on overflow),
+        // so iterating a `HashMap` would let two replicas applying the
+        // same log build different graphs.
+        let mut out: Vec<AffectedEntry> = affected.into_iter().collect();
+        out.sort_unstable_by_key(|((n, layer), _)| (n.get(), *layer));
+        out
     }
 
     /// PASS 2 helper : repair node `n` at `layer` exactly once.
@@ -308,7 +329,14 @@ impl<D: Distance, V: VectorStore> HnswIndex<D, V> {
         }
 
         // Path 2 : tombstoned-T's other live neighbours at this layer.
-        for &t in removed_neighbours {
+        //
+        // Sorted : `removed_neighbours` is a `HashSet`, and the entry
+        // points it produces seed a `search_layer` whose result decides
+        // which edges get added. Iterating unordered would make the
+        // repaired graph depend on hash iteration order.
+        let mut removed_sorted: Vec<VectorId> = removed_neighbours.iter().copied().collect();
+        removed_sorted.sort_unstable();
+        for t in removed_sorted {
             let Some(t_node) = self.nodes.get(&t) else {
                 continue;
             };
@@ -398,9 +426,18 @@ impl<D: Distance, V: VectorStore> HnswIndex<D, V> {
     /// Returns the live node with the highest `top_layer`, or `None`
     /// if the graph is empty.
     fn pick_new_entry_point(&self) -> Option<VectorId> {
+        // Ties on `top_layer` are broken by smallest id, deliberately.
+        //
+        // `max_by_key` returns the *last* maximum it encounters, and
+        // `self.nodes` is a `HashMap` — so with several nodes sharing
+        // the top layer (the common case) the winner depended on hash
+        // iteration order. That made the entry point differ between two
+        // replicas holding identical graphs, which both changes the
+        // snapshot bytes and, worse, changes where every subsequent
+        // search starts.
         self.nodes
             .iter()
-            .max_by_key(|(_, node)| node.top_layer())
+            .max_by_key(|&(id, node)| (node.top_layer(), std::cmp::Reverse(*id)))
             .map(|(id, _)| *id)
     }
 }
@@ -422,6 +459,211 @@ mod tests {
 
     fn fresh_index() -> HnswIndex<L2, InMemoryVectorStore> {
         HnswIndex::new(L2)
+    }
+
+    /// Deterministic input generator. Not `rand` : these tests assert a
+    /// structural invariant, and the inputs should be stable.
+    struct Xorshift(u64);
+    impl Xorshift {
+        fn f(&mut self) -> f32 {
+            let mut x = self.0;
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            self.0 = x;
+            #[allow(clippy::cast_precision_loss)]
+            let scaled = (x.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 40) as f32;
+            scaled / 16_777_216.0
+        }
+        fn vector(&mut self, dim: usize) -> Vector {
+            v((0..dim).map(|_| self.f()).collect())
+        }
+    }
+
+    fn seeded_index(n: u64, dim: usize) -> HnswIndex<L2, InMemoryVectorStore> {
+        let mut rng = Xorshift(0xD37E_2711_D37E_2711);
+        let mut idx = fresh_index();
+        for i in 0..n {
+            idx.insert(id(i), rng.vector(dim)).unwrap();
+        }
+        idx
+    }
+
+    /// **The invariant vacuum exists to maintain.** After it returns,
+    /// no surviving node may reference an id that is no longer in the
+    /// graph.
+    ///
+    /// Returns the dangling `(node, layer, missing_neighbour)` triples so
+    /// a failure can name them.
+    fn dangling_edges(idx: &HnswIndex<L2, InMemoryVectorStore>) -> Vec<(u64, usize, u64)> {
+        let mut out = Vec::new();
+        for (&owner, node) in &idx.nodes {
+            for (layer, neighbours) in node.neighbors.iter().enumerate() {
+                for &nb in neighbours {
+                    if !idx.nodes.contains_key(&nb) {
+                        out.push((owner.get(), layer, nb.get()));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Vacuum must leave no edge pointing at a removed node.
+    ///
+    /// It used to. `collect_affected_at_layer` found nodes to repair by
+    /// walking each *tombstone's own* neighbour list, which assumes the
+    /// graph is symmetric — that everyone pointing at `T` is named by
+    /// `T`. HNSW does not guarantee that : adding a bidirectional edge
+    /// can leave `X -> T` while the back-edge `T -> X` is pruned away by
+    /// `select_neighbors_heuristic` on overflow. Those `X` were never
+    /// repaired and kept dangling references.
+    ///
+    /// Consequences, in increasing order of nastiness :
+    ///
+    /// 1. degraded recall — a node has fewer usable edges than `M` implies
+    /// 2. a *second* vacuum errors out (`affected id N missing from nodes`),
+    ///    which is reachable through the ordinary `Shard::checkpoint` path
+    ///    since checkpoint vacuums internally
+    /// 3. vacuum re-enables id reuse, so a re-inserted id **resurrects the
+    ///    stale edge** — now pointing at an unrelated vector
+    ///
+    /// Needs a few hundred nodes to reproduce : the asymmetry requires
+    /// enough insert pressure for the heuristic to start pruning
+    /// back-edges. Existing vacuum tests use 2-25 nodes.
+    #[test]
+    fn vacuum_leaves_no_dangling_edges() {
+        let mut idx = seeded_index(500, 8);
+        for i in 0..250 {
+            idx.tombstone(id(i)).unwrap();
+        }
+        idx.vacuum_tombstones().unwrap();
+
+        let dangling = dangling_edges(&idx);
+        assert!(
+            dangling.is_empty(),
+            "vacuum left {} edge(s) pointing at removed nodes, e.g. {:?}",
+            dangling.len(),
+            &dangling[..dangling.len().min(5)]
+        );
+    }
+
+    /// The failure mode that surfaced first : a second vacuum trips over
+    /// the dangling edges the first one left behind. Reachable through
+    /// `Shard::checkpoint`, which vacuums internally — so
+    /// delete/checkpoint/delete/checkpoint used to fail.
+    #[test]
+    fn repeated_vacuum_succeeds() {
+        let mut idx = seeded_index(500, 8);
+        for i in 0..250 {
+            idx.tombstone(id(i)).unwrap();
+        }
+        idx.vacuum_tombstones().expect("first vacuum");
+
+        for i in (250..400).filter(|i| i % 3 == 0) {
+            idx.tombstone(id(i)).unwrap();
+        }
+        idx.vacuum_tombstones()
+            .expect("second vacuum must not fail on the first one's leftovers");
+
+        assert!(dangling_edges(&idx).is_empty());
+    }
+
+    /// The silent-corruption case, and the reason the invariant above is
+    /// worth asserting rather than just "not crashing".
+    ///
+    /// Vacuum frees ids for reuse. If a stale edge to a removed id
+    /// survives and that id is later re-inserted, the edge **resurrects**
+    /// — now pointing at a completely unrelated vector, silently
+    /// corrupting graph locality.
+    ///
+    /// This is deliberately checked *before* the reinsert, because
+    /// afterwards it is undetectable from the graph alone : an edge to
+    /// "id 3" looks identical whether it was built for the old id 3 or
+    /// the new one. The graph stores no edge provenance. So the only
+    /// defence is the invariant that no dangling edge exists in the
+    /// first place.
+    #[test]
+    fn vacuum_frees_ids_for_reuse_without_leaving_resurrectable_edges() {
+        let mut idx = seeded_index(500, 8);
+        let doomed: Vec<u64> = (0..250).collect();
+        for &i in &doomed {
+            idx.tombstone(id(i)).unwrap();
+        }
+        idx.vacuum_tombstones().unwrap();
+
+        // The load-bearing check : no edge may reference a freed id at
+        // the moment those ids become reusable.
+        let dangling = dangling_edges(&idx);
+        assert!(
+            dangling.is_empty(),
+            "{} edge(s) reference ids that are now free for reuse — \
+             re-inserting any of them resurrects the edge against unrelated \
+             data. e.g. {:?}",
+            dangling.len(),
+            &dangling[..dangling.len().min(5)]
+        );
+
+        // Reinsert with far-away vectors ; the graph must stay sound.
+        let mut rng = Xorshift(0xFACE_FACE_FACE_FACE);
+        for &i in &doomed {
+            let mut data: Vec<f32> = (0..8).map(|_| rng.f()).collect();
+            for x in &mut data {
+                *x += 1000.0;
+            }
+            idx.insert(id(i), v(data)).unwrap();
+        }
+        assert!(dangling_edges(&idx).is_empty());
+    }
+
+    /// Vacuum must be **reproducible** : it mutates the graph (adds
+    /// bidirectional edges, prunes on overflow), so two replicas
+    /// vacuuming the same tombstone set must land on the same graph or
+    /// they will answer queries differently.
+    ///
+    /// Both `self.tombstones` and the affected-node map are hash-based,
+    /// and iterating either unordered made the repaired graph depend on
+    /// hash iteration order.
+    #[test]
+    fn vacuum_is_reproducible() {
+        let build_and_vacuum = || {
+            let mut idx = seeded_index(500, 8);
+            for i in (0..500).filter(|i| i % 3 == 0) {
+                idx.tombstone(id(i)).unwrap();
+            }
+            idx.vacuum_tombstones().unwrap();
+            idx
+        };
+        let a = build_and_vacuum();
+        let b = build_and_vacuum();
+
+        let fingerprint = |idx: &HnswIndex<L2, InMemoryVectorStore>| {
+            let mut rows: Vec<(u64, Vec<Vec<u64>>)> = idx
+                .nodes
+                .iter()
+                .map(|(id, node)| {
+                    (
+                        id.get(),
+                        node.neighbors
+                            .iter()
+                            .map(|layer| {
+                                let mut l: Vec<u64> = layer.iter().map(|nb| nb.get()).collect();
+                                l.sort_unstable();
+                                l
+                            })
+                            .collect(),
+                    )
+                })
+                .collect();
+            rows.sort_unstable();
+            rows
+        };
+
+        assert_eq!(
+            fingerprint(&a),
+            fingerprint(&b),
+            "two identical vacuums produced different graphs"
+        );
     }
 
     // ---------- baseline ----------

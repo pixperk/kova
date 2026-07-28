@@ -30,7 +30,7 @@
 //!   only affect future insertions ; seed only affects future random
 //!   level assignments.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{Read, Write};
 
 use kova_core::{Distance, VectorId, VectorStore};
@@ -62,7 +62,22 @@ struct GraphSnapshot {
     entry_point: Option<VectorId>,
     /// `nodes[id][layer] = neighbours at that layer`. Top layer per
     /// node is implicit : `nodes[id].len() - 1`.
-    nodes: HashMap<VectorId, Vec<Vec<VectorId>>>,
+    ///
+    /// **`BTreeMap`, not `HashMap`, and that is load-bearing.** bincode
+    /// encodes both as a length-prefixed sequence of pairs, so the wire
+    /// format is identical — but a `HashMap` is written in *hash
+    /// iteration order*, which differs between instances even for
+    /// identical contents. Two replicas holding the same graph would
+    /// then produce snapshots that differ byte-for-byte, which rules
+    /// out comparing replicas by checksum or verifying a snapshot
+    /// transfer by hash. The ordered map costs one `O(n log n)` build
+    /// per checkpoint and makes snapshots content-addressable.
+    ///
+    /// Neighbour lists are deliberately *not* sorted : their order is
+    /// already deterministic (it is insertion order under a
+    /// deterministic apply path), and it is semantically meaningful —
+    /// `search_layer` examines neighbours in list order.
+    nodes: BTreeMap<VectorId, Vec<Vec<VectorId>>>,
 }
 
 impl<D: Distance, V: VectorStore> HnswIndex<D, V> {
