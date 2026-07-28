@@ -355,14 +355,94 @@ pub mod internal_bench {
     }
 }
 
+/// Rows plan A is expected to return : it walks the graph for
+/// `user_k * KNN_OVERFETCH` candidates, post-filters them, and returns
+/// the survivors **without retrying**.
+///
+/// **Measured accuracy** (`examples/validate_cost_model.rs`,
+/// `dim=16 n=10_000`) : predicted 10 / actual 7, predicted 20 / actual
+/// 15, predicted 100 / actual 90, predicted 400 / actual 385.
+/// Consistently 10-30% optimistic — never pessimistic — because the
+/// filter correlates weakly with the query's neighbourhood.
+#[must_use]
+pub fn plan_a_expected_rows(w: &Workload) -> f64 {
+    (w.user_k * KNN_OVERFETCH) as f64 * w.selectivity
+}
+
+/// Whether plan A can return the **complete** answer for this workload.
+///
+/// The complete answer to `... WHERE pred ORDER BY dist LIMIT k` is
+/// `min(k, matching_rows)` — you cannot return more rows than match,
+/// and you should not return fewer than the LIMIT when they exist.
+///
+/// Plans B and C always reach that count : B scores every match, and
+/// C's termination gate requires a full results heap. Plan A does not,
+/// and the shortfall is not marginal :
+///
+/// ```text
+/// dim=16 n=10_000, rows returned for LIMIT 10
+///   s=0.001  ->  A 0   B 10  C 10       (10 rows match)
+///   s=0.01   ->  A 0   B 10  C 10
+///   s=0.05   ->  A 0   B 10  C 10
+/// ```
+///
+/// Plan A returns **nothing** for a query with ten valid answers, and
+/// the cost model dispatches it anyway because 51 us of nothing beats
+/// 369 us of the right answer. That is not an approximation trade-off :
+/// HNSW is approximate, so 8-of-10 would be fine, but 0-of-10 is a
+/// wrong answer.
+///
+/// Substituting `plan_a_expected_rows >= min(k, s*n)` and simplifying
+/// gives the closed form :
+///
+/// - when enough rows match (`s*n >= k`) : plan A can fill the LIMIT
+///   **only when `s >= 1/KNN_OVERFETCH`**, i.e. 0.25. Below that it is
+///   arithmetically impossible, for any `k`.
+/// - when fewer rows match than the LIMIT asks for : plan A can return
+///   them all only when `k * KNN_OVERFETCH >= n`.
+///
+/// # Caveat
+///
+/// This is an *expectation* from a global selectivity estimate, not a
+/// guarantee. Selectivity is global ; starvation is local. A filter
+/// that correlates with position in embedding space (`category='legal'`
+/// clusters in any real embedding model) can starve plan A at a
+/// particular query point even when global `s` is high. Catching that
+/// needs a runtime check — see the roadmap's plan-A escalation item.
+#[must_use]
+pub fn plan_a_can_satisfy(w: &Workload) -> bool {
+    let matching = w.selectivity * w.total_rows as f64;
+    let complete_answer = (w.user_k as f64).min(matching);
+    // A shard with no matching rows has a complete answer of size 0,
+    // which every plan trivially satisfies.
+    plan_a_expected_rows(w) >= complete_answer
+}
+
 /// Dispatch a plan by computing `cost_plan_a/b/c` and returning the
 /// kind with the lowest cost. Ties break A > B > C (most-general
 /// first).
+///
+/// **Correctness gate.** Plan A is excluded outright when
+/// [`plan_a_can_satisfy`] says it cannot return the complete answer,
+/// regardless of how cheap it is. A plan that returns zero rows for a
+/// query with ten valid answers is not a fast plan, it is a wrong one,
+/// and no cost comparison can express that — `cost_plan_a` is
+/// deliberately independent of selectivity.
+///
+/// Plans B and C both always reach `min(k, matching_rows)`, so
+/// excluding A always leaves at least one correct choice.
 #[must_use]
 pub fn dispatch_via_cost(w: &Workload, c: &CostCoefficients) -> PlanKind {
-    let a = cost_plan_a(w, c);
     let b = cost_plan_b(w, c);
     let cc = cost_plan_c(w, c);
+
+    // Correctness first : a plan that cannot answer the query never
+    // wins on price.
+    if !plan_a_can_satisfy(w) {
+        return if b <= cc { PlanKind::B } else { PlanKind::C };
+    }
+
+    let a = cost_plan_a(w, c);
     if a <= b && a <= cc {
         PlanKind::A
     } else if b <= cc {
@@ -544,19 +624,120 @@ mod tests {
         );
     }
 
+    /// Plan A is **not** dispatched at low selectivity, however cheap
+    /// its walk is.
+    ///
+    /// This test previously asserted `PlanKind::A` here, on the
+    /// reasoning that "the executor just returns however many
+    /// candidates pass the post-filter" — treating a short result as an
+    /// acceptable consequence of a fast plan. Measurement showed what
+    /// that actually means : at `s <= 0.05` plan A returns **zero rows**
+    /// for `LIMIT 10` while plans B and C return all ten matches.
+    ///
+    /// At `s = 0.02, k = 10` plan A expects `4 * 10 * 0.02 = 0.8` rows
+    /// against a complete answer of 10, so it is excluded by
+    /// [`plan_a_can_satisfy`] before costs are compared.
+    ///
+    /// Which of B/C then wins is a cost question, and this cell has no
+    /// measured counterpart (the sweep tops out at `n = 10_000`), so the
+    /// assertion below pins "not A" rather than claiming C is right.
     #[test]
-    fn dispatch_picks_a_at_high_dim_low_selectivity_large_n() {
-        // With the starvation term removed, plan A's HNSW walk is
-        // cheap even at very low selectivity : the executor just
-        // returns however many candidates pass the post-filter.
-        // At n=1M, plan B's scan term `n * c_filter_eval` makes it
-        // expensive ; plan C's filter overhead at low s is worse
-        // still. Plan A wins.
+    fn dispatch_refuses_plan_a_at_low_selectivity_large_n() {
         let w = workload(0.02, 10, 1_000_000, 1536);
-        assert_eq!(
-            dispatch_via_cost(&w, &CostCoefficients::default()),
-            PlanKind::A
+        let picked = dispatch_via_cost(&w, &CostCoefficients::default());
+        assert_ne!(
+            picked,
+            PlanKind::A,
+            "plan A expects {:.2} rows against a complete answer of 10",
+            plan_a_expected_rows(&w)
         );
+    }
+
+    // ---- plan A's correctness gate ----
+
+    /// The closed form : with enough matching rows, plan A can fill its
+    /// LIMIT exactly when `s >= 1 / KNN_OVERFETCH`.
+    #[test]
+    fn plan_a_threshold_is_one_over_overfetch() {
+        let threshold = 1.0 / KNN_OVERFETCH as f64; // 0.25
+        // Comfortably above and below, at a shard size where matches
+        // vastly exceed k so the `min(k, matches)` branch is not active.
+        assert!(plan_a_can_satisfy(&workload(
+            threshold + 0.05,
+            10,
+            100_000,
+            16
+        )));
+        assert!(!plan_a_can_satisfy(&workload(
+            threshold - 0.05,
+            10,
+            100_000,
+            16
+        )));
+    }
+
+    /// The threshold does not depend on `k` : the overfetch scales with
+    /// `k`, so the ratio that decides sufficiency does not.
+    #[test]
+    fn plan_a_threshold_is_independent_of_k() {
+        for k in [1, 10, 100, 1000] {
+            assert!(
+                !plan_a_can_satisfy(&workload(0.1, k, 1_000_000, 16)),
+                "k={k} should be starved at s=0.1"
+            );
+            assert!(
+                plan_a_can_satisfy(&workload(0.9, k, 1_000_000, 16)),
+                "k={k} should be fine at s=0.9"
+            );
+        }
+    }
+
+    /// When fewer rows match than the LIMIT asks for, the complete
+    /// answer is the match count, not `k` — so the gate compares
+    /// against `min(k, s*n)`.
+    ///
+    /// `s=0.001, n=10_000` leaves 10 matching rows. A `LIMIT 500` query
+    /// can only ever be answered with those 10, and plan A expects
+    /// `4 * 500 * 0.001 = 2` of them. Measured : plan A returned 3,
+    /// plans B and C returned 10.
+    #[test]
+    fn plan_a_gate_uses_match_count_when_below_the_limit() {
+        let w = workload(0.001, 500, 10_000, 16);
+        assert!((plan_a_expected_rows(&w) - 2.0).abs() < 1e-9);
+        assert!(
+            !plan_a_can_satisfy(&w),
+            "expects 2 rows where the complete answer is 10"
+        );
+    }
+
+    /// An empty match set has a complete answer of size zero, which
+    /// every plan satisfies. Guards against the gate reporting a
+    /// shortfall against nothing.
+    #[test]
+    fn plan_a_gate_is_satisfied_when_nothing_matches() {
+        assert!(plan_a_can_satisfy(&workload(0.0, 10, 10_000, 16)));
+    }
+
+    /// Sweep the regime the measurements cover and assert the dispatcher
+    /// never picks a plan that cannot answer the query.
+    #[test]
+    fn dispatch_never_returns_a_plan_that_cannot_satisfy() {
+        let c = CostCoefficients::default();
+        for &s in &[0.0, 0.001, 0.01, 0.05, 0.2, 0.25, 0.5, 0.7, 0.9, 1.0] {
+            for &k in &[1, 10, 50, 100, 500] {
+                for &n in &[100, 1_000, 10_000, 100_000] {
+                    let w = workload(s, k, n, 128);
+                    if dispatch_via_cost(&w, &c) == PlanKind::A {
+                        assert!(
+                            plan_a_can_satisfy(&w),
+                            "dispatched starved plan A at s={s} k={k} n={n} \
+                             (expects {:.2} rows)",
+                            plan_a_expected_rows(&w)
+                        );
+                    }
+                }
+            }
+        }
     }
 
     /// For tiny shards, touching every row beats HNSW walk overhead —

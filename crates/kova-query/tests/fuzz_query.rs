@@ -632,6 +632,23 @@ enum CheckKind<'a> {
         pred: &'a PredicateExpr,
         assigns: &'a [LogicalAssignment],
     },
+    /// kNN SELECT with a WHERE clause. We cannot check *which* rows
+    /// come back (HNSW is approximate and the recall harnesses cover
+    /// that), but we can check that a query with satisfiable matches
+    /// does not come back **empty**, and never exceeds its LIMIT.
+    ///
+    /// This exists because plan A does not retry : it walks the graph
+    /// for `k * KNN_OVERFETCH` candidates, post-filters, and returns
+    /// the survivors. At low selectivity that was measured returning
+    /// **zero rows** for `LIMIT 10` against ten matching rows, while
+    /// plans B and C returned all ten — and the cost model dispatched
+    /// it anyway, because nothing in `cost_plan_a` can see a result
+    /// count. `cost::plan_a_can_satisfy` now gates that at plan time ;
+    /// this assertion is what stops it regressing silently.
+    KnnNonEmpty {
+        pred: &'a PredicateExpr,
+        limit: u64,
+    },
 }
 
 /// Inspect a [`LogicalStatement`] and decide whether we have a
@@ -659,6 +676,19 @@ fn check_kind<'a>(stmt: &'a LogicalStatement, params: &ParamBindings) -> Option<
                 && !predicate_has_distance_threshold(pred)
             {
                 return Some(CheckKind::ScanAndLimit { pred, limit });
+            }
+            // kNN : distance ordering + LIMIT + WHERE, and the WHERE
+            // must not itself carry a distance threshold (that shape
+            // routes to the radius operator, whose result size is
+            // governed by the radius rather than the LIMIT).
+            if let Some(limit) = q.limit
+                && let Some(pred) = &q.predicate
+                && q.ordering
+                    .iter()
+                    .any(|o| matches!(o, kova_query::logical::OrderingSpec::Distance { .. }))
+                && !predicate_has_distance_threshold(pred)
+            {
+                return Some(CheckKind::KnnNonEmpty { pred, limit });
             }
             None
         }
@@ -1000,6 +1030,33 @@ fn correctness_one(fx: &mut Fixture, rng: &mut StdRng, seed: u64, iter: usize) {
                 "COUNT mismatch on `{sql}` (seed={seed} iter={iter})"
             );
         }
+        (CheckKind::KnnNonEmpty { limit, .. }, Expectation::KnnMatchCount(matches)) => {
+            let Ok(ExecutionResult::Rows { rows, .. }) = engine_result else {
+                return;
+            };
+            let limit_usize = usize::try_from(limit).unwrap_or(usize::MAX);
+            // Never more than the LIMIT.
+            assert!(
+                rows.len() <= limit_usize,
+                "kNN returned more rows than LIMIT : `{sql}` got {} limit {limit} \
+                 (seed={seed} iter={iter})",
+                rows.len()
+            );
+            // The load-bearing one : a satisfiable query must not come
+            // back empty. We deliberately do NOT assert the stronger
+            // `rows.len() == min(limit, matches)` — HNSW is approximate
+            // and a filtered walk may legitimately miss some matches —
+            // but returning *nothing* when matches exist is a wrong
+            // answer, not an approximation.
+            if matches > 0 {
+                assert!(
+                    !rows.is_empty(),
+                    "kNN returned 0 rows but {matches} row(s) satisfy the predicate : \
+                     `{sql}` (seed={seed} iter={iter}). A starved plan A was dispatched ; \
+                     see cost::plan_a_can_satisfy."
+                );
+            }
+        }
         (CheckKind::ScanAndLimit { limit, .. }, Expectation::ScanIds(expected)) => {
             let Ok(ExecutionResult::Rows { rows, .. }) = engine_result else {
                 return;
@@ -1106,6 +1163,8 @@ enum Expectation {
     DeleteByPredicateTargets(Vec<VectorId>),
     UpdateByIdExpected(bool),
     UpdateByPredicateTargets(Vec<VectorId>),
+    /// How many live rows satisfy a kNN query's WHERE clause.
+    KnnMatchCount(usize),
 }
 
 /// Walk the reference state and compute what the engine *should*
@@ -1130,6 +1189,15 @@ fn compute_expectation(
                 }
             }
             Some(Expectation::Count(n))
+        }
+        CheckKind::KnnNonEmpty { pred, .. } => {
+            let mut n = 0usize;
+            for (_, meta) in rows {
+                if ref_eval(pred, meta, params).ok()? {
+                    n += 1;
+                }
+            }
+            Some(Expectation::KnnMatchCount(n))
         }
         CheckKind::ScanAndLimit { pred, .. } => {
             let mut set = std::collections::HashSet::new();
