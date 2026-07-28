@@ -378,6 +378,8 @@ flowchart TD
     Cost -.-> Pick{"argmin"}
     Pick -.-> B["Plan B<br/>MetadataScan, then<br/>ExactDistance on the small set<br/>(bypasses ANN entirely)"]
     Pick -.-> C["Plan C<br/>FilteredKnnSearch<br/>predicate INSIDE the HNSW walk"]
+    Cost -.-> Gate{"can the plan<br/>return min(k, matches)?"}
+    Gate -. no .-> Excl["excluded before<br/>cost is compared"]
     Pick -.-> A["Plan A<br/>KnnSearch with k * 4 overfetch<br/>plus a cheap post_filter"]
 ```
 
@@ -387,9 +389,15 @@ computes a predicted latency per plan and dispatches the cheapest.
 **Plan A : overfetched kNN + post-filter.** Run an unfiltered kNN
 with `k = user_limit * 4`, then walk the candidates and drop the ones
 that fail the WHERE clause. The executor returns whatever survives,
-possibly fewer than `k` items if the filter is very tight. That's a
-recall trade-off, not a latency one : cost A is independent of
-selectivity and bounded by the fixed overfetch.
+**without retrying**. Cost A is independent of selectivity and bounded
+by the fixed overfetch.
+
+That "without retrying" is load-bearing, and for a long time this
+document called it "a recall trade-off, not a latency one." Measured,
+it is neither — it is a **wrong answer**. Plan A's expected yield is
+`k * 4 * selectivity`, so at selectivity 0.05 with `LIMIT 10` it
+returns **zero rows** while plans B and C return all ten matching ones.
+See [Plan A cannot always answer](#plan-a-cannot-always-answer).
 
 **Plan B : metadata scan + exact distance.** Walk the metadata store
 for ids matching the predicate, then compute exact distance for each.
@@ -397,10 +405,27 @@ Bypasses the ANN entirely. Cost is `n * c_filter_eval` (scan everything)
 plus `matches * (c_metadata_get + dim * c_distance_per_dim)` (exact
 distance per match).
 
+Plan B is the only plan that is **exact** : it scores every match, so
+it always returns `min(k, matching_rows)`. Measured across 84 cells :
+zero shortfalls.
+
 **Plan C : filtered ANN.** Run an HNSW search where the predicate is
 consulted **during** the graph walk. Out-of-filter nodes still route
 traversal but never enter the results heap. Visit count scales by
-`1 + 4 * (1 - selectivity)` to account for the filter rejection rate.
+`1 / selectivity` (clamped at `n`) : to fill a results heap that admits
+one node in every `1/s`, the walk must visit roughly `ef / s` nodes.
+
+**Plan C wins at high selectivity**, which is the opposite of what this
+document used to claim ("the middle band"). The reason is plan A's
+fixed 4x overfetch : sized for a filter that rejects, it does ~4x the
+graph work and clones 4x the metadata bags when the filter passes most
+rows. Measured, C is the fastest correct plan in **35 of 84 cells**, by
+up to **3.22x**, concentrated at `s >= 0.5`.
+
+At *low* selectivity plan C is the worst option by a wide margin : its
+heap can never fill, so the walk drains the whole candidate set and
+degenerates into a full scan with per-node filter overhead (measured :
+11 ms at `n=10k, dim=1536, s=0.001`, against plan B's 0.35 ms).
 
 The estimator that feeds the cost model is a trait :
 
@@ -425,22 +450,31 @@ layer recognises.
 The cost model lives in
 [`cost.rs`](../crates/kova-query/src/cost.rs) and reads two
 inputs : a `Workload` (selectivity, k, total_rows, dim) the planner
-assembles per query, and `CostCoefficients` (four per-machine
+assembles per query, and `CostCoefficients` (five per-machine
 nanosecond rates) shipped as defaults.
 
 **The coefficients :**
 
 | Coefficient | Meaning | Default |
 |---|---|---|
-| `c_hnsw_per_visit` | Cost of visiting one HNSW node (heap ops + neighbour walk, exclusive of distance) | 500 ns |
-| `c_distance_per_dim` | Per-scalar distance cost. A `dim`-vector distance costs `dim * c_distance_per_dim`. | 5 ns |
-| `c_metadata_get` | Fetching one metadata bag from the store | 200 ns |
-| `c_filter_eval` | Evaluating one predicate atom on a fetched bag | 200 ns |
+| `c_hnsw_per_visit` | Visiting one HNSW node (heap ops + neighbour walk, exclusive of distance) | 100 ns |
+| `c_distance_per_dim` | Per-scalar distance cost. A `dim`-vector distance costs `dim * c_distance_per_dim`. | 0.15 ns |
+| `c_metadata_get` | Fetching one metadata bag **by value** : lookup + deep clone. Plans A and B, which materialise owned bags into their results. | 310 ns |
+| `c_metadata_peek` | **Borrowing** one bag : the same lookup, no clone. Plan C's per-visit filter. | 30 ns |
+| `c_filter_eval` | Evaluating one predicate atom on a bag | 70 ns |
+
+The last two used to be one coefficient, priced at the clone rate.
+Measured, a clone costs **250 ns and a borrow 10 ns — 24x** — and plan
+C pays its version on the hottest path in the engine. Charging it the
+clone rate made plan C look ~2.4x more expensive than it is, which was
+enough that it was never dispatched at all.
 
 **The closed-form costs :**
 
 ```text
-hnsw_visits(k, n) = ef * log2(n),  ef = max(2*k, 50).min(n)
+hnsw_visits(k, n) = ef * log2(n),  ef = max(k, 50).min(n)
+                                        ^^^^^^^^^^^
+                    must match HnswIndex : `params.ef_search.max(k)`
 
 cost_A = visits_A * (c_hnsw_per_visit + dim * c_distance_per_dim)
        + k_overfetch * (c_metadata_get + c_filter_eval)
@@ -451,12 +485,45 @@ cost_B = n * c_filter_eval                                    # scan
    where matches = max(1, selectivity * n)
 
 cost_C = visits_C * (c_hnsw_per_visit + dim * c_distance_per_dim
-                   + c_metadata_get + c_filter_eval)
-   where visits_C = hnsw_visits(k, n) * (1 + 4 * (1 - selectivity))
+                   + c_metadata_peek + c_filter_eval)
+   where visits_C = min(hnsw_visits(k, n) / selectivity, n)
 ```
 
 `dispatch_via_cost` returns the plan with the smallest cost. Ties
 break A > B > C.
+
+### Plan A cannot always answer
+
+**Correctness is checked before cost.** Plan A's expected yield is
+`k * KNN_OVERFETCH * selectivity`, and the complete answer to
+`... WHERE pred ORDER BY dist LIMIT k` is `min(k, matching_rows)`.
+Substituting and simplifying : with enough matching rows, **plan A can
+fill its LIMIT only when `selectivity >= 1 / KNN_OVERFETCH` = 0.25.**
+Below that it is arithmetically impossible, for any `k`.
+
+Measured at `n = 10_000` — rows returned against the complete answer :
+
+| s | matching rows | plan A | plan B | plan C |
+|---|---|---|---|---|
+| 0.001 | 10 | **0** | 10 | 10 |
+| 0.01 | 100 | **0** | 50 | 50 |
+| 0.05 | 500 | **0** | 10 | 10 |
+| 0.2 | 2000 | 9 | 10 | 10 |
+
+(`LIMIT 10` shown ; the shortfall scales with `k`.) Across all 84
+cells plan A came up short in **48**, plan B in **0**, plan C in **3**
+(by one row each, at `dim=1536` — ordinary ANN approximation).
+
+`cost::plan_a_can_satisfy` excludes plan A whenever it cannot reach the
+complete answer, regardless of how cheap it is. A plan that returns
+nothing for a query with ten valid answers is not a fast plan.
+
+This was a real bug, not a hypothetical : the cost model dispatched
+plan A in those cells because `cost_plan_a` is deliberately independent
+of selectivity, so no cost comparison could see a result count.
+Regression test :
+[`tests/plan_a_starvation.rs`](../crates/kova-query/tests/plan_a_starvation.rs),
+verified to fail with the gate removed.
 
 **What the model captures :**
 
@@ -504,68 +571,93 @@ The harness ships behind the `internal-bench` feature so the
 plan-builder reexports (`internal_bench::build_plan_a/b/c`) and the
 `Engine::execute_plan` bypass don't widen the regular public API.
 
-**Current results :** 30 cells (dim in {16, 128, 1536}, n in {1k,
-10k}, s in {0.001, 0.01, 0.05, 0.2, 0.5}), k=10, 25 samples per cell.
+**Ground truth is the fastest *correct* plan**, not the fastest plan.
+Ranking on latency alone reproduces the very bug the model had : at
+`s=0.001` plan A runs in 51 us returning zero rows while plan B takes
+369 us returning all ten matches, so a plain `argmin` calls plan A the
+winner — and then scores a dispatcher that correctly refuses it as
+*wrong*, charging `369/51 = 7.2x` regret for the right call. Measured,
+that mis-scoring changes the winner in **28% of cells** at a mean 2.4x.
+A plan qualifies only if it returned `min(k, matching_rows)` rows.
+
+**Current results :** 84 cells (dim in {16, 128, 1536}, n = 10k,
+s in {0.001, 0.01, 0.05, 0.2, 0.5, 0.7, 0.9}, k in {10, 50, 100, 500}),
+25 samples per cell.
+
+| Metric | Result |
+|---|---|
+| Dispatch accuracy | **75 / 84** |
+| Mean regret | **1.055** |
+| Cells where the dispatched plan under-delivered | **0 / 84** |
+| Plan C fastest-correct | 35 / 84, up to **3.22x**, dispatched in 28 |
+
+Plan C's band by selectivity — nothing below 0.2, near-total above 0.7 :
 
 ```text
-Confusion matrix (rows=predicted, cols=actual)
-                A      B      C
-predicted A    14      5      1
-predicted B     1      9      0
-predicted C     0      0      0
-
-Mean regret = 1.055
+  s        C fastest    C dispatched
+  0.001      0/12          0/12
+  0.01       0/12          0/12
+  0.05       0/12          0/12
+  0.2        5/12          6/12
+  0.5        7/12          6/12
+  0.7       11/12          9/12
+  0.9       12/12          9/12
 ```
 
-Five of the seven disagreement cells are within 1.02-1.25x of the
-optimal plan (i.e. the dispatched plan is fine in practice). The
-two larger misses are both at dim=1536 n=10000 at very low
-selectivity, where the model picks plan A but plan B was 1.47-1.70x
-faster ; root cause is that `c_distance_per_dim` was calibrated
-at dim=128 and the per-scalar cost climbs at dim=1536 (cache
-effects on 6 KB vectors). A multi-dim calibration curve would
-fix it ; coefficient calibration at a single dim is good enough
-for first-cut dispatch.
+**Six model bugs the harness surfaced**, all the same shape — the
+formulas scored an *idealised* plan rather than the one the executor
+runs :
 
-**The journey to 1.055 :**
-
-| Stage | Mean regret | What changed |
+| # | The model believed | The executor actually |
 |---|---|---|
-| Uncalibrated, model bugs present | 2.526 | Default coefficients, starvation term, missing scan term |
-| Model bugs fixed | 1.116 | Plan A starvation dropped, plan B scan term added |
-| Plus coefficient calibration | **1.055** | Defaults replaced with values measured by `calibrate_cost_coefficients` |
+| 1 | plan A retries until it has `k` results | returns short, never retries |
+| 2 | plan B's ids come from an O(1) catalog lookup | scans all `n` rows first |
+| 3 | `ef = max(2k, 50)` | `ef = params.ef_search.max(k)` |
+| 4 | plan C's overhead is linear in `(1-s)`, capped at 5x | hyperbolic in `s` — it degenerates to a full scan |
+| 5 | the calibrator's copy of `hnsw_visits` mirrored the model | the copy went stale, skewing a *derived* coefficient by 1.6x |
+| 6 | one coefficient covers all metadata access | plans A/B clone a bag (250 ns), plan C borrows one (10 ns) |
 
-**Two earlier model bugs the harness surfaced :**
+Two of these are worth expanding, because the reasoning generalises.
 
-1. **Plan A starvation term.** The first model added a
-   `k_eff = max(k * overfetch, k / selectivity)` term to plan A's
-   cost, reasoning that at low selectivity plan A would need to
-   "retry until k results." The executor doesn't retry : it walks
-   the HNSW for `k * 4` candidates and returns whatever survives,
-   possibly fewer than `k`. That's a recall trade-off the planner
-   can surface separately ; treating it as a latency cost made the
-   model dispatch plan B in 11 cells where plan A was 8-14x faster.
-   Fix : drop the term, make cost A flat in selectivity.
+**Bug 1 — the starvation term.** The first model added
+`k_eff = max(k * overfetch, k / selectivity)` to plan A, reasoning that
+at low selectivity it must "retry until k results." The executor
+doesn't retry, so the term made the model dispatch plan B in 11 cells
+where plan A was 8-14x faster. It was dropped, and the note in this
+document said the shortfall was "a recall trade-off the planner can
+surface separately."
 
-2. **Plan B missing the scan term.** The first model assumed plan
-   B's matching id set came from an O(1) catalog lookup, so cost was
-   `matches * per_match` only. The actual executor's `MetadataScan`
-   walks all `n` rows, paying `c_filter_eval` per row before
-   reaching the matches. Fix : add `n * c_filter_eval` upfront ;
-   plan B's cost now grows linearly in `n` regardless of the match
-   set size, which is what the data shows.
+Nothing then surfaced it. **That framing is what let the correctness
+bug sit unnoticed** — the model stopped charging for starvation, and
+every downstream measurement inherited the assumption that a short
+result was acceptable. The fix was correct ; the follow-up never
+happened. See [Plan A cannot always answer](#plan-a-cannot-always-answer).
 
-Both bugs had the same shape : the model was scoring an
-*idealised* plan, not the plan the executor actually runs. The
-harness made the gap visible by forcing each plan and comparing
-predicted to measured ; the fixes followed mechanically from the
-disagreement cells.
+**Bugs 3 and 5 were the same mistake in two places.** The calibration
+runner carried its own copy of `hnsw_visits` under a
+`// mirrored from cost::hnsw_visits` comment. When the real one was
+corrected, the copy silently kept the old formula — and because the
+calibrator *derives* `c_hnsw_per_visit` by dividing a measured latency
+by a modelled visit count, the stale copy produced a coefficient wrong
+by exactly the ratio between the two formulas. Measured: 73.7 vs 116.4
+ns, a 1.58x error against a predicted 1.6x.
+
+`hnsw_visits` now has one definition, shared with the harnesses via
+`cost::internal_bench` rather than transcribed into them. **A copy is
+not a mirror.**
+
+A seventh bug lived in the harness's own fixture : selectivity was
+built as `bucket = i % round(1/s)`, which collapses to a single bucket
+for any `s > 0.5` — so the first attempt at extending the grid measured
+`s = 1.0` twice under two different labels. The construction is now
+per-mille and, more to the point, **asserted** against the actual match
+count. The missing assertion was the root cause : the harness trusted
+its own setup.
 
 ### Per-machine coefficient calibration
 
-The four `CostCoefficients` ship with defaults measured on a
-typical x86 dev machine, but the actual values matter : SIMD
-distance compute alone can vary 5-10x across CPU generations. A
+The five `CostCoefficients` ship with defaults measured on a
+typical x86 dev machine. A
 companion runner at
 [`examples/calibrate_cost_coefficients.rs`](../crates/kova-query/examples/calibrate_cost_coefficients.rs)
 microbenches each coefficient on the target machine :
@@ -574,8 +666,11 @@ microbenches each coefficient on the target machine :
   `black_box`-ed inputs (1M samples at dim=128). The shipped
   default is 0.15 ns/dim ; older or non-SIMD machines might see
   several times higher.
-- `c_metadata_get` : direct loop of `FileMetadataStore::get` on a
-  50k-row file-backed store. Default 310 ns/get.
+- `c_metadata_get` and `c_metadata_peek` : `MetadataStore::get`
+  (lookup + deep clone) and `with_metadata` (lookup only), measured
+  against **one** shared 50k-row fixture so the ratio between them is
+  meaningful. Defaults 310 ns and 30 ns ; measured on Apple silicon,
+  250 ns and 10 ns.
 - `c_filter_eval` : derived from plan B's median latency at very
   low selectivity (where the `n * c_filter_eval` scan term
   dominates). Default 70 ns/row.
@@ -589,8 +684,29 @@ cargo run --release --example calibrate_cost_coefficients --features internal-be
 ```
 
 The runner prints a struct literal you can paste into
-`CostCoefficients::default()`. Re-run `validate_cost_model`
-afterwards to confirm the regret drop on the target machine.
+`CostCoefficients::default()`.
+
+**Calibration turns out to be second-order.** On the 84-cell grid the
+shipped x86 defaults and coefficients measured on the local machine
+both score 75/84 at regret ~1.05. The formula fixes did the work ; the
+coefficients matter far less than the shapes they multiply. Worth
+knowing before over-investing in per-machine tuning.
+
+Two practical notes. The microbenches carry ~15% run-to-run variance
+(`c_distance_per_dim` measured 0.087 / 0.100 / 0.100 / 0.104 across
+four runs), so don't over-fit to a single run — dispatch is flat with
+respect to `c_metadata_peek` anywhere from 100 ns down to 10 ns.
+And most of the runner's wall-clock is spent *building* its 50k-row
+fixture, because `FileMetadataStore::put` rewrites the whole file per
+call ; that is a storage-layer limitation showing up in the tooling,
+not a property of the measurement.
+
+Rather than re-running the hour-long sweep after every model change,
+[`examples/cost_probe.rs`](../crates/kova-query/examples/cost_probe.rs)
+replays the recorded measurements through the current cost functions in
+seconds. Measurements are fixed observations — the harness forces each
+plan, so they do not depend on what the dispatcher would have chosen.
+Only re-measure when the **executor** changes.
 
 ### Radius operator
 
@@ -1456,6 +1572,23 @@ change, the read-path operator set doesn't change, the result
 shape doesn't change. Existing queries keep working, just with
 better plan choices and tighter estimates.
 
+### Plan A escalation at runtime
+
+`plan_a_can_satisfy` gates plan A on a *global* selectivity estimate.
+Starvation is *local* : a filter that correlates with position in
+embedding space (`category='legal'` clusters in any real embedding
+model) can starve plan A at a particular query point even when global
+selectivity is high. Prediction cannot see that.
+
+The fix is a runtime check — if plan A returns fewer than `k` rows,
+**re-run the dispatcher with plan A excluded** rather than hardcoding a
+fallback. At low selectivity plan B is 8x cheaper than plan C for the
+same complete answer, so a hardcoded "fall back to C" would turn a
+51 us wrong answer into a 3,235 us right one when 369 us was available.
+
+Alongside it, `ExecutionResult::Rows` should carry a `truncated: bool` :
+even a perfect planner cannot guarantee that `k` rows exist.
+
 ### Statistics on unindexed columns
 
 `ShardEstimator` today returns exact cardinality for indexed atoms
@@ -1469,15 +1602,19 @@ stay exact for indexed atoms.
 
 ### Multi-dim distance-cost curve
 
-The shipped `c_distance_per_dim` is a single number (0.15 ns/dim),
-calibrated at dim=128. Reality at dim=1536 is ~2-3x higher because
-the working set no longer fits in L1, and the vector load itself
-costs more. The model under-prices plan A at very high dim as a
-result : two of the seven validation disagreement cells live in
-that regime (1.47-1.70x regret each). A follow-up calibration
+The shipped `c_distance_per_dim` is a single number, calibrated at
+dim=128. Reality at dim=1536 is higher because the working set no
+longer fits in L1 and the vector load itself costs more. A follow-up
 pass that measures distance cost at several dims and fits a
-linear-or-log curve would close that gap. The closed-form cost
-plumbing already passes `dim` ; the curve is the missing piece.
+linear-or-log curve would close that gap ; the closed-form plumbing
+already passes `dim`, so the curve is the only missing piece.
+
+Lower priority than it used to look, though : the 84-cell validation
+found calibration to be second-order overall (shipped defaults and
+locally-measured coefficients both score 75/84), so a *more accurate*
+coefficient is unlikely to move dispatch much. The remaining
+disagreement cells are worth diagnosing individually before assuming
+they share a cause.
 
 ### External benchmarks
 
