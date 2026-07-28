@@ -16,12 +16,12 @@ with gRPC between nodes. Every byte, every index, every network call is ours.
 | `kova-core`    | shipped     | `Vector`, `Distance` trait + `Cosine` / `L2` / `InnerProduct` (SIMD)   |
 | `kova-index`   | shipped     | `Index` trait, `FlatIndex` baseline, `HnswIndex` (insert + search + two-pass vacuum + streaming snapshot) |
 | `kova-storage` | shipped     | Segmented WAL, `MmapVectorStore` (free-list slot reuse, crash-mid-init recovery), `FileMetadataStore`, `atomic_write` (+ streaming variant), `Manifest` commit point, `Shard` (log-then-mutate, batched inserts, logical delete, vacuum, checkpoint + WAL truncate, generation-numbered snapshots). SIGKILL-tested across 55,697 acks and 962 checkpoints. |
-| `kova-query`   | shipped     | KQL end to end : parser (Pest grammar, full DML + DDL), binder (typed `LogicalStatement` with hard semantic rejections), planner (three SELECT strategies dispatched by predicate selectivity, plus radius, COUNT and scan-and-limit bypasses), executor wired to `Shard` for both read and write paths, full DML (INSERT / UPDATE / DELETE including subscripted, radius, and param-bound shapes), `CREATE INDEX` / `DROP INDEX` end to end via the `IndexCatalog`, `Value::Map` for nested metadata, probabilistic query fuzzer with reference-impl correctness check, recall regression sweep across kNN / filtered / radius. See [`docs/query.md`](docs/query.md). |
+| `kova-query`   | shipped     | KQL end to end : parser (Pest grammar, full DML + DDL), binder (typed `LogicalStatement` with hard semantic rejections), planner (three SELECT strategies dispatched by a measured cost model with a correctness gate, plus radius, COUNT and scan-and-limit bypasses), executor wired to `Shard` for both read and write paths, full DML (INSERT / UPDATE / DELETE including subscripted, radius, and param-bound shapes), `CREATE INDEX` / `DROP INDEX` end to end via the `IndexCatalog`, `Value::Map` for nested metadata, probabilistic query fuzzer with reference-impl correctness check, recall regression sweep across kNN / filtered / radius. See [`docs/query.md`](docs/query.md). |
 | `kova-meta-index` | shipped | Secondary indexes on metadata fields : `HashIndex` (equality), `BTreeIndex` (range, with float-ordering gate), `InvertedIndex` (array containment). `RoaringTreemap`-backed bitmaps compose for AND / OR / NOT in microseconds. `IndexCatalog` orchestrates per-field bundles, routes lookups by priority, exposes exact cardinality for the planner. Catalog persists alongside the graph snapshot, generation-numbered like `graph.{N}.snapshot`. WAL records carry `old_metadata` so replay rebuilds the catalog without depending on the (eagerly-mutated) metadata store. See [`docs/meta-index.md`](docs/meta-index.md). |
 | `kova-cluster` | not started | Consistent hashing, quorum replication, coordinator                    |
 | `kova-server`  | not started | gRPC node binary                                                       |
 
-645 lib + integration tests passing across the workspace (covering meta-index unit tests, catalog round-trip + persistence + post-checkpoint replay, plus the existing HNSW / WAL / shard / query suites). The full fuzz long-run pushes 12k+ correctness-checked queries and 32k+ no-panic queries per CI cycle. `cargo clippy --workspace --all-targets -- -D warnings` clean.
+802 lib + integration tests passing across the workspace (covering meta-index unit tests, catalog round-trip + persistence + post-checkpoint replay, plus the existing HNSW / WAL / shard / query suites). The full fuzz long-run pushes 12k+ correctness-checked queries and 32k+ no-panic queries per CI cycle. `cargo clippy --workspace --all-targets -- -D warnings` clean.
 
 ## Build
 
@@ -858,24 +858,49 @@ result limit. The planner picks between three plans automatically :
 
 | Plan | What it does | Wins when |
 |------|--------------|-----------|
-| A    | Overfetched kNN (`k * 4` candidates) then post-filter. Returns whatever survives ; may be fewer than `k` if the filter is very tight (a recall trade-off, not a latency one). | The HNSW walk amortises and the post-filter rarely starves. Dominant at dim 16-128, large `n`. |
-| B    | `MetadataScan` over all rows for matching ids, exact distance per match, top-k. **Bypasses ANN entirely.** | The scan is short or the match set is tiny relative to the HNSW walk's per-visit dim cost. Dominant at high dim with small shards or very low selectivity. |
-| C    | Filtered HNSW : the predicate is consulted **during** the graph walk. Out-of-filter nodes still route traversal but never enter the result heap. | The middle band where neither overfetch nor pre-scan wins outright. |
+| A    | Overfetched kNN (`k * 4` candidates) then post-filter. Returns whatever survives, **without retrying**. | The filter is loose. Cheapest walk when most candidates pass. |
+| B    | `MetadataScan` over all rows for matching ids, exact distance per match, top-k. **Bypasses ANN entirely.** | Low selectivity, or a shard small enough that the scan is short. Also the only plan that is *exact*. |
+| C    | Filtered HNSW : the predicate is consulted **during** the graph walk. Out-of-filter nodes still route traversal but never enter the result heap. | **High selectivity.** Plan A's fixed 4x overfetch is sized for a filter that rejects ; when the filter passes most rows, A does ~4x the graph work and 4x the metadata clones that C does. |
 
 Dispatch is cost-based, not band-based. `cost_plan_a/b/c` in
 [`cost.rs`](crates/kova-query/src/cost.rs) compute closed-form
-latency estimates against four per-machine coefficients
+latency estimates against five per-machine coefficients
 (`c_hnsw_per_visit`, `c_distance_per_dim`, `c_metadata_get`,
-`c_filter_eval`) and the planner picks the minimum. The model
-was validated against measured runs of each plan across a
-30-cell (dim, n, selectivity) grid : **mean regret 1.055** (the
-dispatched plan is on average 1.06x slower than the actually-best
-plan ; perfect would be 1.0). The validation harness ships behind
-the `internal-bench` feature at
-[`examples/validate_cost_model.rs`](crates/kova-query/examples/validate_cost_model.rs),
+`c_metadata_peek`, `c_filter_eval`) and the planner picks the minimum.
+
+**Plan choice is gated on correctness before cost.** Plan A's expected
+yield is `k * 4 * selectivity`, so below `selectivity = 0.25` it
+*mathematically cannot* fill the LIMIT — measured, it returns **zero
+rows** for `LIMIT 10` at selectivity ≤ 0.05, where B and C return every
+matching row. `cost::plan_a_can_satisfy` excludes it in that regime
+regardless of price ; a plan that cannot answer the query is not a fast
+plan.
+
+Validated against measured runs of each plan on an 84-cell
+`(dim, n, selectivity, k)` grid, scoring against **the fastest plan that
+actually returned `min(k, matching_rows)` rows** :
+
+| Metric | Result |
+|---|---|
+| Dispatch accuracy | 75/84 cells |
+| Mean regret | **1.055** (dispatched plan averages 1.06x slower than optimal ; 1.0 is perfect) |
+| Cells where the dispatched plan under-delivered | **0/84** |
+| Plan C fastest-correct | 35/84 cells, up to **3.22x**, found by the planner in 28 |
+
+The validation harness ships behind the `internal-bench` feature at
+[`examples/validate_cost_model.rs`](crates/kova-query/examples/validate_cost_model.rs)
+(axes overridable via `KOVA_DIMS` / `KOVA_NS` / `KOVA_SELS` / `KOVA_KS`),
 alongside a calibration runner
 ([`examples/calibrate_cost_coefficients.rs`](crates/kova-query/examples/calibrate_cost_coefficients.rs))
-that microbenches each coefficient on the target machine.
+that microbenches each coefficient on the target machine, and a replay
+harness ([`examples/cost_probe.rs`](crates/kova-query/examples/cost_probe.rs))
+that re-scores recorded measurements against the current model in
+seconds instead of re-running the hour-long sweep.
+
+Every cost-model bug found so far has had one shape : **the formulas
+scored an idealised plan rather than the one the executor runs.** The
+harness exists because a model can be internally consistent and still
+describe a different program than the one you shipped.
 
 ### Coverage at a glance
 
@@ -900,6 +925,14 @@ unit-test suite :
 | `correctness_fuzz_*` | 1,000 per run | Engine result matches a reference impl for COUNT, scan-and-limit, DELETE, UPDATE |
 | `fuzz_long_run` (ignored) | 32k+ | Long-run no-panic over 16 seeds |
 | `correctness_fuzz_long_run` (ignored) | 12k+ | Long-run correctness over 8 seeds |
+| `plan_a_starvation` | 4 cases | A satisfiable `LIMIT k` never comes back short, through the full `execute_str` pipeline |
+
+`plan_a_starvation` is worth a note on method : the first attempt at
+that regression test was a fuzzer assertion that passed — and **kept
+passing when the bug was deliberately reintroduced**, because the
+fuzzer's generated `k` was too small to trigger starvation. A test that
+has never been observed to fail proves nothing. The replacement was
+verified failing before it was accepted as passing.
 
 The harness is deterministic given a seed. Any failing iteration
 prints the seed + query verbatim ; rerunning with the same seed
@@ -928,18 +961,42 @@ scan only for predicates neither layer recognises.
 
 **Cost-based dispatch, validated against measured runs.** The
 planner picks plan A / B / C by computing closed-form latency
-estimates per plan against four per-machine coefficients, then
-dispatching the cheapest. Two earlier model mistakes surfaced
-during validation and were fixed (plan A had an invented "retry
-on starvation" term the executor never pays, plan B was missing
-its full-shard scan term). A separate calibration runner then
-microbenches each coefficient on the target machine and prints
-a tuned `CostCoefficients` struct ; the shipped defaults come
-from that runner. Mean regret across the 30-cell grid : **2.526
-(uncalibrated, model bugs) → 1.116 (model bugs fixed) → 1.055
-(plus coefficient calibration)**. The discipline is structural :
-the harness and the calibration runner both live in the repo,
-anyone can re-run them on their own machine.
+estimates per plan against five per-machine coefficients, then
+dispatching the cheapest — after excluding any plan that cannot
+return a complete answer.
+
+Six model bugs have surfaced during validation, every one the same
+shape : **the formulas scored an idealised plan rather than the one
+the executor runs.**
+
+| # | The model believed | The executor actually |
+|---|---|---|
+| 1 | plan A retries on starvation | returns short, never retries |
+| 2 | plan B's ids come from an O(1) lookup | scans every row first |
+| 3 | `ef = max(2k, 50)` | `ef = ef_search.max(k)` |
+| 4 | plan C's filter overhead is linear in `(1-s)` | hyperbolic in `s` — it degenerates to a full scan |
+| 5 | (calibrator) its own copy of `hnsw_visits` mirrored the model | the copy went stale, skewing a derived coefficient 1.6x |
+| 6 | one coefficient covers all metadata access | plans A/B *clone* a bag (250 ns), plan C *borrows* one (10 ns) |
+
+Bugs 3 and 5 were the same mistake in two places, so `hnsw_visits` now
+has exactly one definition, shared with the harnesses rather than
+transcribed into them.
+
+A seventh lived in the harness itself : it ranked plans by latency
+alone, so a plan returning **zero rows** counted as the winner and a
+dispatcher that correctly refused it was charged up to 6.5x regret for
+doing the right thing. Ground truth is now the fastest plan that
+actually returned `min(k, matching_rows)`.
+
+A separate calibration runner microbenches each coefficient on the
+target machine and prints a tuned `CostCoefficients` struct. Notably,
+**calibration turned out to be second-order** : on the 84-cell grid the
+shipped x86 defaults and locally-measured coefficients score the same
+(75/84, regret ≈1.05). The formula fixes did the work.
+
+The discipline is structural : the validation harness, the calibration
+runner, and a replay harness that re-scores recorded measurements in
+seconds all live in the repo, and anyone can re-run them.
 
 **Single-id hint instead of duplicate paths.** `DELETE WHERE id = 42`
 and `DELETE WHERE id = $1` both flow through the same `LogicalDelete

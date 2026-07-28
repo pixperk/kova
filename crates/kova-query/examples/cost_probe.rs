@@ -1,209 +1,227 @@
-//! Replay the last recorded `validate_cost_model` run through the
-//! current cost model, without re-measuring anything.
+// Replay harness : cast-heavy by nature, and the embedded cell table
+// is formatted for reading as a grid rather than by rustfmt.
+#![allow(
+    clippy::cast_precision_loss,
+    clippy::doc_markdown,
+    // `main` is a sequence of report sections ; splitting it would
+    // scatter the output format across the file.
+    clippy::too_many_lines,
+    clippy::needless_range_loop
+)]
+
+//! Replay a recorded `validate_cost_model` run through the *current*
+//! cost model, without re-measuring anything.
 //!
-//! The 120 measured timings below are fixed observations from one
-//! sweep. Only the *predictions* change when the model changes, so
-//! this answers "does the fixed model agree with reality?" in
-//! milliseconds instead of the ~40 minutes a full re-sweep costs.
+//! The measurements below are fixed observations : the harness forces
+//! each plan and times it, so they do not depend on what the dispatcher
+//! would have chosen. Only the *predictions* change when the model
+//! changes. That makes this the right loop for model work — seconds
+//! instead of the ~60-90 minutes a full re-sweep costs.
 //!
-//! It also sweeps `c_metadata_get` to show where the dispatch flips,
-//! which tells us whether re-calibrating after the `with_metadata`
-//! change is enough to unlock plan C.
+//! Re-measure only when the **executor** changes. Regenerate this file
+//! with `scratchpad/gen_probe.py <sweep-output>`.
 //!
 //! Run with:
 //!   cargo run --release --example cost_probe --features internal-bench
-
-#![allow(clippy::cast_precision_loss, clippy::doc_markdown)]
 
 use kova_query::cost::{
     CostCoefficients, PlanKind, Workload, cost_plan_a, cost_plan_b, cost_plan_c, dispatch_via_cost,
 };
 
-/// One measured cell : (dim, n, s, k, A us, B us, C us).
-struct M(usize, usize, f64, usize, f64, f64, f64);
+/// One measured cell : dim, n, selectivity, k, then per-plan
+/// `(latency_us, rows_returned)` for A / B / C.
+struct M(usize, usize, f64, usize, f64, f64, f64, usize, usize, usize);
 
+/// 84 cells, `n=10_000`, corrected per-mille selectivity
+/// construction, row counts recorded.
 #[rustfmt::skip]
 const CELLS: &[M] = &[
-      M(16, 1000, 0.001, 10, 163.0, 64.0, 481.0),
-      M(16, 1000, 0.001, 50, 139.0, 32.0, 386.0),
-      M(16, 1000, 0.001, 100, 183.0, 33.0, 335.0),
-      M(16, 1000, 0.001, 500, 322.0, 29.0, 273.0),
-      M(16, 1000, 0.010, 10, 164.0, 68.0, 422.0),
-      M(16, 1000, 0.010, 50, 154.0, 43.0, 396.0),
-      M(16, 1000, 0.010, 100, 182.0, 35.0, 331.0),
-      M(16, 1000, 0.010, 500, 323.0, 31.0, 283.0),
-      M(16, 1000, 0.050, 10, 114.0, 81.0, 496.0),
-      M(16, 1000, 0.050, 50, 142.0, 56.0, 403.0),
-      M(16, 1000, 0.050, 100, 180.0, 42.0, 345.0),
-      M(16, 1000, 0.050, 500, 323.0, 40.0, 285.0),
-      M(16, 1000, 0.200, 10, 166.0, 119.0, 217.0),
-      M(16, 1000, 0.200, 50, 139.0, 94.0, 214.0),
-      M(16, 1000, 0.200, 100, 223.0, 75.0, 250.0),
-      M(16, 1000, 0.200, 500, 357.0, 76.0, 319.0),
-      M(16, 1000, 0.500, 10, 167.0, 116.0, 123.0),
-      M(16, 1000, 0.500, 50, 122.0, 135.0, 118.0),
-      M(16, 1000, 0.500, 100, 210.0, 110.0, 145.0),
-      M(16, 1000, 0.500, 500, 390.0, 141.0, 383.0),
-      M(16, 10000, 0.001, 10, 76.0, 395.0, 4632.0),
-      M(16, 10000, 0.001, 50, 179.0, 352.0, 4106.0),
-      M(16, 10000, 0.001, 100, 310.0, 349.0, 3370.0),
-      M(16, 10000, 0.001, 500, 953.0, 346.0, 3208.0),
-      M(16, 10000, 0.010, 10, 138.0, 370.0, 2509.0),
-      M(16, 10000, 0.010, 50, 179.0, 368.0, 2466.0),
-      M(16, 10000, 0.010, 100, 365.0, 367.0, 3911.0),
-      M(16, 10000, 0.010, 500, 1028.0, 391.0, 3945.0),
-      M(16, 10000, 0.050, 10, 66.0, 599.0, 1032.0),
-      M(16, 10000, 0.050, 50, 218.0, 523.0, 870.0),
-      M(16, 10000, 0.050, 100, 360.0, 466.0, 1377.0),
-      M(16, 10000, 0.050, 500, 1055.0, 510.0, 3852.0),
-      M(16, 10000, 0.200, 10, 111.0, 954.0, 342.0),
-      M(16, 10000, 0.200, 50, 230.0, 726.0, 274.0),
-      M(16, 10000, 0.200, 100, 357.0, 617.0, 430.0),
-      M(16, 10000, 0.200, 500, 1002.0, 648.0, 1440.0),
-      M(16, 10000, 0.500, 10, 64.0, 1453.0, 124.0),
-      M(16, 10000, 0.500, 50, 229.0, 1149.0, 103.0),
-      M(16, 10000, 0.500, 100, 330.0, 980.0, 193.0),
-      M(16, 10000, 0.500, 500, 1006.0, 986.0, 706.0),
-      M(128, 1000, 0.001, 10, 112.0, 31.0, 525.0),
-      M(128, 1000, 0.001, 50, 211.0, 32.0, 451.0),
-      M(128, 1000, 0.001, 100, 244.0, 30.0, 384.0),
-      M(128, 1000, 0.001, 500, 374.0, 26.0, 341.0),
-      M(128, 1000, 0.010, 10, 187.0, 58.0, 583.0),
-      M(128, 1000, 0.010, 50, 260.0, 40.0, 479.0),
-      M(128, 1000, 0.010, 100, 256.0, 34.0, 413.0),
-      M(128, 1000, 0.010, 500, 385.0, 29.0, 358.0),
-      M(128, 1000, 0.050, 10, 92.0, 35.0, 374.0),
-      M(128, 1000, 0.050, 50, 168.0, 38.0, 411.0),
-      M(128, 1000, 0.050, 100, 221.0, 39.0, 379.0),
-      M(128, 1000, 0.050, 500, 381.0, 38.0, 368.0),
-      M(128, 1000, 0.200, 10, 187.0, 109.0, 334.0),
-      M(128, 1000, 0.200, 50, 247.0, 90.0, 260.0),
-      M(128, 1000, 0.200, 100, 284.0, 82.0, 320.0),
-      M(128, 1000, 0.200, 500, 416.0, 77.0, 383.0),
-      M(128, 1000, 0.500, 10, 220.0, 230.0, 245.0),
-      M(128, 1000, 0.500, 50, 265.0, 179.0, 205.0),
-      M(128, 1000, 0.500, 100, 285.0, 151.0, 245.0),
-      M(128, 1000, 0.500, 500, 460.0, 159.0, 434.0),
-      M(128, 10000, 0.001, 10, 242.0, 488.0, 4656.0),
-      M(128, 10000, 0.001, 50, 482.0, 345.0, 4754.0),
-      M(128, 10000, 0.001, 100, 745.0, 341.0, 4582.0),
-      M(128, 10000, 0.001, 500, 1727.0, 347.0, 4740.0),
-      M(128, 10000, 0.010, 10, 291.0, 567.0, 3079.0),
-      M(128, 10000, 0.010, 50, 483.0, 366.0, 2729.0),
-      M(128, 10000, 0.010, 100, 744.0, 361.0, 4537.0),
-      M(128, 10000, 0.010, 500, 1681.0, 360.0, 5773.0),
-      M(128, 10000, 0.050, 10, 266.0, 677.0, 1629.0),
-      M(128, 10000, 0.050, 50, 510.0, 443.0, 1327.0),
-      M(128, 10000, 0.050, 100, 746.0, 433.0, 1878.0),
-      M(128, 10000, 0.050, 500, 1676.0, 459.0, 4771.0),
-      M(128, 10000, 0.200, 10, 220.0, 876.0, 623.0),
-      M(128, 10000, 0.200, 50, 519.0, 713.0, 575.0),
-      M(128, 10000, 0.200, 100, 794.0, 718.0, 1014.0),
-      M(128, 10000, 0.200, 500, 1941.0, 783.0, 2639.0),
-      M(128, 10000, 0.500, 10, 289.0, 1711.0, 300.0),
-      M(128, 10000, 0.500, 50, 546.0, 1324.0, 269.0),
-      M(128, 10000, 0.500, 100, 743.0, 1285.0, 522.0),
-      M(128, 10000, 0.500, 500, 1716.0, 1332.0, 1476.0),
-      M(1536, 1000, 0.001, 10, 660.0, 33.0, 1112.0),
-      M(1536, 1000, 0.001, 50, 756.0, 25.0, 905.0),
-      M(1536, 1000, 0.001, 100, 733.0, 24.0, 879.0),
-      M(1536, 1000, 0.001, 500, 879.0, 23.0, 868.0),
-      M(1536, 1000, 0.010, 10, 715.0, 43.0, 1124.0),
-      M(1536, 1000, 0.010, 50, 754.0, 31.0, 940.0),
-      M(1536, 1000, 0.010, 100, 740.0, 30.0, 883.0),
-      M(1536, 1000, 0.010, 500, 877.0, 30.0, 873.0),
-      M(1536, 1000, 0.050, 10, 688.0, 81.0, 1124.0),
-      M(1536, 1000, 0.050, 50, 764.0, 61.0, 943.0),
-      M(1536, 1000, 0.050, 100, 753.0, 59.0, 902.0),
-      M(1536, 1000, 0.050, 500, 890.0, 59.0, 877.0),
-      M(1536, 1000, 0.200, 10, 677.0, 180.0, 948.0),
-      M(1536, 1000, 0.200, 50, 770.0, 168.0, 776.0),
-      M(1536, 1000, 0.200, 100, 762.0, 162.0, 858.0),
-      M(1536, 1000, 0.200, 500, 904.0, 168.0, 922.0),
-      M(1536, 1000, 0.500, 10, 669.0, 476.0, 762.0),
-      M(1536, 1000, 0.500, 50, 764.0, 395.0, 639.0),
-      M(1536, 1000, 0.500, 100, 759.0, 368.0, 725.0),
-      M(1536, 1000, 0.500, 500, 930.0, 400.0, 950.0),
-      M(1536, 10000, 0.001, 10, 1125.0, 371.0, 13258.0),
-      M(1536, 10000, 0.001, 50, 2988.0, 381.0, 13612.0),
-      M(1536, 10000, 0.001, 100, 4625.0, 361.0, 13522.0),
-      M(1536, 10000, 0.001, 500, 8613.0, 373.0, 13639.0),
-      M(1536, 10000, 0.010, 10, 1050.0, 425.0, 10817.0),
-      M(1536, 10000, 0.010, 50, 2834.0, 421.0, 10406.0),
-      M(1536, 10000, 0.010, 100, 4687.0, 438.0, 14005.0),
-      M(1536, 10000, 0.010, 500, 8481.0, 426.0, 11874.0),
-      M(1536, 10000, 0.050, 10, 1142.0, 770.0, 7110.0),
-      M(1536, 10000, 0.050, 50, 3062.0, 783.0, 6709.0),
-      M(1536, 10000, 0.050, 100, 4299.0, 720.0, 8311.0),
-      M(1536, 10000, 0.050, 500, 8026.0, 760.0, 12649.0),
-      M(1536, 10000, 0.200, 10, 1091.0, 2653.0, 3332.0),
-      M(1536, 10000, 0.200, 50, 3282.0, 2058.0, 2906.0),
-      M(1536, 10000, 0.200, 100, 4271.0, 1996.0, 4853.0),
-      M(1536, 10000, 0.200, 500, 8260.0, 2077.0, 8951.0),
-      M(1536, 10000, 0.500, 10, 1124.0, 4917.0, 1626.0),
-      M(1536, 10000, 0.500, 50, 2885.0, 4837.0, 1621.0),
-      M(1536, 10000, 0.500, 100, 4441.0, 4872.0, 2901.0),
-      M(1536, 10000, 0.500, 500, 8307.0, 4894.0, 6928.0),
+    M(16, 10000, 0.001, 10, 81.0, 528.0, 3271.0, 0, 10, 10),
+    M(16, 10000, 0.001, 50, 172.0, 337.0, 2970.0, 0, 10, 10),
+    M(16, 10000, 0.001, 100, 317.0, 335.0, 2942.0, 1, 10, 10),
+    M(16, 10000, 0.001, 500, 946.0, 338.0, 2948.0, 3, 10, 10),
+    M(16, 10000, 0.01, 10, 125.0, 647.0, 2191.0, 0, 10, 10),
+    M(16, 10000, 0.01, 50, 179.0, 372.0, 1819.0, 0, 50, 50),
+    M(16, 10000, 0.01, 100, 318.0, 362.0, 3004.0, 2, 100, 100),
+    M(16, 10000, 0.01, 500, 955.0, 362.0, 2969.0, 23, 100, 100),
+    M(16, 10000, 0.05, 10, 114.0, 704.0, 966.0, 0, 10, 10),
+    M(16, 10000, 0.05, 50, 216.0, 484.0, 782.0, 7, 50, 50),
+    M(16, 10000, 0.05, 100, 332.0, 412.0, 1138.0, 15, 100, 100),
+    M(16, 10000, 0.05, 500, 962.0, 437.0, 3039.0, 90, 500, 500),
+    M(16, 10000, 0.2, 10, 140.0, 938.0, 297.0, 9, 10, 10),
+    M(16, 10000, 0.2, 50, 239.0, 722.0, 242.0, 40, 50, 50),
+    M(16, 10000, 0.2, 100, 362.0, 614.0, 402.0, 84, 100, 100),
+    M(16, 10000, 0.2, 500, 973.0, 612.0, 1256.0, 385, 500, 500),
+    M(16, 10000, 0.5, 10, 112.0, 1460.0, 135.0, 10, 10, 10),
+    M(16, 10000, 0.5, 50, 224.0, 1155.0, 113.0, 50, 50, 50),
+    M(16, 10000, 0.5, 100, 355.0, 1031.0, 207.0, 100, 100, 100),
+    M(16, 10000, 0.5, 500, 1070.0, 976.0, 677.0, 500, 500, 500),
+    M(16, 10000, 0.7, 10, 116.0, 1738.0, 93.0, 10, 10, 10),
+    M(16, 10000, 0.7, 50, 208.0, 1326.0, 85.0, 50, 50, 50),
+    M(16, 10000, 0.7, 100, 334.0, 1265.0, 164.0, 100, 100, 100),
+    M(16, 10000, 0.7, 500, 1016.0, 1262.0, 543.0, 500, 500, 500),
+    M(16, 10000, 0.9, 10, 120.0, 2029.0, 68.0, 10, 10, 10),
+    M(16, 10000, 0.9, 50, 203.0, 1546.0, 64.0, 50, 50, 50),
+    M(16, 10000, 0.9, 100, 312.0, 1519.0, 120.0, 100, 100, 100),
+    M(16, 10000, 0.9, 500, 994.0, 1546.0, 464.0, 500, 500, 500),
+    M(128, 10000, 0.001, 10, 293.0, 544.0, 4421.0, 0, 10, 10),
+    M(128, 10000, 0.001, 50, 492.0, 344.0, 4069.0, 0, 10, 10),
+    M(128, 10000, 0.001, 100, 743.0, 343.0, 4063.0, 0, 10, 10),
+    M(128, 10000, 0.001, 500, 1652.0, 346.0, 4058.0, 4, 10, 10),
+    M(128, 10000, 0.01, 10, 263.0, 573.0, 3592.0, 1, 10, 10),
+    M(128, 10000, 0.01, 50, 687.0, 435.0, 3966.0, 2, 50, 50),
+    M(128, 10000, 0.01, 100, 771.0, 369.0, 4540.0, 3, 100, 100),
+    M(128, 10000, 0.01, 500, 1722.0, 368.0, 4275.0, 27, 100, 100),
+    M(128, 10000, 0.05, 10, 280.0, 616.0, 1609.0, 2, 10, 10),
+    M(128, 10000, 0.05, 50, 495.0, 445.0, 1337.0, 10, 50, 50),
+    M(128, 10000, 0.05, 100, 733.0, 435.0, 1780.0, 20, 100, 100),
+    M(128, 10000, 0.05, 500, 1627.0, 460.0, 4509.0, 97, 500, 500),
+    M(128, 10000, 0.2, 10, 265.0, 981.0, 662.0, 9, 10, 10),
+    M(128, 10000, 0.2, 50, 544.0, 706.0, 544.0, 42, 50, 50),
+    M(128, 10000, 0.2, 100, 730.0, 688.0, 902.0, 78, 100, 100),
+    M(128, 10000, 0.2, 500, 1663.0, 709.0, 1983.0, 391, 500, 500),
+    M(128, 10000, 0.5, 10, 265.0, 1747.0, 303.0, 10, 10, 10),
+    M(128, 10000, 0.5, 50, 517.0, 1356.0, 277.0, 50, 50, 50),
+    M(128, 10000, 0.5, 100, 893.0, 1317.0, 539.0, 100, 100, 100),
+    M(128, 10000, 0.5, 500, 1730.0, 1296.0, 1434.0, 500, 500, 500),
+    M(128, 10000, 0.7, 10, 333.0, 2105.0, 251.0, 10, 10, 10),
+    M(128, 10000, 0.7, 50, 505.0, 1750.0, 228.0, 50, 50, 50),
+    M(128, 10000, 0.7, 100, 747.0, 1658.0, 365.0, 100, 100, 100),
+    M(128, 10000, 0.7, 500, 1736.0, 1790.0, 1192.0, 500, 500, 500),
+    M(128, 10000, 0.9, 10, 245.0, 2510.0, 177.0, 10, 10, 10),
+    M(128, 10000, 0.9, 50, 561.0, 2637.0, 174.0, 50, 50, 50),
+    M(128, 10000, 0.9, 100, 806.0, 2589.0, 305.0, 100, 100, 100),
+    M(128, 10000, 0.9, 500, 1670.0, 2190.0, 967.0, 500, 500, 500),
+    M(1536, 10000, 0.001, 10, 1126.0, 356.0, 11305.0, 0, 10, 10),
+    M(1536, 10000, 0.001, 50, 2844.0, 346.0, 11321.0, 0, 10, 10),
+    M(1536, 10000, 0.001, 100, 4284.0, 342.0, 11346.0, 0, 10, 10),
+    M(1536, 10000, 0.001, 500, 7864.0, 345.0, 11363.0, 1, 10, 10),
+    M(1536, 10000, 0.01, 10, 1113.0, 422.0, 9537.0, 1, 10, 10),
+    M(1536, 10000, 0.01, 50, 2984.0, 421.0, 9403.0, 1, 50, 50),
+    M(1536, 10000, 0.01, 100, 4210.0, 430.0, 11189.0, 3, 100, 99),
+    M(1536, 10000, 0.01, 500, 7712.0, 428.0, 11092.0, 13, 100, 99),
+    M(1536, 10000, 0.05, 10, 1086.0, 726.0, 7217.0, 2, 10, 10),
+    M(1536, 10000, 0.05, 50, 2729.0, 742.0, 7079.0, 5, 50, 50),
+    M(1536, 10000, 0.05, 100, 4141.0, 746.0, 8166.0, 17, 100, 100),
+    M(1536, 10000, 0.05, 500, 7684.0, 765.0, 11120.0, 80, 500, 499),
+    M(1536, 10000, 0.2, 10, 1178.0, 2153.0, 4365.0, 6, 10, 10),
+    M(1536, 10000, 0.2, 50, 3015.0, 2225.0, 3877.0, 35, 50, 50),
+    M(1536, 10000, 0.2, 100, 4723.0, 2452.0, 6639.0, 73, 100, 100),
+    M(1536, 10000, 0.2, 500, 10733.0, 2850.0, 9775.0, 389, 500, 500),
+    M(1536, 10000, 0.5, 10, 1115.0, 4584.0, 2022.0, 10, 10, 10),
+    M(1536, 10000, 0.5, 50, 2724.0, 4596.0, 2036.0, 50, 50, 50),
+    M(1536, 10000, 0.5, 100, 4233.0, 4716.0, 3113.0, 100, 100, 100),
+    M(1536, 10000, 0.5, 500, 7841.0, 4621.0, 6658.0, 500, 500, 500),
+    M(1536, 10000, 0.7, 10, 1168.0, 6786.0, 1419.0, 10, 10, 10),
+    M(1536, 10000, 0.7, 50, 2744.0, 6836.0, 1407.0, 50, 50, 50),
+    M(1536, 10000, 0.7, 100, 4187.0, 6579.0, 2301.0, 100, 100, 100),
+    M(1536, 10000, 0.7, 500, 7944.0, 6834.0, 5826.0, 500, 500, 500),
+    M(1536, 10000, 0.9, 10, 1133.0, 8593.0, 956.0, 10, 10, 10),
+    M(1536, 10000, 0.9, 50, 2730.0, 8519.0, 969.0, 50, 50, 50),
+    M(1536, 10000, 0.9, 100, 4207.0, 8388.0, 1801.0, 100, 100, 100),
+    M(1536, 10000, 0.9, 500, 7755.0, 8616.0, 5144.0, 500, 500, 500),
 ];
 
-fn measured_winner(m: &M) -> PlanKind {
-    let xs = [m.4, m.5, m.6];
-    let mut best = 0;
-    for i in 1..3 {
-        if xs[i] < xs[best] {
-            best = i;
+impl M {
+    fn dim(&self) -> usize {
+        self.0
+    }
+    fn n(&self) -> usize {
+        self.1
+    }
+    fn s(&self) -> f64 {
+        self.2
+    }
+    fn k(&self) -> usize {
+        self.3
+    }
+    fn latency(&self) -> [f64; 3] {
+        [self.4, self.5, self.6]
+    }
+    fn rows(&self) -> [usize; 3] {
+        [self.7, self.8, self.9]
+    }
+
+    /// Rows a correct plan must return : you cannot return more than
+    /// match, and should not return fewer than the LIMIT when they exist.
+    #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+    fn complete_answer(&self) -> usize {
+        self.k().min((self.s() * self.n() as f64).round() as usize)
+    }
+
+    fn workload(&self) -> Workload {
+        Workload {
+            selectivity: self.s(),
+            user_k: self.k(),
+            total_rows: self.n(),
+            dim: self.dim(),
         }
     }
-    [PlanKind::A, PlanKind::B, PlanKind::C][best]
 }
 
-fn evaluate(coeffs: &CostCoefficients) -> (usize, f64, usize, usize) {
-    let mut correct = 0;
-    let mut total_regret = 0.0;
-    let mut c_dispatched = 0;
-    let mut c_correctly_dispatched = 0;
+/// The plan a perfect dispatcher should have chosen : **the fastest
+/// plan that actually answered the query.**
+///
+/// Ranking on latency alone reproduces the very bug this investigation
+/// found. At `s=0.001` plan A runs in 51 us returning **zero rows**
+/// while plan B takes 369 us returning all ten matches ; a plain argmin
+/// calls A the winner, so a dispatcher that correctly refuses A is
+/// scored as wrong and charged `369/51 = 7.2x` regret for it. Measured
+/// across this grid, that mis-scoring hits 28% of cells at a mean 2.4x.
+fn fastest_correct_plan(m: &M) -> PlanKind {
+    let kinds = [PlanKind::A, PlanKind::B, PlanKind::C];
+    let (lat, rows, complete) = (m.latency(), m.rows(), m.complete_answer());
+    let mut best: Option<usize> = None;
+    for i in 0..3 {
+        if rows[i] < complete {
+            continue;
+        }
+        if best.is_none_or(|b| lat[i] < lat[b]) {
+            best = Some(i);
+        }
+    }
+    best.map_or(PlanKind::A, |i| kinds[i])
+}
+
+struct Score {
+    correct: usize,
+    regret: f64,
+    c_dispatched: usize,
+    c_right: usize,
+    starved_dispatches: usize,
+}
+
+fn evaluate(coeffs: &CostCoefficients) -> Score {
+    let (mut correct, mut total_regret) = (0, 0.0);
+    let (mut c_dispatched, mut c_right, mut starved) = (0, 0, 0);
     for m in CELLS {
-        let w = Workload {
-            selectivity: m.2,
-            user_k: m.3,
-            total_rows: m.1,
-            dim: m.0,
-        };
-        let predicted = dispatch_via_cost(&w, coeffs);
-        let actual = measured_winner(m);
+        let predicted = dispatch_via_cost(&m.workload(), coeffs);
+        let actual = fastest_correct_plan(m);
+        let lat = m.latency();
         if predicted == actual {
             correct += 1;
         }
         if predicted == PlanKind::C {
             c_dispatched += 1;
             if actual == PlanKind::C {
-                c_correctly_dispatched += 1;
+                c_right += 1;
             }
         }
-        let measured = [m.4, m.5, m.6];
-        total_regret += measured[predicted as usize] / measured[actual as usize].max(1.0);
+        // Did the dispatched plan actually answer the query?
+        if m.rows()[predicted as usize] < m.complete_answer() {
+            starved += 1;
+        }
+        total_regret += lat[predicted as usize] / lat[actual as usize].max(1.0);
     }
-    (
+    Score {
         correct,
-        total_regret / CELLS.len() as f64,
+        regret: total_regret / CELLS.len() as f64,
         c_dispatched,
-        c_correctly_dispatched,
-    )
+        c_right,
+        starved_dispatches: starved,
+    }
 }
 
-/// Coefficients measured by `calibrate_cost_coefficients` on the same
-/// machine that produced the timings in `CELLS`. NOT pasted into
-/// `CostCoefficients::default()` : the shipped defaults are documented
-/// as x86 values, and replacing them with Apple-silicon numbers would
-/// just make them wrong for a different machine. Per-machine
-/// calibration belongs in config, not in a `Default` impl.
-/// Coefficients measured by `calibrate_cost_coefficients` on the same
-/// machine that produced the timings in `CELLS`.
-///
-/// NOT pasted into `CostCoefficients::default()` : the shipped defaults
-/// are documented as x86 values, and replacing them with Apple-silicon
-/// numbers would just make them wrong for a different machine.
-/// Per-machine calibration belongs in config, not in a `Default` impl.
 fn calibrated() -> CostCoefficients {
     CostCoefficients {
         c_hnsw_per_visit: 116.4,
@@ -214,12 +232,8 @@ fn calibrated() -> CostCoefficients {
     }
 }
 
-/// The same machine, but pricing plan C's per-visit metadata access at
-/// the *cloning* rate — i.e. modelling the engine as it was before
-/// `MetadataStore::with_metadata` landed.
-///
-/// The delta between this and [`calibrated`] is 0A.2's payoff, isolated
-/// from every other change.
+/// Same machine, but pricing plan C's per-visit metadata access at the
+/// *cloning* rate — the engine as it was before `with_metadata`.
 fn calibrated_before_borrow() -> CostCoefficients {
     let c = calibrated();
     CostCoefficients {
@@ -229,19 +243,18 @@ fn calibrated_before_borrow() -> CostCoefficients {
 }
 
 fn main() {
+    let n = CELLS.len();
     let c_wins: Vec<&M> = CELLS
         .iter()
-        .filter(|m| measured_winner(m) == PlanKind::C)
+        .filter(|m| fastest_correct_plan(m) == PlanKind::C)
         .collect();
     println!(
-        "120 measured cells ; plan C is fastest in {}\n",
+        "{n} measured cells ; plan C is the fastest *correct* plan in {}\n",
         c_wins.len()
     );
 
-    println!("=== Shipped defaults vs coefficients calibrated on this machine ===");
-    println!(
-        "  scenario                       correct/120   regret   C dispatched (of which right)"
-    );
+    println!("=== Dispatch quality ===");
+    println!("  scenario                          correct   regret   C disp (right)   starved");
     for (label, coeffs) in [
         ("shipped defaults (x86)", CostCoefficients::default()),
         (
@@ -250,65 +263,94 @@ fn main() {
         ),
         ("calibrated, C borrows (now)", calibrated()),
     ] {
-        let (correct, regret, c_disp, c_ok) = evaluate(&coeffs);
-        println!("  {label:30} {correct:6}/120     {regret:.3}    {c_disp:9} ({c_ok})");
+        let s = evaluate(&coeffs);
+        println!(
+            "  {label:32} {:3}/{n:<3}   {:.3}   {:6} ({})      {}",
+            s.correct, s.regret, s.c_dispatched, s.c_right, s.starved_dispatches
+        );
     }
-    println!();
+    println!("\n  `starved` = cells where the DISPATCHED plan returned fewer rows");
+    println!("  than min(k, matching). Should be 0.");
 
-    let pre = calibrated_before_borrow();
-    let now = calibrated();
+    println!("\n=== Plan C win rate by selectivity (fastest correct plan) ===");
+    let mut sels: Vec<f64> = CELLS.iter().map(M::s).collect();
+    sels.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    sels.dedup();
+    for s in sels {
+        let cells: Vec<&M> = CELLS.iter().filter(|m| (m.s() - s).abs() < 1e-9).collect();
+        let wins = cells
+            .iter()
+            .filter(|m| fastest_correct_plan(m) == PlanKind::C)
+            .count();
+        let disp = cells
+            .iter()
+            .filter(|m| dispatch_via_cost(&m.workload(), &calibrated()) == PlanKind::C)
+            .count();
+        println!(
+            "  s={s:<6}  C fastest {wins}/{}   C dispatched {disp}/{}",
+            cells.len(),
+            cells.len()
+        );
+    }
 
-    println!("=== The 8 cells where plan C actually won ===");
-    println!("  dim      n      s     k   A(us)   B(us)   C(us)    pre-0A.2   now");
+    println!("\n=== Cells where plan C is the fastest correct plan ===");
+    println!("   dim      s      k       A       B       C   vs best correct   dispatched?");
     for m in &c_wins {
-        let w = Workload {
-            selectivity: m.2,
-            user_k: m.3,
-            total_rows: m.1,
-            dim: m.0,
-        };
+        let lat = m.latency();
+        // Compare against the fastest *correct* alternative. Using
+        // min(A, B) would credit plan A's latency in cells where A
+        // returned an incomplete answer, understating C's real margin.
+        let complete = m.complete_answer();
+        let other = (0..2)
+            .filter(|&i| m.rows()[i] >= complete)
+            .map(|i| lat[i])
+            .fold(f64::INFINITY, f64::min);
+        let picked = dispatch_via_cost(&m.workload(), &calibrated());
         println!(
-            "  {:4} {:6}  {:.3} {:5} {:7.0} {:7.0} {:7.0}       {:?}        {:?}",
-            m.0,
-            m.1,
-            m.2,
-            m.3,
-            m.4,
-            m.5,
-            m.6,
-            dispatch_via_cost(&w, &pre),
-            dispatch_via_cost(&w, &now),
+            "  {:4} {:6} {:6} {:7.0} {:7.0} {:7.0}    {:.2}x   {}",
+            m.dim(),
+            m.s(),
+            m.k(),
+            lat[0],
+            lat[1],
+            lat[2],
+            other / lat[2].max(1.0),
+            if picked == PlanKind::C { "yes" } else { "NO" },
         );
     }
 
-    // Sweep `c_metadata_peek`, not `c_metadata_get` : after the split,
-    // plan C's per-visit cost is the only place the metadata term shows
-    // up in C's formula, and it reads the borrow coefficient.
-    println!("\n=== Sensitivity to c_metadata_peek (measured: 10.4 ns) ===");
-    println!("  c_meta_peek   correct/120   regret   C dispatched   of which right");
-    for c_peek in [249.5, 100.0, 50.0, 30.0, 10.4, 5.0] {
-        let coeffs = CostCoefficients {
-            c_metadata_peek: c_peek,
-            ..now
-        };
-        let (correct, regret, c_disp, c_ok) = evaluate(&coeffs);
-        println!("  {c_peek:10.1}   {correct:6}/120     {regret:.3}    {c_disp:9}   {c_ok:12}");
+    println!("\n=== Result completeness (all cells) ===");
+    let mut short = [0usize; 3];
+    for m in CELLS {
+        let complete = m.complete_answer();
+        for i in 0..3 {
+            if m.rows()[i] < complete {
+                short[i] += 1;
+            }
+        }
     }
+    println!("  cells where the plan returned fewer rows than min(k, matching):");
+    println!("    plan A : {}/{n}", short[0]);
+    println!("    plan B : {}/{n}", short[1]);
+    println!("    plan C : {}/{n}", short[2]);
 
-    println!("\n=== One cell in detail : dim=16 n=10000 s=0.5 k=50 (C measured 2.2x faster) ===");
-    let w = Workload {
-        selectivity: 0.5,
-        user_k: 50,
-        total_rows: 10_000,
-        dim: 16,
-    };
-    for (label, coeffs) in [("C clones (pre-0A.2)", pre), ("C borrows (now)", now)] {
-        println!(
-            "  {label:20}  cost_A={:9.0}  cost_B={:9.0}  cost_C={:9.0}  picks {:?}",
-            cost_plan_a(&w, &coeffs),
-            cost_plan_b(&w, &coeffs),
-            cost_plan_c(&w, &coeffs),
-            dispatch_via_cost(&w, &coeffs),
-        );
+    println!("\n=== One cell in detail : dim=16 s=0.5 k=50 ===");
+    if let Some(m) = CELLS
+        .iter()
+        .find(|m| m.dim() == 16 && (m.s() - 0.5).abs() < 1e-9 && m.k() == 50)
+    {
+        for (label, coeffs) in [
+            ("C clones (pre-0A.2)", calibrated_before_borrow()),
+            ("C borrows (now)", calibrated()),
+        ] {
+            let w = m.workload();
+            println!(
+                "  {label:20}  A={:9.0}  B={:9.0}  C={:9.0}  picks {:?}",
+                cost_plan_a(&w, &coeffs),
+                cost_plan_b(&w, &coeffs),
+                cost_plan_c(&w, &coeffs),
+                dispatch_via_cost(&w, &coeffs),
+            );
+        }
     }
 }

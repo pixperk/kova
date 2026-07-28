@@ -375,9 +375,15 @@ pub fn plan_a_expected_rows(w: &Workload) -> f64 {
 /// `min(k, matching_rows)` — you cannot return more rows than match,
 /// and you should not return fewer than the LIMIT when they exist.
 ///
-/// Plans B and C always reach that count : B scores every match, and
-/// C's termination gate requires a full results heap. Plan A does not,
-/// and the shortfall is not marginal :
+/// Plan B always reaches that count — it scores every match, so it is
+/// exact by construction (measured : 0 shortfalls in 84 cells). Plan C
+/// is approximate but near-complete : its termination gate requires a
+/// full results heap, and it fell short in 3 of 84 cells, by exactly one
+/// row each, all at `dim=1536` where a filtered graph walk can miss a
+/// match. That is ordinary ANN behaviour.
+///
+/// Plan A is in a different category, and the shortfall is not marginal
+/// (measured : 48 of 84 cells) :
 ///
 /// ```text
 /// dim=16 n=10_000, rows returned for LIMIT 10
@@ -429,8 +435,9 @@ pub fn plan_a_can_satisfy(w: &Workload) -> bool {
 /// and no cost comparison can express that — `cost_plan_a` is
 /// deliberately independent of selectivity.
 ///
-/// Plans B and C both always reach `min(k, matching_rows)`, so
-/// excluding A always leaves at least one correct choice.
+/// Excluding A always leaves a usable choice : plan B reaches
+/// `min(k, matching_rows)` exactly, and plan C reaches it up to ANN
+/// approximation (measured : short in 3 of 84 cells, by one row).
 #[must_use]
 pub fn dispatch_via_cost(w: &Workload, c: &CostCoefficients) -> PlanKind {
     let b = cost_plan_b(w, c);
