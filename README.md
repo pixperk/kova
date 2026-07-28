@@ -439,45 +439,66 @@ Ids cannot be reused after delete until vacuum runs.
 graph node is still in place. The
 `reinsert_after_delete_errors_until_vacuum` test pins this contract.
 
-### Vacuum is a two-pass graph repair, not a rebuild
+### Vacuum repairs the graph in place, and has to scan to do it
 
 `HnswIndex::vacuum_tombstones` physically removes tombstoned nodes and
-patches the holes they leave in the graph. The naive approach (drop
-nodes + drop their edges) breaks reachability : a survivor whose only
-path to the entry point ran through a tombstoned node gets stranded.
-The expensive approach (rebuild the whole graph from scratch) is
-correct but wastes everything we already paid to insert.
+patches the holes they leave. The naive approach (drop nodes + drop
+their edges) breaks reachability : a survivor whose only path to the
+entry point ran through a tombstoned node gets stranded. The expensive
+approach (rebuild from scratch) is correct but throws away everything
+insertion already paid for.
 
-The two-pass middle path :
+The middle path :
 
 ```text
-PASS 1 : collect (node, layer) -> {removed tombstones it pointed at}
-PASS 2 : for each affected (node, layer) :
+PASS 1 : scan every live node's neighbour lists ;
+         collect (node, layer) -> {dead ids it points at}
+PASS 2 : for each affected (node, layer), in sorted order :
            drop the dead neighbour ids
            if remaining live neighbours >= M/2 : skip
            else : run search_layer to find fresh M neighbours
                   prune overflow with `select_neighbours_heuristic`
 ```
 
-The **M/2 skip rule** is the bit that makes this cheap. HNSW only
-needs *good* neighbours, not *complete* ones. A node that lost one
-edge out of M still has plenty of routes to the entry point ; paying
-for a re-search just to top it back up to M would dominate vacuum
-time for no recall win. We only re-search nodes that fell below half
-their capacity, which is rare for well-connected nodes and exactly
-right for the few that mattered.
+**Pass 1 scans, and the scan is not optional.** It originally walked
+each *tombstone's own* neighbour list instead — much cheaper, and
+wrong. It assumes graph symmetry : that everyone pointing at `T` is
+named by `T`. HNSW does not guarantee that. Adding a bidirectional
+edge can leave `X -> T` while the back-edge `T -> X` is pruned away by
+`select_neighbors_heuristic` on overflow, so `X` was never visited and
+kept a dangling reference to a removed id.
 
-Entry-point handling is its own case. If the current entry point was
-tombstoned, we pick the surviving node on the highest layer (ties
-broken by id for determinism) ; if no nodes survive at the entry
-layer, we drop down. `vacuum_entry_point_*` and
-`vacuum_with_all_nodes_tombstoned_empties_index` pin both paths.
+That produced three failures, worst last : degraded recall ; a
+**second vacuum erroring out**, which is reachable through ordinary
+`Shard::checkpoint` (it vacuums internally, so
+delete/checkpoint/delete/checkpoint failed) ; and — because vacuum
+frees ids for reuse — a re-inserted id **resurrecting the stale edge**
+against unrelated data. It needed ~500 nodes to reproduce, and the
+existing tests used 20.
 
-Cost : O(affected_nodes × M) for the prune phase, plus
-O(re_searched_nodes × log N) for the re-search phase. On typical
-workloads `re_searched_nodes` is a small fraction of
-`affected_nodes`. `vacuum_leaves_no_dead_edges_in_live_nodes` is the
-load-bearing invariant test.
+The **M/2 skip rule** is what keeps this cheap. HNSW needs *good*
+neighbours, not *complete* ones : a node that lost one edge out of M
+still has plenty of routes to the entry point, and re-searching to top
+it back up would dominate vacuum time for no recall win. Only nodes
+that fell below half capacity get re-searched.
+
+**Vacuum is reproducible**, which matters because replication needs
+two replicas applying the same log to reach the same graph. Pass 2
+mutates the graph as it goes, so anything feeding it must be ordered :
+the affected list is sorted, the tombstone list is sorted, repair entry
+points are sorted, and `pick_new_entry_point` breaks `top_layer` ties
+by smallest id. Each of those was a `HashMap`/`HashSet` iteration whose
+order silently decided the shape of the repaired graph.
+
+Cost : O(N × M) for the scan, plus O(re_searched × log N) for repair.
+The scan is the cheap half — vacuum was already doing `search_layer`
+calls per repaired node, which dominate it.
+
+`vacuum_leaves_no_dangling_edges` is the invariant test, and it checks
+the invariant directly : it walks every surviving node's neighbour
+lists and asserts none reference a missing id. Its predecessor was
+named `vacuum_leaves_no_dead_edges_in_live_nodes` but only checked node
+*membership*, never a neighbour list — which is why the bug survived it.
 
 ### Checkpoint commits through a manifest, atomic at the manifest
 
