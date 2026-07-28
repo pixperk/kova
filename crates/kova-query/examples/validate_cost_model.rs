@@ -8,7 +8,10 @@
     clippy::needless_pass_by_value,
     clippy::needless_range_loop,
     clippy::doc_markdown,
-    clippy::similar_names
+    clippy::similar_names,
+    // `print_report` is a long sequence of report sections ; splitting
+    // it into helpers would scatter the output format across the file.
+    clippy::too_many_lines
 )]
 
 //! Cost model validation harness.
@@ -65,10 +68,7 @@ type TestShard = Shard<L2, MmapVectorStore, FileMetadataStore, FileWal>;
 /// KOVA_SELS=0.7,0.9 KOVA_NS=10000 KOVA_KS=50,100,500 \
 ///   cargo run --release --example validate_cost_model --features internal-bench
 /// ```
-fn axis<T: std::str::FromStr>(var: &str, default: &[T]) -> Vec<T>
-where
-    T: Copy,
-{
+fn axis<T: std::str::FromStr + Copy>(var: &str, default: &[T]) -> Vec<T> {
     let parsed: Option<Vec<T>> = std::env::var(var).ok().map(|s| {
         s.split(',')
             .filter_map(|x| x.trim().parse::<T>().ok())
@@ -213,14 +213,50 @@ fn time_plan(
     ((samples[samples.len() / 2] as f64) / 1000.0, returned)
 }
 
-fn argmin3(xs: [f64; 3]) -> PlanKind {
-    let mut best = 0;
-    for i in 1..3 {
-        if xs[i] < xs[best] {
-            best = i;
+/// The plan a perfect dispatcher should have chosen : **the fastest
+/// plan that actually answered the query.**
+///
+/// Ranking on latency alone is wrong, and wrong in the same way the
+/// cost model was. At `s=0.001` plan A runs in 51 us and returns **zero
+/// rows** while plan B takes 369 us and returns all ten matches. A
+/// plain `argmin` over latency calls plan A the winner, so :
+///
+/// - a dispatcher that correctly refuses plan A gets scored as
+///   *disagreeing* with the measurement, and
+/// - regret for that cell becomes `369/51 = 7.2x` — a large penalty for
+///   doing the right thing.
+///
+/// Across the low-selectivity half of the grid that is enough to make a
+/// correct model look far worse than a broken one. The harness has the
+/// row counts ; it must use them.
+///
+/// A plan qualifies when it returned `min(k, matching_rows)` rows.
+/// Plans B and C always do (measured : 40/40 cells). If nothing
+/// qualifies — which would mean the engine failed on every plan — fall
+/// back to raw latency so the cell still reports something.
+fn fastest_correct_plan(measured: [f64; 3], returned: [usize; 3], complete: usize) -> PlanKind {
+    let kinds = [PlanKind::A, PlanKind::B, PlanKind::C];
+    let mut best: Option<usize> = None;
+    for i in 0..3 {
+        if returned[i] < complete {
+            continue; // under-delivered : not a candidate at any speed
+        }
+        if best.is_none_or(|b| measured[i] < measured[b]) {
+            best = Some(i);
         }
     }
-    [PlanKind::A, PlanKind::B, PlanKind::C][best]
+    best.map_or_else(
+        || {
+            let mut b = 0;
+            for i in 1..3 {
+                if measured[i] < measured[b] {
+                    b = i;
+                }
+            }
+            kinds[b]
+        },
+        |i| kinds[i],
+    )
 }
 
 fn main() {
@@ -298,6 +334,9 @@ fn main() {
                     let (m_c, r_c) = time_plan(&format!("{cell} C"), &mut engine, plan_c, &params);
                     let measured = [m_a, m_b, m_c];
                     let returned = [r_a, r_b, r_c];
+                    // The complete correct answer for this cell. Fewer
+                    // rows may match than the LIMIT asks for.
+                    let complete_answer = k.min(matching);
 
                     let w = Workload {
                         selectivity: s,
@@ -319,7 +358,7 @@ fn main() {
                         measured_micros: measured,
                         returned,
                         predicted_cost: predicted,
-                        measured_winner: argmin3(measured),
+                        measured_winner: fastest_correct_plan(measured, returned, complete_answer),
                         predicted_winner: dispatch_via_cost(&w, &coeffs),
                     });
                     println!(
