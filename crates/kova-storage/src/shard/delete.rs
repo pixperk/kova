@@ -198,7 +198,27 @@ where
     /// [`ShardError::Index`] surfaces any HNSW-level error during the
     /// rewiring or the underlying `vectors.remove` call.
     pub fn vacuum(&mut self) -> Result<usize, ShardError> {
-        Ok(self.index.vacuum_tombstones()?)
+        // Phase 1 : nothing to validate. Vacuuming an empty tombstone
+        // set is a no-op, not an error.
+        //
+        // Phase 2 : commit. Vacuum changes no rows, but it *does*
+        // rewire the graph in a way that depends on when it ran, so it
+        // has to occupy a definite position in the log — see
+        // [`Record::Vacuum`].
+        self.wal
+            .append(&Record::Vacuum)
+            .map_err(ShardError::backend)?;
+        self.wal.sync().map_err(ShardError::backend)?;
+
+        // Phase 3 : apply. Post-commit failure panics, as everywhere
+        // else : the log says the vacuum happened.
+        match self.index.vacuum_tombstones() {
+            Ok(removed) => Ok(removed),
+            Err(e) => panic!(
+                "Shard::vacuum phase-3 apply failure on index.vacuum_tombstones: {e:?} \
+                 (WAL has committed the record ; aborting so replay can reconcile)"
+            ),
+        }
     }
 }
 
@@ -458,7 +478,7 @@ mod tests {
     /// come back), the vacuum work is lost. State is still correct
     /// and a second vacuum still works.
     #[test]
-    fn vacuum_work_is_wasted_on_reopen_but_state_stays_correct() {
+    fn vacuum_survives_reopen_because_it_is_logged() {
         let dir = tempdir().unwrap();
 
         {
@@ -475,14 +495,26 @@ mod tests {
             assert_eq!(shard.len(), 1);
         }
 
-        let mut shard = Shard::open(dir.path(), 2, L2, HnswParams::default()).unwrap();
+        let shard = Shard::open(dir.path(), 2, L2, HnswParams::default()).unwrap();
         assert!(!shard.contains(id(1)));
         assert!(shard.contains(id(2)));
         assert_eq!(shard.len(), 1);
 
-        let freed = shard.vacuum().unwrap();
-        assert_eq!(freed, 1);
-        assert_eq!(shard.len(), 1);
+        // This test used to be called `vacuum_work_is_wasted_on_reopen`
+        // and asserted the tombstone came back : vacuum made no on-disk
+        // commit, so replay re-applied the `Delete` and the node was
+        // tombstoned again, forcing a second vacuum.
+        //
+        // Vacuum is now a logged record (`Record::Vacuum`), because
+        // replicas have to vacuum at the same log position or their
+        // graphs diverge. Durability across reopen is the pleasant
+        // side effect: replay applies the vacuum too, so the work is
+        // no longer thrown away.
+        assert_eq!(
+            shard.index.tombstone_count(),
+            0,
+            "replay should have applied Record::Vacuum, leaving nothing to redo"
+        );
     }
 
     // ---------- delete_many ----------

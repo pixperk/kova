@@ -79,6 +79,27 @@ pub enum Record {
         /// Index method.
         kind: IndexKind,
     },
+    /// Physically remove every tombstoned node from the HNSW graph and
+    /// free its vector-store slot.
+    ///
+    /// **Why vacuum is logged at all.** It touches no user-visible
+    /// state : the same rows are live before and after. But it
+    /// *rewires the graph* — every survivor that pointed at a removed
+    /// node gets repaired, and the repair depends on which nodes were
+    /// tombstoned at the moment it ran. Two shards that vacuum the same
+    /// tombstones at different points in the log end up with different
+    /// neighbour lists, and therefore answer the same query
+    /// differently. `vacuum_timing_changes_the_graph` in
+    /// `kova-index` pins that.
+    ///
+    /// For a single node that is harmless. For replicas it is not : the
+    /// leader has to decide *when*, and every follower has to vacuum at
+    /// exactly that log position. Hence a record rather than a local
+    /// maintenance decision.
+    ///
+    /// Carries no payload — "vacuum whatever is tombstoned here" is
+    /// fully determined by the log prefix.
+    Vacuum,
     /// Drop a named secondary index. Replay re-applies it via
     /// [`crate::IndexCatalog::drop_named_index`] which both
     /// unregisters the name and removes the underlying bucket

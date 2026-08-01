@@ -621,6 +621,13 @@ where
                         .map_err(ShardError::backend)?;
                     self.backfill_kind(&field, kind);
                 }
+                Record::Vacuum => {
+                    // Replay must vacuum at exactly the log position the
+                    // leader chose. Vacuuming late (or not at all) leaves
+                    // a graph with different neighbour lists, which
+                    // answers queries differently — see [`Record::Vacuum`].
+                    self.index.vacuum_tombstones()?;
+                }
                 Record::DropIndex { name } => {
                     self.catalog
                         .drop_named_index(&name)

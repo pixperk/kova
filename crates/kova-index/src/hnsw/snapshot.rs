@@ -23,14 +23,13 @@
 //! - **Vector bytes** : they live in the composed [`VectorStore`], a
 //!   separate file with its own crash-safe lifecycle. The snapshot
 //!   references vector ids ; the store provides the bytes.
-//! - **Tombstones** : snapshots are taken post-vacuum, when
-//!   `self.tombstones` is empty by construction.
+//! - **Vector bytes** — see above.
 //! - **Metric / params / RNG seed** : the caller supplies these at
 //!   restore time. The graph structure is metric-agnostic ; params
 //!   only affect future insertions ; seed only affects future random
 //!   level assignments.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::{Read, Write};
 
 use kova_core::{Distance, VectorId, VectorStore};
@@ -45,7 +44,23 @@ use super::node::Node;
 use super::params::HnswParams;
 
 const MAGIC: &[u8; 8] = b"KOVAGRA1";
-const FORMAT_VERSION: u32 = 1;
+/// Current snapshot format.
+///
+/// **v1 → v2 : tombstones became part of the payload.** v1 relied on an
+/// invariant that no longer holds — that a snapshot is always written
+/// post-vacuum, so the tombstone set is empty by construction. That was
+/// true only because `Shard::checkpoint` vacuumed before snapshotting.
+/// Vacuum is now a *logged* operation (replicas must vacuum at the same
+/// log position, see `Record::Vacuum`) while checkpoint stayed a local
+/// decision, so a snapshot can legitimately contain tombstoned nodes.
+/// Omitting them resurrected deleted rows on reopen.
+///
+/// v1 snapshots still read : they were genuinely post-vacuum, so an
+/// empty tombstone set is the correct interpretation, not a fallback.
+const FORMAT_VERSION: u32 = 2;
+
+/// The last format that omitted the tombstone set.
+const FORMAT_VERSION_V1: u32 = 1;
 
 /// Wire format for a serialised graph.
 ///
@@ -53,6 +68,15 @@ const FORMAT_VERSION: u32 = 1;
 /// we don't bother serialising the `Node` wrapper because it's an
 /// implementation detail. Storing `Vec<Vec<VectorId>>` keeps the format
 /// stable even if `Node` grows additional fields in the future.
+/// v1 payload : no tombstone set. Retained so existing snapshots keep
+/// loading ; see [`FORMAT_VERSION`].
+#[derive(Deserialize)]
+struct GraphSnapshotV1 {
+    dim: Option<usize>,
+    entry_point: Option<VectorId>,
+    nodes: BTreeMap<VectorId, Vec<Vec<VectorId>>>,
+}
+
 #[derive(Serialize, Deserialize)]
 struct GraphSnapshot {
     /// Pinned vector dimension. `None` only if the snapshot is of an
@@ -78,6 +102,15 @@ struct GraphSnapshot {
     /// deterministic apply path), and it is semantically meaningful —
     /// `search_layer` examines neighbours in list order.
     nodes: BTreeMap<VectorId, Vec<Vec<VectorId>>>,
+    /// Logically-deleted ids whose graph nodes are still present.
+    ///
+    /// Load-bearing : these determine which rows are live, so a snapshot
+    /// that omits them silently resurrects deleted data once the WAL is
+    /// truncated past the `Delete` records.
+    ///
+    /// `BTreeSet` for the same reason `nodes` is a `BTreeMap` — ordered
+    /// output keeps snapshots byte-reproducible.
+    tombstones: BTreeSet<VectorId>,
 }
 
 impl<D: Distance, V: VectorStore> HnswIndex<D, V> {
@@ -114,6 +147,7 @@ impl<D: Distance, V: VectorStore> HnswIndex<D, V> {
                 .iter()
                 .map(|(id, node)| (*id, node.neighbors.clone()))
                 .collect(),
+            tombstones: self.tombstones.iter().copied().collect(),
         };
 
         bincode::serialize_into(writer, &snapshot).map_err(|e| bincode_err(&e))?;
@@ -126,9 +160,10 @@ impl<D: Distance, V: VectorStore> HnswIndex<D, V> {
     /// [`VectorStore`] : the snapshot only carries the graph structure,
     /// not the things the caller controls at runtime.
     ///
-    /// The reconstructed index has an empty tombstone set ; snapshots
-    /// are only ever written post-vacuum, so any tombstones from before
-    /// the snapshot have already been physically removed.
+    /// Tombstones come back with the snapshot (v2 onwards). They are
+    /// logical state — they decide which rows are live — so dropping
+    /// them would resurrect deleted rows as soon as the WAL is truncated
+    /// past the corresponding `Delete` records.
     ///
     /// # Errors
     /// - [`KovaIndexError::Storage`] if magic doesn't match (wrong file
@@ -158,19 +193,30 @@ impl<D: Distance, V: VectorStore> HnswIndex<D, V> {
             .read_exact(&mut version_bytes)
             .map_err(|e| io_err(&e))?;
         let version = u32::from_le_bytes(version_bytes);
-        if version != FORMAT_VERSION {
+        if version != FORMAT_VERSION && version != FORMAT_VERSION_V1 {
             return Err(KovaIndexError::Storage(format!(
-                "unsupported snapshot format version : {version} (expected {FORMAT_VERSION})"
+                "unsupported snapshot format version : {version} \
+                 (this build reads {FORMAT_VERSION_V1} and {FORMAT_VERSION})"
             )));
         }
 
         // ----- Decode the payload -----
-        let snapshot: GraphSnapshot =
-            bincode::deserialize_from(reader).map_err(|e| bincode_err(&e))?;
+        //
+        // v1 carried no tombstone set. Reading one as an empty set is
+        // correct rather than lossy : v1 snapshots were only ever
+        // written immediately after a vacuum.
+        let (dim, entry_point, nodes_flat, tombstones) = if version == FORMAT_VERSION_V1 {
+            let v1: GraphSnapshotV1 =
+                bincode::deserialize_from(reader).map_err(|e| bincode_err(&e))?;
+            (v1.dim, v1.entry_point, v1.nodes, BTreeSet::new())
+        } else {
+            let v2: GraphSnapshot =
+                bincode::deserialize_from(reader).map_err(|e| bincode_err(&e))?;
+            (v2.dim, v2.entry_point, v2.nodes, v2.tombstones)
+        };
 
         // Rehydrate Node wrappers from the flat neighbour lists.
-        let nodes: HashMap<VectorId, Node> = snapshot
-            .nodes
+        let nodes: HashMap<VectorId, Node> = nodes_flat
             .into_iter()
             .map(|(id, neighbors)| (id, Node { neighbors }))
             .collect();
@@ -180,9 +226,9 @@ impl<D: Distance, V: VectorStore> HnswIndex<D, V> {
             params,
             nodes,
             vectors,
-            tombstones: HashSet::new(),
-            entry_point: snapshot.entry_point,
-            dim: snapshot.dim,
+            tombstones: tombstones.into_iter().collect(),
+            entry_point,
+            dim,
             rng: StdRng::seed_from_u64(seed),
         })
     }

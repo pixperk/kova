@@ -123,28 +123,30 @@ impl<D: Distance> Shard<D, MmapVectorStore, FileMetadataStore, FileWal> {
     ///
     /// 1. **Capture** : read `wal.last_lsn()`. Anything in the WAL up to
     ///    and including this LSN becomes the snapshot's coverage.
-    /// 2. **Vacuum** : rewire the HNSW graph to physically remove
-    ///    tombstoned nodes. No point in snapshotting state we're about
-    ///    to discard.
-    /// 3. **Snapshot** : stream the post-vacuum graph to
+    /// 2. **Snapshot** : stream the current graph to
     ///    `graph.{new_snapshot_id}.snapshot` via `atomic_write_streaming`.
     ///    The new file lives alongside the old one ; nothing references
     ///    it yet.
-    /// 4. **Commit** : atomic-write the new `manifest` pointing at the
+    /// 3. **Commit** : atomic-write the new `manifest` pointing at the
     ///    new `snapshot_id` and `checkpoint_lsn`. **This is the single
     ///    durable commit point.** A crash before this leaves the old
     ///    manifest (so the old snapshot stays live and the WAL replays
     ///    in full as usual). A crash after this leaves the new manifest
     ///    and new snapshot live ; remaining WAL records past
     ///    `checkpoint_lsn` are still on disk and will be replayed.
-    /// 5. **Truncate WAL** : drop records `<= checkpoint_lsn`. Best-
+    /// 4. **Truncate WAL** : drop records `<= checkpoint_lsn`. Best-
     ///    effort ; a crash here just leaves dead-weight records that
     ///    `replay_from(checkpoint_lsn + 1)` will skip on next open.
-    /// 6. **Delete old snapshot** : best-effort cleanup. Orphans get
+    /// 5. **Delete old snapshot** : best-effort cleanup. Orphans get
     ///    swept on the next open if this step fails.
     ///
+    /// **Does not vacuum.** Call [`Shard::vacuum`] first if you want the
+    /// snapshot to exclude tombstoned nodes ; vacuum is a logged state
+    /// change (see [`crate::Record::Vacuum`]) precisely so that it does
+    /// not happen at a locally-chosen moment.
+    ///
     /// # Errors
-    /// [`ShardError`] from vacuum, snapshot write, manifest write, or
+    /// [`ShardError`] from the snapshot write, manifest write, or
     /// WAL truncate. The post-commit steps (truncate, delete) are
     /// fail-safe ; if they error after the manifest committed, the
     /// next open will still see the new state.
@@ -164,11 +166,29 @@ impl<D: Distance> Shard<D, MmapVectorStore, FileMetadataStore, FileWal> {
         // -------- Phase 1 : capture --------
         let checkpoint_lsn = self.wal.last_lsn().unwrap_or(Lsn::ZERO);
 
-        // -------- Phase 2 : vacuum --------
-        // No reason to snapshot state we're about to discard.
-        self.index.vacuum_tombstones()?;
+        // NOTE : checkpoint deliberately does **not** vacuum.
+        //
+        // It used to, on the reasonable-sounding grounds that there is
+        // no point snapshotting state you are about to discard. But
+        // vacuum rewires the graph in a way that depends on *when* it
+        // ran, while checkpoint is a local decision every node makes on
+        // its own schedule (`CheckpointPolicy`). Vacuuming here would
+        // therefore make two replicas holding identical logs diverge —
+        // the one thing replication cannot tolerate.
+        //
+        // The two concerns are now separate :
+        //
+        // - `Shard::vacuum` is a logged state change (`Record::Vacuum`),
+        //   so every replica applies it at the same log position.
+        // - `checkpoint` is a pure durability artifact — snapshot the
+        //   graph you have, commit the manifest, truncate the WAL — and
+        //   is safe to run locally at any time.
+        //
+        // Operators who want vacuumed snapshots call `vacuum()` before
+        // `checkpoint()`. That also makes a cheap durability-only
+        // checkpoint possible, which was not expressible before.
 
-        // -------- Phase 3 : stream snapshot to a NEW file --------
+        // -------- Phase 2 : stream snapshot to a NEW file --------
         // The old `graph.{old}.snapshot` stays valid until the manifest
         // commits to the new id below.
         let new_snapshot_id = self.snapshot_id + 1;
@@ -182,7 +202,7 @@ impl<D: Distance> Shard<D, MmapVectorStore, FileMetadataStore, FileWal> {
         })
         .map_err(ShardError::backend)?;
 
-        // -------- Phase 3b : serialise the catalog alongside --------
+        // -------- Phase 2b : serialise the catalog alongside --------
         // The catalog snapshot is generation-numbered for the same
         // reason the graph snapshot is : the manifest commit below is
         // the single atomic "which generation is live" point. A crash
@@ -195,7 +215,7 @@ impl<D: Distance> Shard<D, MmapVectorStore, FileMetadataStore, FileWal> {
         })?;
         atomic_write(&new_catalog_path, &catalog_bytes).map_err(ShardError::backend)?;
 
-        // -------- Phase 3c : rebuild + serialise the column stats --------
+        // -------- Phase 2c : rebuild + serialise the column stats --------
         // Stats are derived state, so rebuild from the post-vacuum
         // metadata store every checkpoint. Cost is O(N) walk of the
         // metadata HashMap ; happens once per checkpoint, not per
@@ -207,7 +227,7 @@ impl<D: Distance> Shard<D, MmapVectorStore, FileMetadataStore, FileWal> {
         })?;
         atomic_write(&new_stats_path, &stats_bytes).map_err(ShardError::backend)?;
 
-        // -------- Phase 4 : commit (the single atomic point) --------
+        // -------- Phase 3 : commit (the single atomic point) --------
         let manifest = Manifest {
             version: 1,
             checkpoint_lsn: checkpoint_lsn.get(),
@@ -223,13 +243,13 @@ impl<D: Distance> Shard<D, MmapVectorStore, FileMetadataStore, FileWal> {
         self.snapshot_id = new_snapshot_id;
         self.checkpoint_lsn = checkpoint_lsn;
 
-        // -------- Phase 5 : truncate WAL --------
+        // -------- Phase 4 : truncate WAL --------
         // Best-effort : if this fails, the next open just sees more
         // records to replay. They get skipped via `replay_from(cp+1)`
         // because the manifest's `checkpoint_lsn` covers them.
         let _ = self.wal.truncate_before(Lsn::new(checkpoint_lsn.get() + 1));
 
-        // -------- Phase 6 : delete old snapshot + old catalog + old stats --------
+        // -------- Phase 5 : delete old snapshot + old catalog + old stats --------
         // Best-effort. The orphan cleanup in `Shard::open` sweeps any
         // stragglers anyway.
         if old_snapshot_id != new_snapshot_id {
@@ -353,12 +373,22 @@ mod tests {
         );
     }
 
-    /// Checkpoint after vacuum genuinely persists the vacuumed state :
-    /// reopen sees the post-vacuum index (tombstones gone), unlike the
-    /// vacuum-without-checkpoint case where the WAL replays the deletes
-    /// and tombstones come back.
+    /// Checkpoint **does not** vacuum, and a tombstone written into a
+    /// snapshot survives reopen.
+    ///
+    /// This used to assert the opposite (`checkpoint_locks_in_vacuum_work`)
+    /// because checkpoint vacuumed first. It no longer does : vacuum
+    /// rewires the graph in a timing-dependent way, while checkpoint is
+    /// a local decision each node makes on its own schedule, so
+    /// vacuuming here would make replicas holding identical logs
+    /// diverge. See [`crate::Record::Vacuum`].
+    ///
+    /// The load-bearing part is that the snapshot carries the tombstone
+    /// set (format v2). Without it, checkpoint would truncate the WAL
+    /// past the `Delete` record while writing a snapshot that still
+    /// contains the node — and the row would come back from the dead.
     #[test]
-    fn checkpoint_locks_in_vacuum_work() {
+    fn checkpoint_preserves_tombstones_without_vacuuming() {
         let dir = tempdir().unwrap();
 
         {
@@ -370,22 +400,46 @@ mod tests {
                 .insert(id(2), v(vec![0.0, 1.0]), tag_meta("b"))
                 .unwrap();
             shard.delete(id(1)).unwrap();
-            shard.checkpoint().unwrap(); // vacuums + truncates
+            shard.checkpoint().unwrap();
+            // Not vacuumed : the node is still in the graph, tombstoned.
+            assert_eq!(shard.index.tombstone_count(), 1);
         }
 
         let shard = Shard::open(dir.path(), 2, L2, HnswParams::default()).unwrap();
-        // After checkpoint, the WAL's Delete{1} record is truncated.
-        // Reopen loads the post-vacuum snapshot directly ; id 1 isn't
-        // even in the graph anymore (not tombstoned, just gone).
+        assert!(!shard.contains(id(1)), "deleted row must stay deleted");
+        assert!(shard.contains(id(2)));
+        assert_eq!(shard.len(), 1);
+        assert_eq!(
+            shard.index.tombstone_count(),
+            1,
+            "the snapshot must carry the tombstone set across reopen"
+        );
+    }
+
+    /// Vacuum then checkpoint : the vacuum is locked into the snapshot
+    /// and there is nothing left to redo.
+    #[test]
+    fn vacuum_then_checkpoint_locks_in_the_vacuum() {
+        let dir = tempdir().unwrap();
+
+        {
+            let mut shard = Shard::open(dir.path(), 2, L2, HnswParams::default()).unwrap();
+            shard
+                .insert(id(1), v(vec![1.0, 0.0]), tag_meta("a"))
+                .unwrap();
+            shard
+                .insert(id(2), v(vec![0.0, 1.0]), tag_meta("b"))
+                .unwrap();
+            shard.delete(id(1)).unwrap();
+            shard.vacuum().unwrap();
+            shard.checkpoint().unwrap();
+        }
+
+        let shard = Shard::open(dir.path(), 2, L2, HnswParams::default()).unwrap();
         assert!(!shard.contains(id(1)));
         assert!(shard.contains(id(2)));
         assert_eq!(shard.len(), 1);
-        // No tombstones reborn from WAL replay.
-        let tombstones_after = shard.index.tombstone_count();
-        assert_eq!(
-            tombstones_after, 0,
-            "tombstones should be 0 (vacuum was locked in)"
-        );
+        assert_eq!(shard.index.tombstone_count(), 0);
     }
 
     /// Two checkpoints in a row : the second supersedes the first ; the
