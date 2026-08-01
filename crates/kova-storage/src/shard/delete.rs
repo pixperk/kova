@@ -203,7 +203,7 @@ where
         //
         // Phase 2 : commit. Vacuum changes no rows, but it *does*
         // rewire the graph in a way that depends on when it ran, so it
-        // has to occupy a definite position in the log — see
+        // has to occupy a definite position in the log : see
         // [`Record::Vacuum`].
         self.wal
             .append(&Record::Vacuum)

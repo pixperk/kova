@@ -17,7 +17,7 @@
 //!
 //! Plan A returned **nothing** for a query with ten valid answers, and
 //! the cost model dispatched it because 51 us of nothing beat 369 us of
-//! the right answer — `cost_plan_a` is deliberately independent of
+//! the right answer : `cost_plan_a` is deliberately independent of
 //! selectivity, so no cost comparison could see the difference.
 //!
 //! These tests go through the **full public pipeline**
@@ -130,7 +130,7 @@ fn loose_filter_still_fills_the_limit() {
     assert_eq!(knn_rows(&mut engine, 100), 100);
 }
 
-/// A predicate that matches nothing returns nothing — the gate must not
+/// A predicate that matches nothing returns nothing : the gate must not
 /// invent rows or error.
 #[test]
 fn unsatisfiable_filter_returns_empty() {

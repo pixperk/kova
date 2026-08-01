@@ -124,7 +124,7 @@ const SELECTIVITY_GRANULARITY: usize = 1000;
 /// Spread matching rows across insertion order rather than blocking them
 /// together. Coprime with [`SELECTIVITY_GRANULARITY`], so
 /// `(i * STRIDE) % GRANULARITY` visits every residue exactly once per
-/// 1000 rows — giving an *exact* match count with the matches scattered.
+/// 1000 rows : giving an *exact* match count with the matches scattered.
 const SELECTIVITY_STRIDE: usize = 7919;
 
 /// Build a shard where exactly `selectivity` of the rows satisfy
@@ -173,7 +173,7 @@ fn build_shard(
 /// actually returned**.
 ///
 /// The row count is not decoration. Plan A overfetches `k * OVERFETCH`
-/// candidates, post-filters, and returns whatever survives — with no
+/// candidates, post-filters, and returns whatever survives, with no
 /// retry. At low selectivity that means a `LIMIT k` query can come back
 /// with far fewer than `k` rows, and the cost model deliberately does
 /// not charge for it (`cost_plan_a` has no selectivity term, on the
@@ -223,7 +223,7 @@ fn time_plan(
 ///
 /// - a dispatcher that correctly refuses plan A gets scored as
 ///   *disagreeing* with the measurement, and
-/// - regret for that cell becomes `369/51 = 7.2x` — a large penalty for
+/// - regret for that cell becomes `369/51 = 7.2x` : a large penalty for
 ///   doing the right thing.
 ///
 /// Across the low-selectivity half of the grid that is enough to make a
@@ -232,7 +232,7 @@ fn time_plan(
 ///
 /// A plan qualifies when it returned `min(k, matching_rows)` rows.
 /// Plans B and C always do (measured : 40/40 cells). If nothing
-/// qualifies — which would mean the engine failed on every plan — fall
+/// qualifies, which would mean the engine failed on every plan : fall
 /// back to raw latency so the cell still reports something.
 fn fastest_correct_plan(measured: [f64; 3], returned: [usize; 3], complete: usize) -> PlanKind {
     let kinds = [PlanKind::A, PlanKind::B, PlanKind::C];
@@ -510,7 +510,7 @@ fn print_report(rs: &[CellResult]) {
         }
     }
     if c_wins == 0 {
-        println!("  (none — plan C was never the fastest plan on any cell)");
+        println!("  (none : plan C was never the fastest plan on any cell)");
     }
 
     // ---- Disagreements ----

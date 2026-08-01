@@ -429,7 +429,7 @@ impl<D: Distance, V: VectorStore> HnswIndex<D, V> {
         // Ties on `top_layer` are broken by smallest id, deliberately.
         //
         // `max_by_key` returns the *last* maximum it encounters, and
-        // `self.nodes` is a `HashMap` — so with several nodes sharing
+        // `self.nodes` is a `HashMap`, so with several nodes sharing
         // the top layer (the common case) the winner depended on hash
         // iteration order. That made the entry point differ between two
         // replicas holding identical graphs, which both changes the
@@ -513,7 +513,7 @@ mod tests {
     ///
     /// It used to. `collect_affected_at_layer` found nodes to repair by
     /// walking each *tombstone's own* neighbour list, which assumes the
-    /// graph is symmetric — that everyone pointing at `T` is named by
+    /// graph is symmetric : that everyone pointing at `T` is named by
     /// `T`. HNSW does not guarantee that : adding a bidirectional edge
     /// can leave `X -> T` while the back-edge `T -> X` is pruned away by
     /// `select_neighbors_heuristic` on overflow. Those `X` were never
@@ -521,12 +521,12 @@ mod tests {
     ///
     /// Consequences, in increasing order of nastiness :
     ///
-    /// 1. degraded recall — a node has fewer usable edges than `M` implies
+    /// 1. degraded recall : a node has fewer usable edges than `M` implies
     /// 2. a *second* vacuum errors out (`affected id N missing from nodes`),
     ///    which is reachable through the ordinary `Shard::checkpoint` path
     ///    since checkpoint vacuums internally
     /// 3. vacuum re-enables id reuse, so a re-inserted id **resurrects the
-    ///    stale edge** — now pointing at an unrelated vector
+    ///    stale edge**, now pointing at an unrelated vector
     ///
     /// Needs a few hundred nodes to reproduce : the asymmetry requires
     /// enough insert pressure for the heuristic to start pruning
@@ -550,7 +550,7 @@ mod tests {
 
     /// The failure mode that surfaced first : a second vacuum trips over
     /// the dangling edges the first one left behind. Reachable through
-    /// `Shard::checkpoint`, which vacuums internally — so
+    /// `Shard::checkpoint`, which vacuums internally : so
     /// delete/checkpoint/delete/checkpoint used to fail.
     #[test]
     fn repeated_vacuum_succeeds() {
@@ -574,7 +574,7 @@ mod tests {
     ///
     /// Vacuum frees ids for reuse. If a stale edge to a removed id
     /// survives and that id is later re-inserted, the edge **resurrects**
-    /// — now pointing at a completely unrelated vector, silently
+    ///, now pointing at a completely unrelated vector, silently
     /// corrupting graph locality.
     ///
     /// This is deliberately checked *before* the reinsert, because
@@ -597,7 +597,7 @@ mod tests {
         let dangling = dangling_edges(&idx);
         assert!(
             dangling.is_empty(),
-            "{} edge(s) reference ids that are now free for reuse — \
+            "{} edge(s) reference ids that are now free for reuse : \
              re-inserting any of them resurrects the edge against unrelated \
              data. e.g. {:?}",
             dangling.len(),

@@ -625,7 +625,7 @@ where
                     // Replay must vacuum at exactly the log position the
                     // leader chose. Vacuuming late (or not at all) leaves
                     // a graph with different neighbour lists, which
-                    // answers queries differently — see [`Record::Vacuum`].
+                    // answers queries differently ; see [`Record::Vacuum`].
                     self.index.vacuum_tombstones()?;
                 }
                 Record::DropIndex { name } => {

@@ -14,14 +14,14 @@ with gRPC between nodes. Every byte, every index, every network call is ours.
 | Crate          | Status      | What it provides                                                       |
 | -------------- | ----------- | ---------------------------------------------------------------------- |
 | `kova-core`    | shipped     | `Vector`, `Distance` trait + `Cosine` / `L2` / `InnerProduct` (SIMD)   |
-| `kova-index`   | shipped     | `Index` trait, `FlatIndex` baseline, `HnswIndex` (insert + search + two-pass vacuum + streaming snapshot) |
-| `kova-storage` | shipped     | Segmented WAL, `MmapVectorStore` (free-list slot reuse, crash-mid-init recovery), `FileMetadataStore`, `atomic_write` (+ streaming variant), `Manifest` commit point, `Shard` (log-then-mutate, batched inserts, logical delete, vacuum, checkpoint + WAL truncate, generation-numbered snapshots). SIGKILL-tested across 55,697 acks and 962 checkpoints. |
+| `kova-index`   | shipped     | `Index` trait, `FlatIndex` baseline, `HnswIndex` (insert + search + vacuum with full-scan edge repair + deterministic streaming snapshot) |
+| `kova-storage` | shipped     | Segmented WAL, `MmapVectorStore` (free-list slot reuse, crash-mid-init recovery), `FileMetadataStore`, `atomic_write` (+ streaming variant), `Manifest` commit point, `Shard` (log-then-mutate, batched inserts, logical delete, logged vacuum, checkpoint + WAL truncate, generation-numbered snapshots, deterministic apply). SIGKILL-tested across 55,697 acks and 962 checkpoints. |
 | `kova-query`   | shipped     | KQL end to end : parser (Pest grammar, full DML + DDL), binder (typed `LogicalStatement` with hard semantic rejections), planner (three SELECT strategies dispatched by a measured cost model with a correctness gate, plus radius, COUNT and scan-and-limit bypasses), executor wired to `Shard` for both read and write paths, full DML (INSERT / UPDATE / DELETE including subscripted, radius, and param-bound shapes), `CREATE INDEX` / `DROP INDEX` end to end via the `IndexCatalog`, `Value::Map` for nested metadata, probabilistic query fuzzer with reference-impl correctness check, recall regression sweep across kNN / filtered / radius. See [`docs/query.md`](docs/query.md). |
 | `kova-meta-index` | shipped | Secondary indexes on metadata fields : `HashIndex` (equality), `BTreeIndex` (range, with float-ordering gate), `InvertedIndex` (array containment). `RoaringTreemap`-backed bitmaps compose for AND / OR / NOT in microseconds. `IndexCatalog` orchestrates per-field bundles, routes lookups by priority, exposes exact cardinality for the planner. Catalog persists alongside the graph snapshot, generation-numbered like `graph.{N}.snapshot`. WAL records carry `old_metadata` so replay rebuilds the catalog without depending on the (eagerly-mutated) metadata store. See [`docs/meta-index.md`](docs/meta-index.md). |
 | `kova-cluster` | not started | Consistent hashing, quorum replication, coordinator                    |
 | `kova-server`  | not started | gRPC node binary                                                       |
 
-802 lib + integration tests passing across the workspace (covering meta-index unit tests, catalog round-trip + persistence + post-checkpoint replay, plus the existing HNSW / WAL / shard / query suites). The full fuzz long-run pushes 12k+ correctness-checked queries and 32k+ no-panic queries per CI cycle. `cargo clippy --workspace --all-targets -- -D warnings` clean.
+813 lib + integration tests passing across the workspace (covering meta-index unit tests, catalog round-trip + persistence + post-checkpoint replay, plus the existing HNSW / WAL / shard / query suites). The full fuzz long-run pushes 12k+ correctness-checked queries and 32k+ no-panic queries per CI cycle. `cargo clippy --workspace --all-targets -- -D warnings` clean.
 
 ## Build
 
@@ -38,11 +38,16 @@ cargo bench -p kova-core
 
 - **HNSW**, hand-rolled. Default params (`M=16`, `ef_construction=200`,
   `ef_search=50`) hit recall > 0.9 at 50k vectors without tuning.
-- **Two-pass vacuum** physically removes tombstoned nodes and repairs
-  the neighbour lists of every survivor that pointed at one. Bounded
-  by the M/2 skip rule so well-connected nodes don't pay for re-search.
+- **Vacuum** physically removes tombstoned nodes and repairs the
+  neighbour lists of every survivor that pointed at one. Those
+  survivors are found by scanning, because HNSW edges are not
+  symmetric : a tombstone's own list does not name everyone pointing
+  at it. Bounded by the M/2 skip rule so well-connected nodes don't
+  pay for re-search.
 - **Streaming snapshot** (`write_snapshot`/`read_snapshot`) serializes
   the whole graph through a `Write` so checkpoints don't double-buffer.
+  Ordered collections make the bytes reproducible, so snapshots are
+  content-addressable and replicas comparable by checksum.
 - **`FlatIndex` baseline** shares the `Index` trait, used as ground
   truth for recall validation.
 
@@ -77,7 +82,16 @@ cargo bench -p kova-core
 - **Checkpoint + WAL truncate**: stop-the-world snapshot of the index,
   manifest commits the new generation atomically, WAL truncates past
   the checkpoint LSN. Generation-numbered snapshots make the swap
-  crash-safe.
+  crash-safe. Checkpoint is a pure durability artifact : it does *not*
+  vacuum, because vacuum is timing-dependent while checkpoint is a
+  local decision.
+- **Vacuum is logged** (`Record::Vacuum`): it rewires the graph in a
+  way that depends on when it ran, so replicas have to vacuum at the
+  same log position. Durable across reopen as a side effect.
+- **Deterministic apply**: identical record sequences produce
+  byte-identical graph snapshots, whether applied live or replayed from
+  the WAL. The gate for state-machine replication, pinned by
+  `tests/determinism.rs`.
 - **SIGKILL-tested**: 300 torture iterations, 55,697 acked inserts,
   962 checkpoints, zero failures. See [Crash recovery](#crash-recovery).
 
@@ -461,7 +475,7 @@ PASS 2 : for each affected (node, layer), in sorted order :
 ```
 
 **Pass 1 scans, and the scan is not optional.** It originally walked
-each *tombstone's own* neighbour list instead — much cheaper, and
+each *tombstone's own* neighbour list instead : much cheaper, and
 wrong. It assumes graph symmetry : that everyone pointing at `T` is
 named by `T`. HNSW does not guarantee that. Adding a bidirectional
 edge can leave `X -> T` while the back-edge `T -> X` is pruned away by
@@ -471,8 +485,8 @@ kept a dangling reference to a removed id.
 That produced three failures, worst last : degraded recall ; a
 **second vacuum erroring out**, which is reachable through ordinary
 `Shard::checkpoint` (it vacuums internally, so
-delete/checkpoint/delete/checkpoint failed) ; and — because vacuum
-frees ids for reuse — a re-inserted id **resurrecting the stale edge**
+delete/checkpoint/delete/checkpoint failed) ; and : because vacuum
+frees ids for reuse : a re-inserted id **resurrecting the stale edge**
 against unrelated data. It needed ~500 nodes to reproduce, and the
 existing tests used 20.
 
@@ -491,14 +505,14 @@ by smallest id. Each of those was a `HashMap`/`HashSet` iteration whose
 order silently decided the shape of the repaired graph.
 
 Cost : O(N × M) for the scan, plus O(re_searched × log N) for repair.
-The scan is the cheap half — vacuum was already doing `search_layer`
+The scan is the cheap half : vacuum was already doing `search_layer`
 calls per repaired node, which dominate it.
 
 `vacuum_leaves_no_dangling_edges` is the invariant test, and it checks
 the invariant directly : it walks every surviving node's neighbour
 lists and asserts none reference a missing id. Its predecessor was
 named `vacuum_leaves_no_dead_edges_in_live_nodes` but only checked node
-*membership*, never a neighbour list — which is why the bug survived it.
+*membership*, never a neighbour list : which is why the bug survived it.
 
 ### Checkpoint commits through a manifest, atomic at the manifest
 
@@ -571,9 +585,9 @@ asks it to. `checkpoint_locks_in_vacuum_work` and
 `Shard::insert_many(items)` groups a batch under a single WAL commit :
 
 ```text
-   for each item:    wal.append(record)        (cheap, just buffered I/O)
+   for each item:   wal.append(record)        (cheap, just buffered I/O)
    ─────────────────────────────────────────
-   once at end:      wal.sync()                (the actual fsync)
+   once at end:     wal.sync()                (the actual fsync)
                      metadata.put_many(...)    (one full-file flush)
                      for each: index.insert    (sequential by HNSW design)
 ```
@@ -891,7 +905,7 @@ latency estimates against five per-machine coefficients
 
 **Plan choice is gated on correctness before cost.** Plan A's expected
 yield is `k * 4 * selectivity`, so below `selectivity = 0.25` it
-*mathematically cannot* fill the LIMIT — measured, it returns **zero
+*mathematically cannot* fill the LIMIT : measured, it returns **zero
 rows** for `LIMIT 10` at selectivity ≤ 0.05, where B and C return every
 matching row. `cost::plan_a_can_satisfy` excludes it in that regime
 regardless of price ; a plan that cannot answer the query is not a fast
@@ -949,7 +963,7 @@ unit-test suite :
 | `plan_a_starvation` | 4 cases | A satisfiable `LIMIT k` never comes back short, through the full `execute_str` pipeline |
 
 `plan_a_starvation` is worth a note on method : the first attempt at
-that regression test was a fuzzer assertion that passed — and **kept
+that regression test was a fuzzer assertion that passed, and **kept
 passing when the bug was deliberately reintroduced**, because the
 fuzzer's generated `k` was too small to trigger starvation. A test that
 has never been observed to fail proves nothing. The replacement was
@@ -983,7 +997,7 @@ scan only for predicates neither layer recognises.
 **Cost-based dispatch, validated against measured runs.** The
 planner picks plan A / B / C by computing closed-form latency
 estimates per plan against five per-machine coefficients, then
-dispatching the cheapest — after excluding any plan that cannot
+dispatching the cheapest : after excluding any plan that cannot
 return a complete answer.
 
 Six model bugs have surfaced during validation, every one the same
@@ -995,7 +1009,7 @@ the executor runs.**
 | 1 | plan A retries on starvation | returns short, never retries |
 | 2 | plan B's ids come from an O(1) lookup | scans every row first |
 | 3 | `ef = max(2k, 50)` | `ef = ef_search.max(k)` |
-| 4 | plan C's filter overhead is linear in `(1-s)` | hyperbolic in `s` — it degenerates to a full scan |
+| 4 | plan C's filter overhead is linear in `(1-s)` | hyperbolic in `s` : it degenerates to a full scan |
 | 5 | (calibrator) its own copy of `hnsw_visits` mirrored the model | the copy went stale, skewing a derived coefficient 1.6x |
 | 6 | one coefficient covers all metadata access | plans A/B *clone* a bag (250 ns), plan C *borrows* one (10 ns) |
 

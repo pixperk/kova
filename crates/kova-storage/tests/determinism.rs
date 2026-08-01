@@ -6,8 +6,8 @@
 //! not, two replicas answer the same query differently and no amount
 //! of consensus fixes it.
 //!
-//! Kova's apply path has one obvious source of nondeterminism — HNSW
-//! assigns each node a random top layer — and it is seeded
+//! Kova's apply path has one obvious source of nondeterminism : HNSW
+//! assigns each node a random top layer, and it is seeded
 //! (`StdRng::seed_from_u64`), advanced once per insert. So determinism
 //! should hold *given identical insert order*, which is exactly what a
 //! replicated log provides.
@@ -18,7 +18,7 @@
 
 use kova_core::{L2, Metadata, Value, Vector, VectorId};
 use kova_index::HnswParams;
-use kova_storage::Shard;
+use kova_storage::{Manifest, Shard};
 
 const DIM: usize = 8;
 const N: usize = 500;
@@ -61,7 +61,7 @@ impl Xorshift {
     }
 }
 
-/// A deterministic row set. Same every call — this is the "log" the
+/// A deterministic row set. Same every call : this is the "log" the
 /// replicas replay.
 fn rows(n: usize) -> Vec<(VectorId, Vector, Metadata)> {
     let mut rng = Xorshift::new(SEED);
@@ -105,8 +105,16 @@ fn build(dir: &std::path::Path, data: &[(VectorId, Vector, Metadata)]) -> FileSh
 /// reason to keep it afterwards.
 fn snapshot_bytes(mut shard: FileShard, dir: &std::path::Path) -> Vec<u8> {
     shard.checkpoint().expect("checkpoint");
-    // First checkpoint commits generation 1.
-    std::fs::read(dir.join("graph.1.snapshot")).expect("read snapshot")
+    // Ask the manifest which generation is live rather than assuming
+    // `graph.1.snapshot` : a shard that has checkpointed before is on a
+    // later generation. The generation number lives in the filename,
+    // not in the payload, so snapshots from different generations are
+    // still directly comparable.
+    let manifest = Manifest::load(&dir.join("manifest"))
+        .expect("read manifest")
+        .expect("checkpoint must have written a manifest");
+    std::fs::read(dir.join(format!("graph.{}.snapshot", manifest.snapshot_id)))
+        .expect("read snapshot")
 }
 
 /// The property that actually matters to a user : two replicas must
@@ -142,7 +150,7 @@ fn two_shards_built_from_the_same_sequence_agree() {
     assert_eq!(
         search_fingerprint(&a, &qs, 10),
         search_fingerprint(&b, &qs, 10),
-        "two identically-built shards answered the same query differently — \
+        "two identically-built shards answered the same query differently : \
          the apply path is not deterministic and log-shipping replication \
          cannot work"
     );
@@ -193,7 +201,7 @@ fn replay_from_the_wal_reproduces_direct_application() {
 }
 
 /// Determinism must survive the full mutation surface, not just
-/// inserts — a real log carries deletes and metadata updates too.
+/// inserts : a real log carries deletes and metadata updates too.
 #[test]
 fn mixed_mutations_are_deterministic() {
     let data = rows(N);
@@ -241,7 +249,7 @@ fn mixed_mutations_are_deterministic() {
 ///
 /// Vacuum rewires the neighbour lists of every survivor that pointed at
 /// a tombstoned node. The result depends on *which* nodes were
-/// tombstoned when it ran — so two replicas that vacuum at different
+/// tombstoned when it ran, so two replicas that vacuum at different
 /// log positions produce different graphs, and answer the same query
 /// differently, without either being "wrong".
 ///
@@ -250,8 +258,8 @@ fn mixed_mutations_are_deterministic() {
 /// a local maintenance decision : the leader picks the log position,
 /// every replica vacuums at exactly that point.
 ///
-/// If this test ever starts *failing* — i.e. vacuum timing stops
-/// mattering — the constraint can be relaxed.
+/// If this test ever starts *failing* : i.e. vacuum timing stops
+/// mattering : the constraint can be relaxed.
 #[test]
 fn vacuum_timing_changes_the_graph() {
     let data = rows(N);
@@ -283,7 +291,7 @@ fn vacuum_timing_changes_the_graph() {
     assert_eq!(
         late.len(),
         early.len(),
-        "vacuum changed which rows are live — that would be a real bug"
+        "vacuum changed which rows are live : that would be a real bug"
     );
 
     // But the graphs differ, so the answers can differ.
@@ -291,7 +299,94 @@ fn vacuum_timing_changes_the_graph() {
     let early_hits = search_fingerprint(&early, &qs, 10);
     assert_ne!(
         late_hits, early_hits,
-        "vacuum timing no longer affects search results — if this is genuinely \
+        "vacuum timing no longer affects search results : if this is genuinely \
          true, Record::Vacuum may not be needed and this test should be revisited"
     );
+}
+
+/// **The payoff for splitting vacuum out of checkpoint.**
+///
+/// `checkpoint()` is a local decision : every node runs it on its own
+/// `CheckpointPolicy` schedule. It used to vacuum first, and vacuum is
+/// timing-dependent (see [`vacuum_timing_changes_the_graph`]), so two
+/// replicas holding *identical logs* would diverge purely because they
+/// happened to checkpoint at different moments. No amount of consensus
+/// fixes that: the logs agree and the graphs still differ.
+///
+/// Vacuum is now a logged record and checkpoint is a pure durability
+/// artifact, so checkpoint timing is free. This test is that claim,
+/// checked rather than asserted.
+#[test]
+fn checkpoint_timing_does_not_affect_the_graph() {
+    let data = rows(N);
+    let qs = queries(20);
+    let doomed: Vec<VectorId> = (0..N)
+        .filter(|i| (i * 37) % 100 < 20)
+        .map(|i| VectorId::new(i as u64))
+        .collect();
+
+    // Replica 1 : checkpoint early, before the deletes.
+    let dir_early = tempfile::tempdir().expect("tempdir");
+    let mut early = build(dir_early.path(), &data);
+    early.checkpoint().expect("checkpoint");
+    early.delete_many(doomed.clone()).expect("delete");
+    early.vacuum().expect("vacuum");
+
+    // Replica 2 : identical mutations, no checkpoint until the end.
+    let dir_late = tempfile::tempdir().expect("tempdir");
+    let mut late = build(dir_late.path(), &data);
+    late.delete_many(doomed).expect("delete");
+    late.vacuum().expect("vacuum");
+
+    assert_eq!(early.len(), late.len());
+    assert_eq!(
+        search_fingerprint(&early, &qs, 10),
+        search_fingerprint(&late, &qs, 10),
+        "checkpoint timing changed the graph : checkpoint is a local \
+         decision, so this would make replicas holding identical logs \
+         diverge"
+    );
+    // `snapshot_bytes` checkpoints again ; for `early` that is its
+    // second checkpoint and for `late` its first, which is exactly the
+    // asymmetry being tested : hence the manifest lookup in the helper.
+    assert_eq!(
+        snapshot_bytes(early, dir_early.path()),
+        snapshot_bytes(late, dir_late.path()),
+        "checkpoint timing changed the snapshot bytes"
+    );
+}
+
+/// Repeated delete/vacuum/checkpoint cycles must keep working.
+///
+/// This sequence used to fail outright. `checkpoint()` vacuumed
+/// internally, and a second vacuum tripped over the dangling edges the
+/// first one left behind (`vacuum: affected id N missing from nodes`),
+/// because vacuum's pass 1 assumed HNSW edges are symmetric. A failed
+/// checkpoint also means the WAL never truncates, so the log grows
+/// without bound.
+#[test]
+fn repeated_delete_and_checkpoint_cycles_succeed() {
+    let data = rows(N);
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut shard = build(dir.path(), &data);
+
+    let mut alive = N;
+    for round in 0..4u64 {
+        let doomed: Vec<VectorId> = (0..N)
+            .filter(|i| (*i as u64) % 4 == round)
+            .map(|i| VectorId::new(i as u64))
+            .collect();
+        alive -= doomed.len();
+        shard.delete_many(doomed).expect("delete");
+        shard.vacuum().expect("vacuum");
+        shard
+            .checkpoint()
+            .unwrap_or_else(|e| panic!("checkpoint failed in round {round}: {e:?}"));
+        assert_eq!(shard.len(), alive, "row count wrong after round {round}");
+    }
+
+    // And it all survives a reopen.
+    drop(shard);
+    let reopened = Shard::open(dir.path(), DIM, L2, HnswParams::default()).expect("reopen");
+    assert_eq!(reopened.len(), alive);
 }

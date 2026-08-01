@@ -394,7 +394,7 @@ by the fixed overfetch.
 
 That "without retrying" is load-bearing, and for a long time this
 document called it "a recall trade-off, not a latency one." Measured,
-it is neither — it is a **wrong answer**. Plan A's expected yield is
+it is neither : it is a **wrong answer**. Plan A's expected yield is
 `k * 4 * selectivity`, so at selectivity 0.05 with `LIMIT 10` it
 returns **zero rows** while plans B and C return all ten matching ones.
 See [Plan A cannot always answer](#plan-a-cannot-always-answer).
@@ -464,7 +464,7 @@ nanosecond rates) shipped as defaults.
 | `c_filter_eval` | Evaluating one predicate atom on a bag | 70 ns |
 
 The last two used to be one coefficient, priced at the clone rate.
-Measured, a clone costs **250 ns and a borrow 10 ns — 24x** — and plan
+Measured, a clone costs **250 ns and a borrow 10 ns : 24x**, and plan
 C pays its version on the hottest path in the engine. Charging it the
 clone rate made plan C look ~2.4x more expensive than it is, which was
 enough that it was never dispatched at all.
@@ -501,7 +501,7 @@ Substituting and simplifying : with enough matching rows, **plan A can
 fill its LIMIT only when `selectivity >= 1 / KNN_OVERFETCH` = 0.25.**
 Below that it is arithmetically impossible, for any `k`.
 
-Measured at `n = 10_000` — rows returned against the complete answer :
+Measured at `n = 10_000` : rows returned against the complete answer :
 
 | s | matching rows | plan A | plan B | plan C |
 |---|---|---|---|---|
@@ -512,7 +512,7 @@ Measured at `n = 10_000` — rows returned against the complete answer :
 
 (`LIMIT 10` shown ; the shortfall scales with `k`.) Across all 84
 cells plan A came up short in **48**, plan B in **0**, plan C in **3**
-(by one row each, at `dim=1536` — ordinary ANN approximation).
+(by one row each, at `dim=1536` : ordinary ANN approximation).
 
 `cost::plan_a_can_satisfy` excludes plan A whenever it cannot reach the
 complete answer, regardless of how cheap it is. A plan that returns
@@ -575,7 +575,7 @@ plan-builder reexports (`internal_bench::build_plan_a/b/c`) and the
 Ranking on latency alone reproduces the very bug the model had : at
 `s=0.001` plan A runs in 51 us returning zero rows while plan B takes
 369 us returning all ten matches, so a plain `argmin` calls plan A the
-winner — and then scores a dispatcher that correctly refuses it as
+winner, and then scores a dispatcher that correctly refuses it as
 *wrong*, charging `369/51 = 7.2x` regret for the right call. Measured,
 that mis-scoring changes the winner in **28% of cells** at a mean 2.4x.
 A plan qualifies only if it returned `min(k, matching_rows)` rows.
@@ -591,7 +591,7 @@ s in {0.001, 0.01, 0.05, 0.2, 0.5, 0.7, 0.9}, k in {10, 50, 100, 500}),
 | Cells where the dispatched plan under-delivered | **0 / 84** |
 | Plan C fastest-correct | 35 / 84, up to **3.22x**, dispatched in 28 |
 
-Plan C's band by selectivity — nothing below 0.2, near-total above 0.7 :
+Plan C's band by selectivity : nothing below 0.2, near-total above 0.7 :
 
 ```text
   s        C fastest    C dispatched
@@ -604,7 +604,7 @@ Plan C's band by selectivity — nothing below 0.2, near-total above 0.7 :
   0.9       12/12          9/12
 ```
 
-**Six model bugs the harness surfaced**, all the same shape — the
+**Six model bugs the harness surfaced**, all the same shape : the
 formulas scored an *idealised* plan rather than the one the executor
 runs :
 
@@ -613,13 +613,13 @@ runs :
 | 1 | plan A retries until it has `k` results | returns short, never retries |
 | 2 | plan B's ids come from an O(1) catalog lookup | scans all `n` rows first |
 | 3 | `ef = max(2k, 50)` | `ef = params.ef_search.max(k)` |
-| 4 | plan C's overhead is linear in `(1-s)`, capped at 5x | hyperbolic in `s` — it degenerates to a full scan |
+| 4 | plan C's overhead is linear in `(1-s)`, capped at 5x | hyperbolic in `s` : it degenerates to a full scan |
 | 5 | the calibrator's copy of `hnsw_visits` mirrored the model | the copy went stale, skewing a *derived* coefficient by 1.6x |
 | 6 | one coefficient covers all metadata access | plans A/B clone a bag (250 ns), plan C borrows one (10 ns) |
 
 Two of these are worth expanding, because the reasoning generalises.
 
-**Bug 1 — the starvation term.** The first model added
+**Bug 1 : the starvation term.** The first model added
 `k_eff = max(k * overfetch, k / selectivity)` to plan A, reasoning that
 at low selectivity it must "retry until k results." The executor
 doesn't retry, so the term made the model dispatch plan B in 11 cells
@@ -628,7 +628,7 @@ document said the shortfall was "a recall trade-off the planner can
 surface separately."
 
 Nothing then surfaced it. **That framing is what let the correctness
-bug sit unnoticed** — the model stopped charging for starvation, and
+bug sit unnoticed** : the model stopped charging for starvation, and
 every downstream measurement inherited the assumption that a short
 result was acceptable. The fix was correct ; the follow-up never
 happened. See [Plan A cannot always answer](#plan-a-cannot-always-answer).
@@ -636,7 +636,7 @@ happened. See [Plan A cannot always answer](#plan-a-cannot-always-answer).
 **Bugs 3 and 5 were the same mistake in two places.** The calibration
 runner carried its own copy of `hnsw_visits` under a
 `// mirrored from cost::hnsw_visits` comment. When the real one was
-corrected, the copy silently kept the old formula — and because the
+corrected, the copy silently kept the old formula, and because the
 calibrator *derives* `c_hnsw_per_visit` by dividing a measured latency
 by a modelled visit count, the stale copy produced a coefficient wrong
 by exactly the ratio between the two formulas. Measured: 73.7 vs 116.4
@@ -648,7 +648,7 @@ not a mirror.**
 
 A seventh bug lived in the harness's own fixture : selectivity was
 built as `bucket = i % round(1/s)`, which collapses to a single bucket
-for any `s > 0.5` — so the first attempt at extending the grid measured
+for any `s > 0.5`, so the first attempt at extending the grid measured
 `s = 1.0` twice under two different labels. The construction is now
 per-mille and, more to the point, **asserted** against the actual match
 count. The missing assertion was the root cause : the harness trusted
@@ -694,7 +694,7 @@ knowing before over-investing in per-machine tuning.
 
 Two practical notes. The microbenches carry ~15% run-to-run variance
 (`c_distance_per_dim` measured 0.087 / 0.100 / 0.100 / 0.104 across
-four runs), so don't over-fit to a single run — dispatch is flat with
+four runs), so don't over-fit to a single run : dispatch is flat with
 respect to `c_metadata_peek` anywhere from 100 ns down to 10 ns.
 And most of the runner's wall-clock is spent *building* its 50k-row
 fixture, because `FileMetadataStore::put` rewrites the whole file per
@@ -704,7 +704,7 @@ not a property of the measurement.
 Rather than re-running the hour-long sweep after every model change,
 [`examples/cost_probe.rs`](../crates/kova-query/examples/cost_probe.rs)
 replays the recorded measurements through the current cost functions in
-seconds. Measurements are fixed observations — the harness forces each
+seconds. Measurements are fixed observations : the harness forces each
 plan, so they do not depend on what the dispatcher would have chosen.
 Only re-measure when the **executor** changes.
 
@@ -809,9 +809,9 @@ fn search_radius(query, r):
     ef = max(ef_search, 16)
     loop:
         hits = search_layer(query, entry_points, ef, layer=0)
-        if any hit has distance > r:           // the ball is enclosed
+        if any hit has distance > r:          // the ball is enclosed
             return hits filter (d <= r)
-        if ef >= index size:                   // we have everything
+        if ef >= index size:                  // we have everything
             return hits filter (d <= r)
         ef = min(ef * 2, index size)           // grow and retry
 ```
@@ -1580,7 +1580,7 @@ embedding space (`category='legal'` clusters in any real embedding
 model) can starve plan A at a particular query point even when global
 selectivity is high. Prediction cannot see that.
 
-The fix is a runtime check — if plan A returns fewer than `k` rows,
+The fix is a runtime check : if plan A returns fewer than `k` rows,
 **re-run the dispatcher with plan A excluded** rather than hardcoding a
 fallback. At low selectivity plan B is 8x cheaper than plan C for the
 same complete answer, so a hardcoded "fall back to C" would turn a

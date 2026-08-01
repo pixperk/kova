@@ -15,7 +15,7 @@
 //! The measurements below are fixed observations : the harness forces
 //! each plan and times it, so they do not depend on what the dispatcher
 //! would have chosen. Only the *predictions* change when the model
-//! changes. That makes this the right loop for model work — seconds
+//! changes. That makes this the right loop for model work : seconds
 //! instead of the ~60-90 minutes a full re-sweep costs.
 //!
 //! Re-measure only when the **executor** changes. Regenerate this file
@@ -233,7 +233,7 @@ fn calibrated() -> CostCoefficients {
 }
 
 /// Same machine, but pricing plan C's per-visit metadata access at the
-/// *cloning* rate — the engine as it was before `with_metadata`.
+/// *cloning* rate : the engine as it was before `with_metadata`.
 fn calibrated_before_borrow() -> CostCoefficients {
     let c = calibrated();
     CostCoefficients {

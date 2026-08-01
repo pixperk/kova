@@ -84,7 +84,7 @@ pub enum Record {
     ///
     /// **Why vacuum is logged at all.** It touches no user-visible
     /// state : the same rows are live before and after. But it
-    /// *rewires the graph* — every survivor that pointed at a removed
+    /// *rewires the graph* : every survivor that pointed at a removed
     /// node gets repaired, and the repair depends on which nodes were
     /// tombstoned at the moment it ran. Two shards that vacuum the same
     /// tombstones at different points in the log end up with different
@@ -97,7 +97,7 @@ pub enum Record {
     /// exactly that log position. Hence a record rather than a local
     /// maintenance decision.
     ///
-    /// Carries no payload — "vacuum whatever is tombstoned here" is
+    /// Carries no payload : "vacuum whatever is tombstoned here" is
     /// fully determined by the log prefix.
     Vacuum,
     /// Drop a named secondary index. Replay re-applies it via

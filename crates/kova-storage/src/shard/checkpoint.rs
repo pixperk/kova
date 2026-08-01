@@ -173,15 +173,15 @@ impl<D: Distance> Shard<D, MmapVectorStore, FileMetadataStore, FileWal> {
         // vacuum rewires the graph in a way that depends on *when* it
         // ran, while checkpoint is a local decision every node makes on
         // its own schedule (`CheckpointPolicy`). Vacuuming here would
-        // therefore make two replicas holding identical logs diverge —
-        // the one thing replication cannot tolerate.
+        // therefore make two replicas holding identical logs diverge,
+        // which is the one thing replication cannot tolerate.
         //
         // The two concerns are now separate :
         //
         // - `Shard::vacuum` is a logged state change (`Record::Vacuum`),
         //   so every replica applies it at the same log position.
-        // - `checkpoint` is a pure durability artifact — snapshot the
-        //   graph you have, commit the manifest, truncate the WAL — and
+        // - `checkpoint` is a pure durability artifact : snapshot the
+        //   graph you have, commit the manifest, truncate the WAL : and
         //   is safe to run locally at any time.
         //
         // Operators who want vacuumed snapshots call `vacuum()` before
@@ -386,7 +386,7 @@ mod tests {
     /// The load-bearing part is that the snapshot carries the tombstone
     /// set (format v2). Without it, checkpoint would truncate the WAL
     /// past the `Delete` record while writing a snapshot that still
-    /// contains the node — and the row would come back from the dead.
+    /// contains the node, and the row would come back from the dead.
     #[test]
     fn checkpoint_preserves_tombstones_without_vacuuming() {
         let dir = tempdir().unwrap();

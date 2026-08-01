@@ -23,7 +23,7 @@
 //! - **Vector bytes** : they live in the composed [`VectorStore`], a
 //!   separate file with its own crash-safe lifecycle. The snapshot
 //!   references vector ids ; the store provides the bytes.
-//! - **Vector bytes** — see above.
+//! - **Vector bytes** ; see above.
 //! - **Metric / params / RNG seed** : the caller supplies these at
 //!   restore time. The graph structure is metric-agnostic ; params
 //!   only affect future insertions ; seed only affects future random
@@ -47,7 +47,7 @@ const MAGIC: &[u8; 8] = b"KOVAGRA1";
 /// Current snapshot format.
 ///
 /// **v1 → v2 : tombstones became part of the payload.** v1 relied on an
-/// invariant that no longer holds — that a snapshot is always written
+/// invariant that no longer holds : that a snapshot is always written
 /// post-vacuum, so the tombstone set is empty by construction. That was
 /// true only because `Shard::checkpoint` vacuumed before snapshotting.
 /// Vacuum is now a *logged* operation (replicas must vacuum at the same
@@ -89,7 +89,7 @@ struct GraphSnapshot {
     ///
     /// **`BTreeMap`, not `HashMap`, and that is load-bearing.** bincode
     /// encodes both as a length-prefixed sequence of pairs, so the wire
-    /// format is identical — but a `HashMap` is written in *hash
+    /// format is identical, but a `HashMap` is written in *hash
     /// iteration order*, which differs between instances even for
     /// identical contents. Two replicas holding the same graph would
     /// then produce snapshots that differ byte-for-byte, which rules
@@ -99,7 +99,7 @@ struct GraphSnapshot {
     ///
     /// Neighbour lists are deliberately *not* sorted : their order is
     /// already deterministic (it is insertion order under a
-    /// deterministic apply path), and it is semantically meaningful —
+    /// deterministic apply path), and it is semantically meaningful :
     /// `search_layer` examines neighbours in list order.
     nodes: BTreeMap<VectorId, Vec<Vec<VectorId>>>,
     /// Logically-deleted ids whose graph nodes are still present.
@@ -108,7 +108,7 @@ struct GraphSnapshot {
     /// that omits them silently resurrects deleted data once the WAL is
     /// truncated past the `Delete` records.
     ///
-    /// `BTreeSet` for the same reason `nodes` is a `BTreeMap` — ordered
+    /// `BTreeSet` for the same reason `nodes` is a `BTreeMap` : ordered
     /// output keeps snapshots byte-reproducible.
     tombstones: BTreeSet<VectorId>,
 }
@@ -161,7 +161,7 @@ impl<D: Distance, V: VectorStore> HnswIndex<D, V> {
     /// not the things the caller controls at runtime.
     ///
     /// Tombstones come back with the snapshot (v2 onwards). They are
-    /// logical state — they decide which rows are live — so dropping
+    /// logical state : they decide which rows are live, so dropping
     /// them would resurrect deleted rows as soon as the WAL is truncated
     /// past the corresponding `Delete` records.
     ///
