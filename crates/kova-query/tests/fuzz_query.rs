@@ -641,7 +641,7 @@ enum CheckKind<'a> {
     /// for `k * KNN_OVERFETCH` candidates, post-filters, and returns
     /// the survivors. At low selectivity that was measured returning
     /// **zero rows** for `LIMIT 10` against ten matching rows, while
-    /// plans B and C returned all ten — and the cost model dispatched
+    /// plans B and C returned all ten, and the cost model dispatched
     /// it anyway, because nothing in `cost_plan_a` can see a result
     /// count. `cost::plan_a_can_satisfy` now gates that at plan time ;
     /// this assertion is what stops it regressing silently.
@@ -1044,8 +1044,8 @@ fn correctness_one(fx: &mut Fixture, rng: &mut StdRng, seed: u64, iter: usize) {
             );
             // The load-bearing one : a satisfiable query must not come
             // back empty. We deliberately do NOT assert the stronger
-            // `rows.len() == min(limit, matches)` — HNSW is approximate
-            // and a filtered walk may legitimately miss some matches —
+            // `rows.len() == min(limit, matches)` : HNSW is approximate
+            // and a filtered walk may legitimately miss some matches :
             // but returning *nothing* when matches exist is a wrong
             // answer, not an approximation.
             if matches > 0 {

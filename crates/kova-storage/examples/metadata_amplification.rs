@@ -1,9 +1,24 @@
+// Benchmark harness : cast-heavy by nature.
+#![allow(clippy::cast_possible_wrap, clippy::cast_precision_loss)]
+
 //! Measure `FileMetadataStore`'s write amplification.
 //!
-//! Every `put` serialises the whole map and rewrites the whole file
-//! through `atomic_write` (fsync + rename + dirsync). Cost per mutation
-//! is therefore O(rows already stored), which makes a bulk load
-//! quadratic.
+//! `put` used to serialise the whole map and rewrite the whole file
+//! through `atomic_write` on every call. The interesting part of the
+//! measurement is that per-put latency came out **flat** at ~7.9 ms
+//! rather than growing with the store : the two fsyncs inside
+//! `atomic_write` (tmp file, then parent directory) dominate
+//! serialisation entirely, so it was a hard ~125 writes/sec ceiling at
+//! any size. The O(rows) part showed up as bytes instead : 852 MB
+//! pushed to disk to store 436 KB.
+//!
+//! Writes are now in-memory and the file is written by
+//! `MetadataStore::flush` at checkpoint, so this should report ~1 us
+//! per put and no bytes written. Durability is unaffected : `Shard`
+//! fsyncs a WAL record before touching the store.
+//!
+//! Run with:
+//!   `cargo run --release -p kova-storage --example metadata_amplification`
 
 use std::time::Instant;
 

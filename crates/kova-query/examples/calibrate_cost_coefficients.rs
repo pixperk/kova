@@ -126,7 +126,7 @@ fn metadata_fixture() -> (tempfile::TempDir, FileMetadataStore, Vec<VectorId>) {
 /// Sharing the fixture is also what keeps this runner usable.
 /// `FileMetadataStore::put` rewrites the entire file per call, so
 /// building an `N_FOR_META`-row store is quadratic and dominates the
-/// whole calibration — building it twice roughly doubled the runtime
+/// whole calibration : building it twice roughly doubled the runtime
 /// for no extra information.
 fn calibrate_metadata_accessors() -> (f64, f64) {
     let (_dir, store, ids) = metadata_fixture();
@@ -274,7 +274,7 @@ fn main() {
     println!("       -> get  (clone)  = {c_meta:.0} ns");
     println!("       -> peek (borrow) = {c_peek:.0} ns");
     println!(
-        "       -> borrowing is {:.1}x cheaper  <- what 0A.2 bought plan C",
+        "       -> borrowing is {:.1}x cheaper  <- this is what plan C pays",
         c_meta / c_peek.max(0.001)
     );
     println!();

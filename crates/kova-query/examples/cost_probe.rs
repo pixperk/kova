@@ -233,7 +233,8 @@ fn calibrated() -> CostCoefficients {
 }
 
 /// Same machine, but pricing plan C's per-visit metadata access at the
-/// *cloning* rate : the engine as it was before `with_metadata`.
+/// *cloning* rate, i.e. the engine as it was before the borrowing
+/// accessor landed.
 fn calibrated_before_borrow() -> CostCoefficients {
     let c = calibrated();
     CostCoefficients {
@@ -258,7 +259,7 @@ fn main() {
     for (label, coeffs) in [
         ("shipped defaults (x86)", CostCoefficients::default()),
         (
-            "calibrated, C clones (pre-0A.2)",
+            "calibrated, C priced as cloning",
             calibrated_before_borrow(),
         ),
         ("calibrated, C borrows (now)", calibrated()),
@@ -340,7 +341,7 @@ fn main() {
         .find(|m| m.dim() == 16 && (m.s() - 0.5).abs() < 1e-9 && m.k() == 50)
     {
         for (label, coeffs) in [
-            ("C clones (pre-0A.2)", calibrated_before_borrow()),
+            ("C priced as cloning", calibrated_before_borrow()),
             ("C borrows (now)", calibrated()),
         ] {
             let w = m.workload();

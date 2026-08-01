@@ -15,7 +15,7 @@
 //!   match set is small.
 //! - **Plan C** : filtered HNSW walk where the predicate is
 //!   consulted during graph traversal. Wins at **high** selectivity
-//!   on large shards with a large `k` — not, as an earlier version of
+//!   on large shards with a large `k` : not, as an earlier version of
 //!   this doc claimed, in the middle band.
 //!
 //!   The measured band (`examples/validate_cost_model.rs`, 120 cells)
@@ -46,9 +46,9 @@
 //! - `c_distance_per_dim` : per-scalar cost of distance compute.
 //!   Distance for `dim`-dim vectors costs `dim * c_distance_per_dim`.
 //! - `c_metadata_get` : cost of fetching one metadata bag **by
-//!   value** (lookup + deep clone) — plans A and B
+//!   value** (lookup + deep clone) : plans A and B
 //! - `c_metadata_peek` : cost of **borrowing** one metadata bag
-//!   (lookup, no clone) — plan C's per-visit filter
+//!   (lookup, no clone) : plan C's per-visit filter
 //! - `c_filter_eval` : cost of evaluating one predicate atom
 //!   on a metadata bag
 //!
@@ -91,7 +91,7 @@
 //!
 //! Every bug this model has shipped has had the same shape : the
 //! formulas scored an *idealised* plan rather than the one the
-//! executor actually runs. Four instances so far —
+//! executor actually runs. Four instances so far :
 //!
 //! 1. plan A charged a starvation-retry term for a retry that does
 //!    not exist (the executor returns short rather than retrying) ;
@@ -144,7 +144,7 @@ pub struct CostCoefficients {
     /// Split out from [`Self::c_metadata_get`] because they differ by
     /// roughly an order of magnitude, and plan C pays its version on
     /// the hottest path in the engine. Pricing the borrow at the clone's
-    /// rate made plan C look ~2.4x more expensive than it is — enough
+    /// rate made plan C look ~2.4x more expensive than it is : enough
     /// that it was never dispatched, in a band where measurement shows
     /// it running 1.4-2.2x faster than the alternatives.
     pub c_metadata_peek: f64,
@@ -220,7 +220,7 @@ const HNSW_EF_FLOOR: f64 = 50.0;
 /// let ef = self.params.ef_search.max(k);
 /// ```
 ///
-/// i.e. `max(k, 50)` — **not** `max(2k, 50)`. An earlier version of
+/// i.e. `max(k, 50)` : **not** `max(2k, 50)`. An earlier version of
 /// this function doubled `k`, which inflated the modelled visit count
 /// for every plan that walks the graph. The error mostly cancelled in
 /// the plan A vs plan C comparison (both were doubled) except below
@@ -313,7 +313,7 @@ pub fn cost_plan_b(w: &Workload, c: &CostCoefficients) -> f64 {
 /// at high selectivity the walk behaves like vanilla HNSW ; as the
 /// filter rejects more, proportionally more nodes must be visited to
 /// fill the results heap. Clamped at `total_rows`, since the walk
-/// cannot visit more nodes than the graph holds — that clamp is the
+/// cannot visit more nodes than the graph holds : that clamp is the
 /// model's way of saying "plan C degenerated into a full scan."
 #[must_use]
 pub fn cost_plan_c(w: &Workload, c: &CostCoefficients) -> f64 {
@@ -338,7 +338,7 @@ pub fn cost_plan_c(w: &Workload, c: &CostCoefficients) -> f64 {
 /// `examples/calibrate_cost_coefficients.rs` used to carry its own
 /// `hnsw_visits` under a `// mirrored from cost::hnsw_visits`
 /// comment. When the real one was corrected from `max(2k, 50)` to
-/// `max(k, 50)`, the copy silently kept the old formula — and since
+/// `max(k, 50)`, the copy silently kept the old formula, and since
 /// the calibrator *derives* `c_hnsw_per_visit` by dividing a measured
 /// latency by a modelled visit count, the stale copy produced a
 /// coefficient off by the exact ratio of the two formulas (1.6x).
@@ -362,7 +362,7 @@ pub mod internal_bench {
 /// **Measured accuracy** (`examples/validate_cost_model.rs`,
 /// `dim=16 n=10_000`) : predicted 10 / actual 7, predicted 20 / actual
 /// 15, predicted 100 / actual 90, predicted 400 / actual 385.
-/// Consistently 10-30% optimistic — never pessimistic — because the
+/// Consistently 10-30% optimistic, never pessimistic, because the
 /// filter correlates weakly with the query's neighbourhood.
 #[must_use]
 pub fn plan_a_expected_rows(w: &Workload) -> f64 {
@@ -372,10 +372,10 @@ pub fn plan_a_expected_rows(w: &Workload) -> f64 {
 /// Whether plan A can return the **complete** answer for this workload.
 ///
 /// The complete answer to `... WHERE pred ORDER BY dist LIMIT k` is
-/// `min(k, matching_rows)` — you cannot return more rows than match,
+/// `min(k, matching_rows)` : you cannot return more rows than match,
 /// and you should not return fewer than the LIMIT when they exist.
 ///
-/// Plan B always reaches that count — it scores every match, so it is
+/// Plan B always reaches that count : it scores every match, so it is
 /// exact by construction (measured : 0 shortfalls in 84 cells). Plan C
 /// is approximate but near-complete : its termination gate requires a
 /// full results heap, and it fell short in 3 of 84 cells, by exactly one
@@ -414,7 +414,8 @@ pub fn plan_a_expected_rows(w: &Workload) -> f64 {
 /// that correlates with position in embedding space (`category='legal'`
 /// clusters in any real embedding model) can starve plan A at a
 /// particular query point even when global `s` is high. Catching that
-/// needs a runtime check — see the roadmap's plan-A escalation item.
+/// needs a runtime check : if plan A comes back short at run time,
+/// re-dispatch with it excluded rather than trusting the estimate.
 #[must_use]
 pub fn plan_a_can_satisfy(w: &Workload) -> bool {
     let matching = w.selectivity * w.total_rows as f64;
@@ -432,7 +433,7 @@ pub fn plan_a_can_satisfy(w: &Workload) -> bool {
 /// [`plan_a_can_satisfy`] says it cannot return the complete answer,
 /// regardless of how cheap it is. A plan that returns zero rows for a
 /// query with ten valid answers is not a fast plan, it is a wrong one,
-/// and no cost comparison can express that — `cost_plan_a` is
+/// and no cost comparison can express that : `cost_plan_a` is
 /// deliberately independent of selectivity.
 ///
 /// Excluding A always leaves a usable choice : plan B reaches
@@ -636,7 +637,7 @@ mod tests {
     ///
     /// This test previously asserted `PlanKind::A` here, on the
     /// reasoning that "the executor just returns however many
-    /// candidates pass the post-filter" — treating a short result as an
+    /// candidates pass the post-filter" : treating a short result as an
     /// acceptable consequence of a fast plan. Measurement showed what
     /// that actually means : at `s <= 0.05` plan A returns **zero rows**
     /// for `LIMIT 10` while plans B and C return all ten matches.
@@ -700,7 +701,7 @@ mod tests {
     }
 
     /// When fewer rows match than the LIMIT asks for, the complete
-    /// answer is the match count, not `k` — so the gate compares
+    /// answer is the match count, not `k`, so the gate compares
     /// against `min(k, s*n)`.
     ///
     /// `s=0.001, n=10_000` leaves 10 matching rows. A `LIMIT 500` query
@@ -747,7 +748,7 @@ mod tests {
         }
     }
 
-    /// For tiny shards, touching every row beats HNSW walk overhead —
+    /// For tiny shards, touching every row beats HNSW walk overhead :
     /// but *which* exhaustive plan wins depends on how each one reads
     /// metadata, and at mid selectivity that is genuinely close.
     ///
@@ -761,7 +762,7 @@ mod tests {
     ///
     /// Both visit all 100 rows. Plan B loses because it **clones** a
     /// bag per match (`InternalHit.metadata`) while plan C only
-    /// **borrows** one per visit — 50 clones at 310 ns outweighs 100
+    /// **borrows** one per visit : 50 clones at 310 ns outweighs 100
     /// borrows at 30 ns. Before `c_metadata_peek` was split out, plan C
     /// was charged the clone rate too and this asserted `B`.
     ///
@@ -794,7 +795,7 @@ mod tests {
     }
 
     /// Plan C is measurably fastest at high selectivity on a large
-    /// shard — `examples/validate_cost_model.rs` records
+    /// shard : `examples/validate_cost_model.rs` records
     /// `dim=16 n=10_000 s=0.5 k=50` at A=229us B=1149us **C=103us**
     /// (C wins by 2.2x), plus seven sibling cells.
     ///
@@ -808,7 +809,7 @@ mod tests {
     /// measurement.
     ///
     /// If this test starts failing after a re-calibration, the
-    /// coefficient moved — re-run the validation harness before
+    /// coefficient moved : re-run the validation harness before
     /// changing the assertion.
     #[test]
     fn plan_c_is_dispatched_in_its_measured_band_when_metadata_is_borrowed() {

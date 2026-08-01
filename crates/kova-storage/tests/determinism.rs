@@ -13,8 +13,6 @@
 //! replicated log provides.
 //!
 //! "Should" is not "does". These tests check it.
-//!
-//! See `docs/.notes/roadmap-distributed.md`, phase 0B.3.
 
 use kova_core::{L2, Metadata, Value, Vector, VectorId};
 use kova_index::HnswParams;

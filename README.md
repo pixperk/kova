@@ -15,7 +15,7 @@ with gRPC between nodes. Every byte, every index, every network call is ours.
 | -------------- | ----------- | ---------------------------------------------------------------------- |
 | `kova-core`    | shipped     | `Vector`, `Distance` trait + `Cosine` / `L2` / `InnerProduct` (SIMD)   |
 | `kova-index`   | shipped     | `Index` trait, `FlatIndex` baseline, `HnswIndex` (insert + search + vacuum with full-scan edge repair + deterministic streaming snapshot) |
-| `kova-storage` | shipped     | Segmented WAL, `MmapVectorStore` (free-list slot reuse, crash-mid-init recovery), `FileMetadataStore`, `atomic_write` (+ streaming variant), `Manifest` commit point, `Shard` (log-then-mutate, batched inserts, logical delete, logged vacuum, checkpoint + WAL truncate, generation-numbered snapshots, deterministic apply). SIGKILL-tested across 55,697 acks and 962 checkpoints. |
+| `kova-storage` | shipped     | Segmented WAL, `MmapVectorStore` (free-list slot reuse, crash-mid-init recovery), `FileMetadataStore`, `atomic_write` (+ streaming variant), `Manifest` commit point, `Shard` (log-then-mutate, batched inserts, logical delete, logged vacuum, checkpoint + WAL truncate, generation-numbered snapshots, deterministic apply). SIGKILL-tested across 42,976 acks and 654 checkpoints. |
 | `kova-query`   | shipped     | KQL end to end : parser (Pest grammar, full DML + DDL), binder (typed `LogicalStatement` with hard semantic rejections), planner (three SELECT strategies dispatched by a measured cost model with a correctness gate, plus radius, COUNT and scan-and-limit bypasses), executor wired to `Shard` for both read and write paths, full DML (INSERT / UPDATE / DELETE including subscripted, radius, and param-bound shapes), `CREATE INDEX` / `DROP INDEX` end to end via the `IndexCatalog`, `Value::Map` for nested metadata, probabilistic query fuzzer with reference-impl correctness check, recall regression sweep across kNN / filtered / radius. See [`docs/query.md`](docs/query.md). |
 | `kova-meta-index` | shipped | Secondary indexes on metadata fields : `HashIndex` (equality), `BTreeIndex` (range, with float-ordering gate), `InvertedIndex` (array containment). `RoaringTreemap`-backed bitmaps compose for AND / OR / NOT in microseconds. `IndexCatalog` orchestrates per-field bundles, routes lookups by priority, exposes exact cardinality for the planner. Catalog persists alongside the graph snapshot, generation-numbered like `graph.{N}.snapshot`. WAL records carry `old_metadata` so replay rebuilds the catalog without depending on the (eagerly-mutated) metadata store. See [`docs/meta-index.md`](docs/meta-index.md). |
 | `kova-cluster` | not started | Consistent hashing, quorum replication, coordinator                    |
@@ -66,8 +66,11 @@ cargo bench -p kova-core
   torn-tail recovery, and O(1) truncation by deleting superseded
   segments.
 - **File-backed metadata** with open-shaped attribute bags
-  (`String` / `I64` / `F64` / `Bool` / `Array`), full-file snapshot on
-  mutation via `atomic_write`.
+  (`String` / `I64` / `F64` / `Bool` / `Array`), flushed at checkpoint
+  via `atomic_write`. Mutations are in-memory only : durability comes
+  from the WAL, which is fsynced before the store is touched. Flushing
+  per mutation cost two extra fsyncs and a full-file rewrite each time,
+  ~7.9 ms regardless of store size.
 - **Atomic file replacement** (tmp + fsync + rename + dirsync), both
   buffer and streaming variants.
 
@@ -92,8 +95,8 @@ cargo bench -p kova-core
   byte-identical graph snapshots, whether applied live or replayed from
   the WAL. The gate for state-machine replication, pinned by
   `tests/determinism.rs`.
-- **SIGKILL-tested**: 300 torture iterations, 55,697 acked inserts,
-  962 checkpoints, zero failures. See [Crash recovery](#crash-recovery).
+- **SIGKILL-tested**: 300 torture iterations, 42,976 acked inserts,
+  654 checkpoints, zero failures. See [Crash recovery](#crash-recovery).
 
 **Extensibility**
 
@@ -1213,8 +1216,8 @@ Beyond what `kova-query` ships today :
 
 **The log is truth ; memory is a cache.** Every mutation is logged,
 fsynced, and only then applied. If apply diverges from the log, the
-process aborts and reopen rebuilds from the log. 55,697 acked inserts
-and 962 checkpoints survived 300 SIGKILLs with zero data loss : the
+process aborts and reopen rebuilds from the log. 42,976 acked inserts
+and 654 checkpoints survived 300 SIGKILLs with zero data loss : the
 discipline is what makes that possible, not luck.
 
 **Pluggable seams, concrete impls.** `VectorStore`, `MetadataStore`,
