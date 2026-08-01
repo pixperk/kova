@@ -73,7 +73,7 @@ impl FileMetadataStore {
                 path: path.clone(),
                 entries: HashMap::new(),
             };
-            store.flush()?;
+            store.flush_to_disk()?;
             return Ok(store);
         };
         Ok(Self { path, entries })
@@ -85,7 +85,10 @@ impl FileMetadataStore {
         &self.path
     }
 
-    fn flush(&self) -> Result<(), KovaStorageError> {
+    /// Write the whole map out through [`atomic_write`].
+    ///
+    /// Private helper ; the trait-level [`MetadataStore::flush`] wraps it.
+    fn flush_to_disk(&self) -> Result<(), KovaStorageError> {
         let payload = bincode::serialize(&self.entries).map_err(KovaStorageError::Encode)?;
         let mut buf = Vec::with_capacity(HEADER_LEN + payload.len());
         buf.extend_from_slice(MAGIC);
@@ -128,21 +131,16 @@ fn load(path: &Path) -> Result<HashMap<VectorId, Metadata>, KovaStorageError> {
 impl MetadataStore for FileMetadataStore {
     type Error = KovaStorageError;
 
+    /// In-memory only. The file is written by [`Self::flush`], which
+    /// `Shard::checkpoint` calls.
+    ///
+    /// Durability is not lost : `Shard` appends and fsyncs a WAL record
+    /// before calling this, so a crash replays the mutation on reopen.
+    /// Flushing here instead cost two fsyncs and a full-file rewrite per
+    /// row (~7.9 ms, independent of store size), on top of the WAL's own
+    /// fsync.
     fn put(&mut self, id: VectorId, meta: Metadata) -> Result<(), Self::Error> {
-        let prev = self.entries.insert(id, meta);
-        if let Err(e) = self.flush() {
-            // Roll the in-memory state back so the store doesn't claim a
-            // write that didn't make it to disk.
-            match prev {
-                Some(old) => {
-                    self.entries.insert(id, old);
-                }
-                None => {
-                    self.entries.remove(&id);
-                }
-            }
-            return Err(e);
-        }
+        self.entries.insert(id, meta);
         Ok(())
     }
 
@@ -161,14 +159,9 @@ impl MetadataStore for FileMetadataStore {
         self.entries.get(&id).map(f)
     }
 
+    /// In-memory only ; see [`Self::put`].
     fn delete(&mut self, id: VectorId) -> Result<(), Self::Error> {
-        let prev = self.entries.remove(&id);
-        if let Err(e) = self.flush() {
-            if let Some(old) = prev {
-                self.entries.insert(id, old);
-            }
-            return Err(e);
-        }
+        self.entries.remove(&id);
         Ok(())
     }
 
@@ -219,25 +212,23 @@ impl MetadataStore for FileMetadataStore {
     /// map), but it preserves the "if `put_many` returned Err, the
     /// in-memory state matches the on-disk state" invariant the singleton
     /// `put` already guarantees.
+    /// In-memory only ; see [`Self::put`]. The rollback snapshot the
+    /// eager version needed is gone with it : there is no fallible disk
+    /// write left to unwind.
     fn put_many<I>(&mut self, items: I) -> Result<(), Self::Error>
     where
         I: IntoIterator<Item = (VectorId, Metadata)>,
         Self: Sized,
     {
-        // Snapshot for rollback. Skipping this would mean a flush failure
-        // mid-batch leaves the in-memory map ahead of disk, and the
-        // store would report keys it can't actually serve from disk.
-        let snapshot = self.entries.clone();
-
         for (id, meta) in items {
             self.entries.insert(id, meta);
         }
-
-        if let Err(e) = self.flush() {
-            self.entries = snapshot;
-            return Err(e);
-        }
         Ok(())
+    }
+
+    /// Write the map to disk. Called by `Shard::checkpoint`.
+    fn flush(&mut self) -> Result<(), Self::Error> {
+        self.flush_to_disk()
     }
 }
 
@@ -291,7 +282,7 @@ mod tests {
     }
 
     #[test]
-    fn reopen_recovers_entries() {
+    fn flush_then_reopen_recovers_entries() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("meta.bin");
         {
@@ -299,11 +290,41 @@ mod tests {
             store.put(id(1), sample_meta("alpha")).unwrap();
             store.put(id(2), sample_meta("beta")).unwrap();
             store.delete(id(1)).unwrap();
+            store.flush().unwrap();
         }
         let store = FileMetadataStore::open(&path).unwrap();
         assert_eq!(store.len(), 1);
         assert!(!store.contains(id(1)));
         assert_eq!(store.get(id(2)), Some(sample_meta("beta")));
+    }
+
+    /// Mutations are **not** durable on their own, by design.
+    ///
+    /// This store used to `atomic_write` the whole file on every `put`,
+    /// which cost two fsyncs and O(rows) bytes per mutation (~7.9 ms
+    /// regardless of size). Durability for metadata comes from the WAL :
+    /// `Shard` logs and fsyncs before touching this store, so a crash
+    /// replays the mutation. The file is a checkpoint artifact, written
+    /// by `flush`.
+    ///
+    /// Dropping an unflushed store therefore loses the writes, and that
+    /// is the contract, not a bug. Anyone using `FileMetadataStore`
+    /// outside `Shard` has to call `flush` themselves.
+    #[test]
+    fn writes_are_not_durable_without_flush() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("meta.bin");
+        {
+            let mut store = FileMetadataStore::open(&path).unwrap();
+            store.put(id(1), sample_meta("alpha")).unwrap();
+            // no flush
+        }
+        let store = FileMetadataStore::open(&path).unwrap();
+        assert_eq!(
+            store.len(),
+            0,
+            "unflushed writes should not survive ; durability is the WAL's job"
+        );
     }
 
     #[test]
@@ -314,6 +335,7 @@ mod tests {
             let mut store = FileMetadataStore::open(&path).unwrap();
             store.put(id(7), sample_meta("first")).unwrap();
             store.put(id(7), sample_meta("second")).unwrap();
+            store.flush().unwrap();
         }
         let store = FileMetadataStore::open(&path).unwrap();
         assert_eq!(store.get(id(7)), Some(sample_meta("second")));

@@ -115,6 +115,29 @@ pub trait MetadataStore {
     /// Number of entries stored.
     fn len(&self) -> usize;
 
+    /// Push any in-memory state to durable storage.
+    ///
+    /// **Mutations are not required to be durable when they return.**
+    /// Durability for metadata comes from the WAL : `Shard` logs and
+    /// fsyncs every mutation *before* touching this store, so the log
+    /// is the recovery source and this file is a checkpoint artifact.
+    /// `Shard::checkpoint` is what calls this.
+    ///
+    /// That split matters because a file-backed store rewrites the whole
+    /// file per flush : two fsyncs and O(rows) bytes. Doing that per
+    /// mutation measured at ~7.9 ms per `put` regardless of store size
+    /// (a hard ~125 writes/sec ceiling), and pushed 852 MB through the
+    /// disk to store 436 KB. Flushing at checkpoint instead makes the
+    /// cost proportional to checkpoints rather than to writes.
+    ///
+    /// In-memory implementations have nothing to do, hence the default.
+    ///
+    /// # Errors
+    /// Returns `Self::Error` if the underlying write fails.
+    fn flush(&mut self) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
     /// Whether the store is empty.
     fn is_empty(&self) -> bool {
         self.len() == 0

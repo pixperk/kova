@@ -21,7 +21,7 @@
 
 use std::fs;
 
-use kova_core::Distance;
+use kova_core::{Distance, MetadataStore};
 use kova_index::Index;
 
 use crate::atomic::{atomic_write, atomic_write_streaming};
@@ -201,6 +201,20 @@ impl<D: Distance> Shard<D, MmapVectorStore, FileMetadataStore, FileWal> {
                 })
         })
         .map_err(ShardError::backend)?;
+
+        // -------- Phase 2a : flush the metadata store --------
+        //
+        // Mutations only touch the metadata store's in-memory map ; this
+        // is where it reaches disk. Durability in between comes from the
+        // WAL, which is fsynced per mutation, so a crash before this
+        // point replays the mutations on reopen.
+        //
+        // Ordering against the manifest commit does not matter, because
+        // `metadata.bin` is overwritten in place rather than
+        // generation-numbered and every replayed `put` is idempotent :
+        // crash before it and replay brings the file forward, crash
+        // after and replay re-applies writes the file already has.
+        self.metadata.flush().map_err(ShardError::backend)?;
 
         // -------- Phase 2b : serialise the catalog alongside --------
         // The catalog snapshot is generation-numbered for the same
